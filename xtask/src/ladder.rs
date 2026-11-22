@@ -3,12 +3,35 @@
 use std::path::Path;
 use std::time::Instant;
 
-use layercraft_config::{PrintConfig, ProfileApplyResult, ProfileLibrary};
+use layercraft_config::{
+    ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileLibrary,
+};
 use layercraft_gcode::{emit_gcode, evaluate_gcode};
-use layercraft_mesh::{ObjectTransform, auto_arrange_footprints, prepare_transformed_object};
-use layercraft_slice::{slice_meshes, slice_single_mesh};
+use layercraft_mesh::{
+    ModifierPrimitive, ModifierTransform, ObjectTransform, auto_arrange_footprints,
+    build_modifier_primitive, prepare_modifier_mesh, prepare_transformed_object,
+};
+use layercraft_slice::{
+    ModifierVolume, slice_meshes_with_modifiers, slice_single_mesh_with_modifiers,
+};
 use layercraft_testkit::{ShapeSpec, build_shape};
 use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct LadderModifierSpec {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: ModifierRole,
+    #[serde(default)]
+    primitive: Option<ModifierPrimitive>,
+    #[serde(default)]
+    shape: Option<ShapeSpec>,
+    #[serde(default)]
+    transform: Option<ModifierTransform>,
+    #[serde(default)]
+    overrides: ModifierOverrides,
+}
 
 #[derive(Debug, Deserialize)]
 struct LadderObjectSpec {
@@ -50,12 +73,19 @@ struct LadderRecipe {
     #[serde(default)]
     profile_bundle: Option<LadderProfileSpec>,
     #[serde(default)]
+    modifiers: Vec<LadderModifierSpec>,
+    #[serde(default)]
     config: PrintConfig,
 }
 
 #[derive(Debug, Deserialize)]
 struct LadderExpected {
-    layer_count: usize,
+    #[serde(default)]
+    layer_count: Option<usize>,
+    #[serde(default)]
+    min_layer_count: Option<usize>,
+    #[serde(default)]
+    max_layer_count: Option<usize>,
     max_z_mm: f64,
     #[serde(default)]
     require_outer_wall: bool,
@@ -105,6 +135,16 @@ struct LadderExpected {
     max_volume_mm3: Option<f64>,
     #[serde(default)]
     min_wall_width_variation_ratio: Option<f64>,
+    #[serde(default)]
+    min_layer_height_variation_ratio: Option<f64>,
+    #[serde(default)]
+    max_min_layer_height_mm: Option<f64>,
+    #[serde(default)]
+    min_max_layer_height_mm: Option<f64>,
+    #[serde(default)]
+    min_sparse_infill_volume_mm3: Option<f64>,
+    #[serde(default)]
+    min_inner_wall_volume_mm3: Option<f64>,
     #[serde(default)]
     require_gcode_contains: Vec<String>,
     #[serde(default)]
@@ -194,6 +234,39 @@ pub fn run(root: &Path) -> Result<(), String> {
                     (recipe.config.clone(), None)
                 };
 
+            let mut mod_vols = Vec::with_capacity(recipe.modifiers.len());
+            for (mi, ms) in recipe.modifiers.iter().enumerate() {
+                let raw_mod = if let Some(prim) = ms.primitive {
+                    build_modifier_primitive(prim).map_err(|e| e.to_string())?
+                } else if let Some(sh) = &ms.shape {
+                    build_shape(sh).map_err(|e| e.to_string())?
+                } else {
+                    return Err(format!(
+                        "{tier_name}/{}: modifier #{mi} must specify `primitive` or `shape`",
+                        recipe.name
+                    ));
+                };
+                let xf = ms.transform.unwrap_or_else(|| ModifierTransform {
+                    position_xyz_mm: [
+                        0.5 * effective_config.machine.bed_width_mm,
+                        0.5 * effective_config.machine.bed_depth_mm,
+                        10.0,
+                    ],
+                    ..ModifierTransform::default()
+                });
+                let prep = prepare_modifier_mesh(&raw_mod, xf).map_err(|e| e.to_string())?;
+                mod_vols.push(ModifierVolume {
+                    id: (mi + 1) as u64,
+                    name: ms
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("modifier_{}", mi + 1)),
+                    role: ms.role,
+                    mesh: prep,
+                    overrides: ms.overrides.clone(),
+                });
+            }
+
             let plate = if !recipe.objects.is_empty() {
                 let mut transforms = Vec::with_capacity(recipe.objects.len());
                 let mut raw_meshes = Vec::with_capacity(recipe.objects.len());
@@ -236,10 +309,12 @@ pub fn run(root: &Path) -> Result<(), String> {
                     prepared_meshes
                         .push(prepare_transformed_object(raw, xf).map_err(|e| e.to_string())?);
                 }
-                slice_meshes(&prepared_meshes, &effective_config).map_err(|e| e.to_string())?
+                slice_meshes_with_modifiers(&prepared_meshes, &effective_config, &mod_vols)
+                    .map_err(|e| e.to_string())?
             } else if let Some(shape) = &recipe.shape {
                 let mesh = build_shape(shape).map_err(|e| e.to_string())?;
-                slice_single_mesh(&mesh, &effective_config).map_err(|e| e.to_string())?
+                slice_single_mesh_with_modifiers(&mesh, &effective_config, &mod_vols)
+                    .map_err(|e| e.to_string())?
             } else {
                 return Err(format!(
                     "{tier_name}/{}: recipe must specify `shape` or `objects`",
@@ -260,11 +335,20 @@ pub fn run(root: &Path) -> Result<(), String> {
             if !rep.safety.is_clean() {
                 errs.push(format!("safety violation: {:?}", rep.safety));
             }
-            if rep.active_layer_count != exp.layer_count {
-                errs.push(format!(
-                    "layers {} != {}",
-                    rep.active_layer_count, exp.layer_count
-                ));
+            if let Some(lc) = exp.layer_count
+                && rep.active_layer_count != lc
+            {
+                errs.push(format!("layers {} != {}", rep.active_layer_count, lc));
+            }
+            if let Some(min_lc) = exp.min_layer_count
+                && rep.active_layer_count < min_lc
+            {
+                errs.push(format!("layers {} < min {min_lc}", rep.active_layer_count));
+            }
+            if let Some(max_lc) = exp.max_layer_count
+                && rep.active_layer_count > max_lc
+            {
+                errs.push(format!("layers {} > max {max_lc}", rep.active_layer_count));
             }
             if (rep.max_z_mm - exp.max_z_mm).abs() > 0.005 {
                 errs.push(format!("max_z {:.3} != {:.3}", rep.max_z_mm, exp.max_z_mm));
@@ -414,6 +498,54 @@ pub fn run(root: &Path) -> Result<(), String> {
                     "wall width variation ratio {:.3} < min {min_ratio:.3}",
                     rep.wall_width_variation_ratio
                 ));
+            }
+            if let Some(min_lr) = exp.min_layer_height_variation_ratio
+                && rep.layer_height_variation_ratio < min_lr
+            {
+                errs.push(format!(
+                    "layer height variation ratio {:.3} < min {min_lr:.3}",
+                    rep.layer_height_variation_ratio
+                ));
+            }
+            if let Some(max_min_h) = exp.max_min_layer_height_mm
+                && (rep.min_layer_height_mm <= 0.0 || rep.min_layer_height_mm > max_min_h)
+            {
+                errs.push(format!(
+                    "min layer height {:.3} mm > max_min {max_min_h:.3} mm",
+                    rep.min_layer_height_mm
+                ));
+            }
+            if let Some(min_max_h) = exp.min_max_layer_height_mm
+                && rep.max_layer_height_mm < min_max_h
+            {
+                errs.push(format!(
+                    "max layer height {:.3} mm < min_max {min_max_h:.3} mm",
+                    rep.max_layer_height_mm
+                ));
+            }
+            if let Some(min_sv) = exp.min_sparse_infill_volume_mm3 {
+                let got = rep
+                    .feature_volumes_mm3
+                    .get("Sparse infill")
+                    .copied()
+                    .unwrap_or(0.0);
+                if got < min_sv {
+                    errs.push(format!(
+                        "Sparse infill volume {got:.2} mm3 < min {min_sv:.2} mm3"
+                    ));
+                }
+            }
+            if let Some(min_iw) = exp.min_inner_wall_volume_mm3 {
+                let got = rep
+                    .feature_volumes_mm3
+                    .get("Inner wall")
+                    .copied()
+                    .unwrap_or(0.0);
+                if got < min_iw {
+                    errs.push(format!(
+                        "Inner wall volume {got:.2} mm3 < min {min_iw:.2} mm3"
+                    ));
+                }
             }
             for needle in &exp.require_gcode_contains {
                 if !out.gcode.contains(needle) {

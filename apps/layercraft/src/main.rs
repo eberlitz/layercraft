@@ -17,7 +17,7 @@ use layercraft_viewport_gpu::install_renderer;
 struct Args {
     /// Optional STL or 3MF file to open at startup.
     file: Option<PathBuf>,
-    /// Optional built-in sample primitive (`cube20`, `cylinder`, `hollow_tube`, `stepped_block`, `thin_rib`).
+    /// Optional built-in sample primitive (`cube20`, `cylinder`, `hollow_tube`, `stepped_block`, `thin_rib`, `bridge_arch`, `dome`).
     #[arg(long)]
     sample: Option<String>,
 }
@@ -28,6 +28,8 @@ fn parse_sample(name: &str) -> SampleShape {
         "hollow_tube" | "tube" => SampleShape::HollowTube,
         "stepped_block" | "stepped" => SampleShape::SteppedBlock,
         "thin_rib" | "rib" => SampleShape::ThinRib,
+        "bridge_arch" | "bridge" => SampleShape::BridgeArch,
+        "dome" | "hemisphere" => SampleShape::Dome,
         _ => SampleShape::Cube20,
     }
 }

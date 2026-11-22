@@ -1,6 +1,6 @@
 //! Procedural watertight test meshes and hostile input generators (`dev-dependencies` only).
 
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_PI_2, TAU};
 
 use layercraft_config::{InfillPattern, PrintConfig};
 use layercraft_geom::{GeomError, Point3, Triangle, TriangleMesh};
@@ -75,10 +75,22 @@ pub enum ShapeSpec {
         narrow_width_mm: f64,
         height_mm: f64,
     },
+    Dome {
+        radius_mm: f64,
+        base_height_mm: f64,
+        #[serde(default = "default_segments")]
+        segments: usize,
+        #[serde(default = "default_rings")]
+        rings: usize,
+    },
 }
 
 fn default_segments() -> usize {
     64
+}
+
+fn default_rings() -> usize {
+    24
 }
 
 /// Build a watertight [`TriangleMesh`] from a [`ShapeSpec`].
@@ -175,6 +187,12 @@ pub fn build_shape(spec: &ShapeSpec) -> Result<TriangleMesh, TestkitError> {
             narrow_width_mm,
             height_mm,
         )?),
+        ShapeSpec::Dome {
+            radius_mm,
+            base_height_mm,
+            segments,
+            rings,
+        } => Ok(make_dome(radius_mm, base_height_mm, segments, rings)?),
     }
 }
 
@@ -382,6 +400,72 @@ pub fn make_tapered_wedge(
     TriangleMesh::new(tris)
 }
 
+/// Watertight cylindrical base (`0..base_h`) topped with a hemispherical dome (`radius`).
+pub fn make_dome(
+    radius: f64,
+    base_h: f64,
+    segments: usize,
+    rings: usize,
+) -> Result<TriangleMesh, GeomError> {
+    let n = segments.max(8);
+    let r_count = rings.max(4);
+    let mut tris = Vec::with_capacity(n * (r_count * 2 + 3));
+    let cb = Point3::new(0.0, 0.0, 0.0);
+
+    let mut ring_pts: Vec<Vec<Point3>> = Vec::with_capacity(r_count);
+    for ri in 0..r_count {
+        let phi = FRAC_PI_2 * (ri as f64) / (r_count as f64);
+        let rr = radius * phi.cos();
+        let zz = base_h + radius * phi.sin();
+        let mut pts = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = TAU * (i as f64) / (n as f64);
+            pts.push(Point3::new(rr * a.cos(), rr * a.sin(), zz));
+        }
+        ring_pts.push(pts);
+    }
+
+    if let Some(base_top) = ring_pts.first() {
+        for i in 0..n {
+            let i1 = (i + 1) % n;
+            let a0 = TAU * (i as f64) / (n as f64);
+            let a1 = TAU * (i1 as f64) / (n as f64);
+            let b0 = Point3::new(radius * a0.cos(), radius * a0.sin(), 0.0);
+            let b1 = Point3::new(radius * a1.cos(), radius * a1.sin(), 0.0);
+            tris.push(Triangle::new(cb, b1, b0));
+            if let (Some(&t0), Some(&t1)) = (base_top.get(i), base_top.get(i1)) {
+                push_quad(&mut tris, b0, b1, t1, t0);
+            }
+        }
+    }
+
+    for ri in 0..r_count.saturating_sub(1) {
+        let (Some(cur), Some(nxt)) = (ring_pts.get(ri), ring_pts.get(ri + 1)) else {
+            continue;
+        };
+        for i in 0..n {
+            let i1 = (i + 1) % n;
+            if let (Some(&p00), Some(&p10), Some(&p11), Some(&p01)) =
+                (cur.get(i), cur.get(i1), nxt.get(i1), nxt.get(i))
+            {
+                push_quad(&mut tris, p00, p10, p11, p01);
+            }
+        }
+    }
+
+    let apex = Point3::new(0.0, 0.0, base_h + radius);
+    if let Some(last_ring) = ring_pts.last() {
+        for i in 0..n {
+            let i1 = (i + 1) % n;
+            if let (Some(&p0), Some(&p1)) = (last_ring.get(i), last_ring.get(i1)) {
+                tris.push(Triangle::new(p0, p1, apex));
+            }
+        }
+    }
+
+    TriangleMesh::new(tris)
+}
+
 /// Hostile raw byte payloads that must never panic in STL/3MF readers.
 pub fn hostile_stl_inputs() -> Vec<Vec<u8>> {
     let mut bad_nan_bin = vec![0u8; 84 + 50];
@@ -423,4 +507,48 @@ pub fn hostile_configs() -> Vec<PrintConfig> {
     c6.filament.diameter_mm = f64::INFINITY;
 
     vec![c1, c2, c3, c4, c5, c6]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::f64::consts::PI;
+
+    #[test]
+    fn dome_mesh_is_watertight_with_analytical_volume() {
+        let r = 10.0;
+        let h = 8.0;
+        let dome = make_dome(r, h, 64, 24).unwrap();
+
+        let quant = |p: Point3| {
+            (
+                (p.x * 1e4).round() as i64,
+                (p.y * 1e4).round() as i64,
+                (p.z * 1e4).round() as i64,
+            )
+        };
+        let mut edges: HashMap<_, usize> = HashMap::new();
+        for tri in &dome.triangles {
+            let qa = quant(tri.a);
+            let qb = quant(tri.b);
+            let qc = quant(tri.c);
+            for (u, v) in [(qa, qb), (qb, qc), (qc, qa)] {
+                let key = if u <= v { (u, v) } else { (v, u) };
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        let non_manifold = edges.values().filter(|&&c| c != 2).count();
+        assert_eq!(
+            non_manifold, 0,
+            "dome has {non_manifold} non-manifold edges"
+        );
+
+        let expected_vol = PI * r * r * h + (2.0 / 3.0) * PI * r * r * r;
+        let got_vol = dome.signed_volume_mm3();
+        assert!(
+            (got_vol - expected_vol).abs() / expected_vol < 0.015,
+            "dome volume {got_vol:.1} != {expected_vol:.1}"
+        );
+    }
 }

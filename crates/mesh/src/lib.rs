@@ -1,7 +1,7 @@
 //! Triangle mesh inspection, bed placement, and exact Z-plane slicing.
 
 use std::collections::HashMap;
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_PI_2, TAU};
 
 use layercraft_clip::{ClipError, union_polygons};
 use layercraft_geom::{
@@ -253,6 +253,148 @@ pub fn auto_arrange_footprints(
     Ok(placed)
 }
 
+/// Transform for positioning a 3D modifier volume on the build plate without Z grounding.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ModifierTransform {
+    /// Desired world-space XYZ center position in millimeters.
+    pub position_xyz_mm: [f64; 3],
+    /// Euler XYZ rotation in degrees.
+    pub rotation_deg: [f64; 3],
+    /// Positive XYZ scale factors.
+    pub scale: [f64; 3],
+}
+
+impl Default for ModifierTransform {
+    fn default() -> Self {
+        Self {
+            position_xyz_mm: [125.0, 125.0, 10.0],
+            rotation_deg: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        }
+    }
+}
+
+fn default_modifier_segments() -> usize {
+    32
+}
+
+/// Built-in 3D modifier primitive geometry centered around its local bounding box center.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModifierPrimitive {
+    Box {
+        width_mm: f64,
+        depth_mm: f64,
+        height_mm: f64,
+    },
+    Cylinder {
+        radius_mm: f64,
+        height_mm: f64,
+        #[serde(default = "default_modifier_segments")]
+        segments: usize,
+    },
+}
+
+/// Construct a centered watertight primitive mesh for a modifier volume.
+pub fn build_modifier_primitive(prim: ModifierPrimitive) -> Result<TriangleMesh, MeshError> {
+    let tris = match prim {
+        ModifierPrimitive::Box {
+            width_mm,
+            depth_mm,
+            height_mm,
+        } => {
+            if !width_mm.is_finite()
+                || !depth_mm.is_finite()
+                || !height_mm.is_finite()
+                || width_mm <= 0.0
+                || depth_mm <= 0.0
+                || height_mm <= 0.0
+            {
+                return Err(MeshError::InvalidSchedule(
+                    "modifier box dimensions must be finite and positive",
+                ));
+            }
+            sample_box(
+                width_mm,
+                depth_mm,
+                height_mm,
+                -0.5 * width_mm,
+                -0.5 * depth_mm,
+                -0.5 * height_mm,
+            )
+        }
+        ModifierPrimitive::Cylinder {
+            radius_mm,
+            height_mm,
+            segments,
+        } => {
+            if !radius_mm.is_finite()
+                || !height_mm.is_finite()
+                || radius_mm <= 0.0
+                || height_mm <= 0.0
+            {
+                return Err(MeshError::InvalidSchedule(
+                    "modifier cylinder dimensions must be finite and positive",
+                ));
+            }
+            let n = segments.max(8);
+            let half_h = 0.5 * height_mm;
+            let mut t = Vec::with_capacity(n * 4);
+            let cb = Point3::new(0.0, 0.0, -half_h);
+            let ct = Point3::new(0.0, 0.0, half_h);
+            for i in 0..n {
+                let a0 = TAU * (i as f64) / (n as f64);
+                let a1 = TAU * (((i + 1) % n) as f64) / (n as f64);
+                let b0 = Point3::new(radius_mm * a0.cos(), radius_mm * a0.sin(), -half_h);
+                let b1 = Point3::new(radius_mm * a1.cos(), radius_mm * a1.sin(), -half_h);
+                let t0 = Point3::new(radius_mm * a0.cos(), radius_mm * a0.sin(), half_h);
+                let t1 = Point3::new(radius_mm * a1.cos(), radius_mm * a1.sin(), half_h);
+                t.push(Triangle::new(cb, b1, b0));
+                t.push(Triangle::new(ct, t0, t1));
+                push_sample_quad(&mut t, b0, b1, t1, t0);
+            }
+            t
+        }
+    };
+    Ok(TriangleMesh::new(tris)?)
+}
+
+/// Clean degenerate triangles and apply scale -> rotation -> XYZ center placement (no Z grounding).
+pub fn prepare_modifier_mesh(
+    mesh: &TriangleMesh,
+    transform: ModifierTransform,
+) -> Result<TriangleMesh, MeshError> {
+    if !transform.position_xyz_mm.iter().all(|v| v.is_finite())
+        || !transform.rotation_deg.iter().all(|v| v.is_finite())
+        || !transform.scale.iter().all(|v| v.is_finite() && *v > 0.0)
+    {
+        return Err(MeshError::InvalidSchedule(
+            "modifier transform must be finite with positive scale",
+        ));
+    }
+    let valid: Vec<Triangle> = mesh
+        .triangles
+        .iter()
+        .copied()
+        .filter(|t| t.is_finite() && t.area_mm2() > 1e-12)
+        .collect();
+    let mut clean = TriangleMesh::new(valid)?;
+    clean.scale(transform.scale[0], transform.scale[1], transform.scale[2])?;
+    clean.rotate_euler_deg(
+        transform.rotation_deg[0],
+        transform.rotation_deg[1],
+        transform.rotation_deg[2],
+    )?;
+    let c = clean.aabb().ok_or(GeomError::EmptyMesh)?.center();
+    clean.translate(
+        transform.position_xyz_mm[0] - c.x,
+        transform.position_xyz_mm[1] - c.y,
+        transform.position_xyz_mm[2] - c.z,
+    )?;
+    Ok(clean)
+}
+
 /// A single layer Z slice definition.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LayerPlane {
@@ -318,6 +460,257 @@ pub fn build_layer_schedule(
     Ok(schedule)
 }
 
+/// Explicit Z-height band forcing a target layer height over `[min_z_mm, max_z_mm]`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExplicitHeightRange {
+    pub min_z_mm: f64,
+    pub max_z_mm: f64,
+    pub layer_height_mm: f64,
+}
+
+/// Parameters controlling adaptive and/or Z-range variable layer scheduling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VariableScheduleParams {
+    pub first_layer_height_mm: f64,
+    pub nominal_layer_height_mm: f64,
+    pub adaptive: bool,
+    pub min_layer_height_mm: f64,
+    pub max_layer_height_mm: f64,
+    pub quality: f64,
+    pub smooth_radius_mm: f64,
+    pub max_step_ratio: f64,
+    pub explicit_ranges: Vec<ExplicitHeightRange>,
+}
+
+/// Build an adaptive + Z-range variable layer schedule over `[0, max_z]` of `mesh`.
+pub fn build_variable_layer_schedule(
+    mesh: &TriangleMesh,
+    params: &VariableScheduleParams,
+) -> Result<Vec<LayerPlane>, MeshError> {
+    if !params.first_layer_height_mm.is_finite() || params.first_layer_height_mm <= 0.0 {
+        return Err(MeshError::InvalidSchedule(
+            "first_layer_height must be positive",
+        ));
+    }
+    if !params.nominal_layer_height_mm.is_finite() || params.nominal_layer_height_mm <= 0.0 {
+        return Err(MeshError::InvalidSchedule(
+            "nominal_layer_height must be positive",
+        ));
+    }
+    if !params.min_layer_height_mm.is_finite()
+        || !params.max_layer_height_mm.is_finite()
+        || params.min_layer_height_mm <= 0.0
+        || params.min_layer_height_mm > params.max_layer_height_mm
+    {
+        return Err(MeshError::InvalidSchedule(
+            "min_layer_height must be positive and <= max_layer_height",
+        ));
+    }
+    if !params.quality.is_finite() || !(0.0..=1.0).contains(&params.quality) {
+        return Err(MeshError::InvalidSchedule(
+            "quality must be within 0.0..=1.0",
+        ));
+    }
+    if !params.smooth_radius_mm.is_finite() || params.smooth_radius_mm < 0.0 {
+        return Err(MeshError::InvalidSchedule(
+            "smooth_radius_mm must be finite and >= 0",
+        ));
+    }
+    if !params.max_step_ratio.is_finite() || params.max_step_ratio < 1.0 {
+        return Err(MeshError::InvalidSchedule(
+            "max_step_ratio must be finite and >= 1.0",
+        ));
+    }
+    for r in &params.explicit_ranges {
+        if !r.min_z_mm.is_finite()
+            || r.min_z_mm < 0.0
+            || !r.max_z_mm.is_finite()
+            || r.max_z_mm <= r.min_z_mm
+            || !r.layer_height_mm.is_finite()
+            || r.layer_height_mm <= 0.0
+        {
+            return Err(MeshError::InvalidSchedule(
+                "explicit height range bounds and height must be valid",
+            ));
+        }
+    }
+
+    let aabb = mesh.aabb().ok_or(GeomError::EmptyMesh)?;
+    let max_z_mm = aabb.max.z - aabb.min.z;
+    if !max_z_mm.is_finite() || max_z_mm <= 0.0 {
+        return Err(MeshError::InvalidSchedule("max_z must be positive"));
+    }
+
+    if !params.adaptive && params.explicit_ranges.is_empty() {
+        return build_layer_schedule(
+            max_z_mm,
+            params.first_layer_height_mm,
+            params.nominal_layer_height_mm,
+        );
+    }
+
+    let min_h = params.min_layer_height_mm;
+    let max_h = params.max_layer_height_mm;
+    let mut dz = (0.5 * min_h).clamp(0.02, 0.05);
+    let mut bins = (max_z_mm / dz).ceil().max(1.0) as usize;
+    if bins > 16_384 {
+        bins = 16_384;
+    }
+    dz = max_z_mm / (bins as f64);
+
+    let default_target = if params.adaptive {
+        max_h
+    } else {
+        params.nominal_layer_height_mm
+    };
+    let mut bin_target = vec![default_target; bins];
+
+    if params.adaptive {
+        let delta_min = 0.35 * min_h;
+        let delta_max = 1.6 * max_h;
+        let delta = delta_min + (1.0 - params.quality).powf(1.5) * (delta_max - delta_min);
+
+        for tri in &mesh.triangles {
+            let da = tri.double_area_vec();
+            let len = da.length();
+            if 0.5 * len <= 1e-12 {
+                continue;
+            }
+            let abs_nz = (da.z / len).abs().clamp(0.0, 1.0);
+            let z0 = tri.a.z.min(tri.b.z).min(tri.c.z) - aabb.min.z;
+            let z1 = tri.a.z.max(tri.b.z).max(tri.c.z) - aabb.min.z;
+            if abs_nz < 1e-3 || abs_nz > 0.9995 || (z1 - z0) < 1e-4 {
+                continue;
+            }
+            let horiz = (1.0 - abs_nz * abs_nz).max(1e-12).sqrt();
+            let tan_theta = abs_nz / horiz;
+            let h_tri = (delta / tan_theta).clamp(min_h, max_h);
+            let b0 = ((z0 / dz).floor() as isize).clamp(0, (bins as isize) - 1) as usize;
+            let b1 = ((z1 / dz).floor() as isize).clamp(0, (bins as isize) - 1) as usize;
+            for slot in bin_target.iter_mut().take(b1 + 1).skip(b0) {
+                *slot = (*slot).min(h_tri);
+            }
+        }
+
+        if params.smooth_radius_mm > 1e-4 {
+            let sigma = (0.5 * params.smooth_radius_mm).max(1e-4);
+            let half_w = (params.smooth_radius_mm / dz).ceil() as isize;
+            let mut weights = Vec::with_capacity((2 * half_w + 1).max(1) as usize);
+            let mut w_sum = 0.0;
+            for k in -half_w..=half_w {
+                let d = (k as f64) * dz;
+                let w = (-0.5 * (d / sigma) * (d / sigma)).exp();
+                weights.push((k, w));
+                w_sum += w;
+            }
+            if w_sum > 1e-12 {
+                let mut smoothed = Vec::with_capacity(bins);
+                let max_bi = (bins as isize) - 1;
+                for i in 0..bins {
+                    let mut acc = 0.0;
+                    for &(k, w) in &weights {
+                        let bi = (i as isize + k).clamp(0, max_bi) as usize;
+                        acc += w * bin_target.get(bi).copied().unwrap_or(default_target);
+                    }
+                    smoothed.push((acc / w_sum).clamp(min_h, max_h));
+                }
+                bin_target = smoothed;
+            }
+        }
+    }
+
+    let mut bin_explicit = vec![false; bins];
+    for r in &params.explicit_ranges {
+        for (b, slot) in bin_target.iter_mut().enumerate() {
+            let zc = ((b as f64) + 0.5) * dz;
+            if zc >= r.min_z_mm - 1e-9 && zc <= r.max_z_mm + 1e-9 {
+                *slot = r.layer_height_mm;
+                if let Some(flag) = bin_explicit.get_mut(b) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+
+    let sample_bin = |z_mm: f64| -> (f64, bool) {
+        let bi = ((z_mm / dz).floor() as isize).clamp(0, (bins as isize) - 1) as usize;
+        let h = bin_target.get(bi).copied().unwrap_or(default_target);
+        let is_exp = bin_explicit.get(bi).copied().unwrap_or(false);
+        (h, is_exp)
+    };
+
+    let mut schedule = Vec::new();
+    let eps = 1e-4;
+    let mut z_prev = 0.0;
+    let mut prev_h = params.first_layer_height_mm;
+
+    if max_z_mm > eps {
+        let z_top = params.first_layer_height_mm.min(max_z_mm);
+        schedule.push(LayerPlane {
+            index: 0,
+            z_top_mm: z_top,
+            z_slice_mm: 0.5 * z_top,
+            height_mm: z_top,
+        });
+        z_prev = z_top;
+        prev_h = z_top;
+    }
+
+    let mut idx = 1usize;
+    let base_floor = min_h.min(params.nominal_layer_height_mm);
+    while z_prev + eps < max_z_mm {
+        let (h0, exp0) = sample_bin(z_prev);
+        let (h1, exp1) = sample_bin(z_prev + 0.5 * h0);
+        let is_exp = exp1 || (exp0 && (h1 - h0).abs() < 1e-9);
+        let mut h_cand = if exp1 {
+            h1
+        } else if exp0 {
+            h0
+        } else {
+            h1
+        };
+        if params.adaptive && !is_exp {
+            let step_lo = prev_h / params.max_step_ratio;
+            let step_hi = prev_h * params.max_step_ratio;
+            h_cand = h_cand.clamp(step_lo, step_hi).clamp(min_h, max_h);
+        }
+
+        let rem = max_z_mm - z_prev;
+        let floor_h = base_floor.min(h_cand);
+        let (h_step, z_top) = if rem <= h_cand + eps {
+            if rem >= 0.5 * floor_h {
+                (rem, max_z_mm)
+            } else {
+                break;
+            }
+        } else if rem < h_cand + floor_h {
+            let half = 0.5 * rem;
+            (half, z_prev + half)
+        } else {
+            (h_cand, z_prev + h_cand)
+        };
+
+        let z_slice = z_prev + 0.5 * h_step;
+        if z_slice >= max_z_mm {
+            break;
+        }
+        schedule.push(LayerPlane {
+            index: idx,
+            z_top_mm: z_top,
+            z_slice_mm: z_slice,
+            height_mm: h_step,
+        });
+        z_prev = z_top;
+        prev_h = h_step;
+        idx += 1;
+        if idx > 1_000_000 {
+            return Err(MeshError::InvalidSchedule("excessive layer count"));
+        }
+    }
+
+    Ok(schedule)
+}
+
 /// Raw 2D slice regions produced at one Z plane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RawSliceLayer {
@@ -334,6 +727,33 @@ pub fn slice_mesh(
     let aabb = mesh.aabb().ok_or(GeomError::EmptyMesh)?;
     let max_z = aabb.max.z - aabb.min.z;
     let schedule = build_layer_schedule(max_z, first_layer_height_mm, layer_height_mm)?;
+    slice_mesh_with_schedule(mesh, &schedule)
+}
+
+/// Slice a mesh along a caller-supplied layer schedule (preserving variable per-layer heights).
+pub fn slice_mesh_with_schedule(
+    mesh: &TriangleMesh,
+    schedule: &[LayerPlane],
+) -> Result<Vec<RawSliceLayer>, MeshError> {
+    let z_planes: Vec<f64> = schedule.iter().map(|p| p.z_slice_mm).collect();
+    let slices = slice_mesh_at_z_planes(mesh, &z_planes)?;
+    Ok(schedule
+        .iter()
+        .copied()
+        .zip(slices)
+        .map(|(plane, regions)| RawSliceLayer { plane, regions })
+        .collect())
+}
+
+/// Intersect a mesh with an arbitrary list of Z planes, returning `Vec<ExPolygon>` per plane.
+pub fn slice_mesh_at_z_planes(
+    mesh: &TriangleMesh,
+    z_planes_mm: &[f64],
+) -> Result<Vec<Vec<ExPolygon>>, MeshError> {
+    let aabb = mesh.aabb().ok_or(GeomError::EmptyMesh)?;
+    if z_planes_mm.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // Precompute per-triangle Z bounds for fast per-layer filtering.
     let tri_z: Vec<(f64, f64, &Triangle)> = mesh
@@ -346,11 +766,13 @@ pub fn slice_mesh(
         })
         .collect();
 
-    let mut layers = Vec::with_capacity(schedule.len());
-    for plane in schedule {
-        let z = plane.z_slice_mm;
+    let mut out = Vec::with_capacity(z_planes_mm.len());
+    for &z in z_planes_mm {
+        if !z.is_finite() || z < aabb.min.z || z > aabb.max.z {
+            out.push(Vec::new());
+            continue;
+        }
         let mut segments: Vec<(Point2, Point2)> = Vec::new();
-
         for &(zmin, zmax, tri) in &tri_z {
             if zmin > z || zmax <= z {
                 continue;
@@ -361,13 +783,12 @@ pub fn slice_mesh(
                 segments.push(seg);
             }
         }
-
         let loops = stitch_segments_into_loops(&segments);
         let regions = union_polygons(&loops)?;
-        layers.push(RawSliceLayer { plane, regions });
+        out.push(regions);
     }
 
-    Ok(layers)
+    Ok(out)
 }
 
 fn lerp_edge_xy(p0: Point3, p1: Point3, z: f64) -> Result<Point2, GeomError> {
@@ -510,6 +931,7 @@ pub enum SampleShape {
     SteppedBlock,
     ThinRib,
     BridgeArch,
+    Dome,
 }
 
 impl SampleShape {
@@ -522,17 +944,19 @@ impl SampleShape {
             Self::SteppedBlock => "Stepped Block",
             Self::ThinRib => "Thin Rib 30x1.6",
             Self::BridgeArch => "Bridge Arch",
+            Self::Dome => "Dome R10 H18",
         }
     }
 
     /// All built-in sample variants.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Cube20,
         Self::Cylinder,
         Self::HollowTube,
         Self::SteppedBlock,
         Self::ThinRib,
         Self::BridgeArch,
+        Self::Dome,
     ];
 }
 
@@ -618,6 +1042,62 @@ pub fn build_sample_shape(shape: SampleShape) -> Result<TriangleMesh, MeshError>
                 push_sample_quad(&mut t, ib1, ib0, it0, it1);
                 push_sample_quad(&mut t, ib0, ib1, ob1, ob0);
                 push_sample_quad(&mut t, ot0, ot1, it1, it0);
+            }
+            t
+        }
+        SampleShape::Dome => {
+            let n = 48usize;
+            let rings = 16usize;
+            let r = 10.0;
+            let base_h = 8.0;
+            let mut t = Vec::with_capacity(n * (rings * 2 + 3));
+            let cb = Point3::new(0.0, 0.0, 0.0);
+            let mut ring_pts: Vec<Vec<Point3>> = Vec::with_capacity(rings);
+            for ri in 0..rings {
+                let phi = FRAC_PI_2 * (ri as f64) / (rings as f64);
+                let rr = r * phi.cos();
+                let zz = base_h + r * phi.sin();
+                let mut pts = Vec::with_capacity(n);
+                for i in 0..n {
+                    let a = TAU * (i as f64) / (n as f64);
+                    pts.push(Point3::new(rr * a.cos(), rr * a.sin(), zz));
+                }
+                ring_pts.push(pts);
+            }
+            if let Some(base_top) = ring_pts.first() {
+                for i in 0..n {
+                    let i1 = (i + 1) % n;
+                    let a0 = TAU * (i as f64) / (n as f64);
+                    let a1 = TAU * (i1 as f64) / (n as f64);
+                    let b0 = Point3::new(r * a0.cos(), r * a0.sin(), 0.0);
+                    let b1 = Point3::new(r * a1.cos(), r * a1.sin(), 0.0);
+                    t.push(Triangle::new(cb, b1, b0));
+                    if let (Some(&t0), Some(&t1)) = (base_top.get(i), base_top.get(i1)) {
+                        push_sample_quad(&mut t, b0, b1, t1, t0);
+                    }
+                }
+            }
+            for ri in 0..rings.saturating_sub(1) {
+                let (Some(cur), Some(nxt)) = (ring_pts.get(ri), ring_pts.get(ri + 1)) else {
+                    continue;
+                };
+                for i in 0..n {
+                    let i1 = (i + 1) % n;
+                    if let (Some(&p00), Some(&p10), Some(&p11), Some(&p01)) =
+                        (cur.get(i), cur.get(i1), nxt.get(i1), nxt.get(i))
+                    {
+                        push_sample_quad(&mut t, p00, p10, p11, p01);
+                    }
+                }
+            }
+            let apex = Point3::new(0.0, 0.0, base_h + r);
+            if let Some(last_ring) = ring_pts.last() {
+                for i in 0..n {
+                    let i1 = (i + 1) % n;
+                    if let (Some(&p0), Some(&p1)) = (last_ring.get(i), last_ring.get(i1)) {
+                        t.push(Triangle::new(p0, p1, apex));
+                    }
+                }
             }
             t
         }
@@ -726,6 +1206,134 @@ mod tests {
                     ..Default::default()
                 }
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adaptive_schedule_distinguishes_vertical_cube_and_curved_dome() {
+        let cube = prepare_for_plate(&unit_cube(12.0), 250.0, 250.0).unwrap();
+        let adapt_params = VariableScheduleParams {
+            first_layer_height_mm: 0.2,
+            nominal_layer_height_mm: 0.2,
+            adaptive: true,
+            min_layer_height_mm: 0.08,
+            max_layer_height_mm: 0.28,
+            quality: 0.6,
+            smooth_radius_mm: 2.0,
+            max_step_ratio: 1.5,
+            explicit_ranges: Vec::new(),
+        };
+        let cube_sched = build_variable_layer_schedule(&cube, &adapt_params).unwrap();
+        assert!((cube_sched.last().unwrap().z_top_mm - 12.0).abs() < 1e-6);
+        let thick_count = cube_sched
+            .iter()
+            .skip(1)
+            .filter(|l| l.height_mm >= 0.275)
+            .count();
+        assert!(
+            thick_count >= 40 && cube_sched.iter().skip(1).all(|l| l.height_mm >= 0.14),
+            "vertical walls on cube should stay thick: {:?}",
+            cube_sched.iter().map(|l| l.height_mm).collect::<Vec<_>>()
+        );
+
+        let dome_raw = build_sample_shape(SampleShape::Dome).unwrap();
+        let dome_insp = inspect_mesh(&dome_raw);
+        assert_eq!(dome_insp.non_manifold_edges, 0);
+        let dome = prepare_for_plate(&dome_raw, 250.0, 250.0).unwrap();
+        let dome_sched = build_variable_layer_schedule(&dome, &adapt_params).unwrap();
+        assert!((dome_sched.last().unwrap().z_top_mm - 18.0).abs() < 1e-6);
+        let upper_heights: Vec<f64> = dome_sched.iter().skip(1).map(|l| l.height_mm).collect();
+        let min_h = upper_heights.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_h = upper_heights.iter().copied().fold(0.0, f64::max);
+        assert!(
+            min_h <= 0.10,
+            "expected fine top cap layers, got min_h={min_h}"
+        );
+        assert!(
+            max_h >= 0.24,
+            "expected thick vertical base layers, got max_h={max_h}"
+        );
+
+        let banded = build_variable_layer_schedule(
+            &cube,
+            &VariableScheduleParams {
+                first_layer_height_mm: 0.2,
+                nominal_layer_height_mm: 0.2,
+                adaptive: false,
+                min_layer_height_mm: 0.08,
+                max_layer_height_mm: 0.28,
+                quality: 0.5,
+                smooth_radius_mm: 2.0,
+                max_step_ratio: 1.5,
+                explicit_ranges: vec![
+                    ExplicitHeightRange {
+                        min_z_mm: 0.0,
+                        max_z_mm: 4.0,
+                        layer_height_mm: 0.25,
+                    },
+                    ExplicitHeightRange {
+                        min_z_mm: 4.0,
+                        max_z_mm: 8.0,
+                        layer_height_mm: 0.10,
+                    },
+                    ExplicitHeightRange {
+                        min_z_mm: 8.0,
+                        max_z_mm: 12.0,
+                        layer_height_mm: 0.20,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert!((banded.last().unwrap().z_top_mm - 12.0).abs() < 1e-6);
+        let band_hs: Vec<f64> = banded.iter().skip(1).map(|l| l.height_mm).collect();
+        let bmin = band_hs.iter().copied().fold(f64::INFINITY, f64::min);
+        let bmax = band_hs.iter().copied().fold(0.0, f64::max);
+        assert!(bmin <= 0.105 && bmax >= 0.245, "min={bmin} max={bmax}");
+    }
+
+    #[test]
+    fn modifier_primitives_transform_without_grounding_and_slice_selected_z() {
+        let box_raw = build_modifier_primitive(ModifierPrimitive::Box {
+            width_mm: 10.0,
+            depth_mm: 8.0,
+            height_mm: 4.0,
+        })
+        .unwrap();
+        let xf = ModifierTransform {
+            position_xyz_mm: [125.0, 125.0, 10.0],
+            rotation_deg: [0.0, 0.0, 90.0],
+            scale: [1.0, 1.0, 1.0],
+        };
+        let prepared = prepare_modifier_mesh(&box_raw, xf).unwrap();
+        let bb = prepared.aabb().unwrap();
+        assert!((bb.min.z - 8.0).abs() < 1e-6);
+        assert!((bb.max.z - 12.0).abs() < 1e-6);
+        assert!((bb.size().x - 8.0).abs() < 1e-4);
+        assert!((bb.size().y - 10.0).abs() < 1e-4);
+
+        let cyl_raw = build_modifier_primitive(ModifierPrimitive::Cylinder {
+            radius_mm: 5.0,
+            height_mm: 6.0,
+            segments: 32,
+        })
+        .unwrap();
+        assert_eq!(inspect_mesh(&cyl_raw).non_manifold_edges, 0);
+
+        let slices = slice_mesh_at_z_planes(&prepared, &[2.0, 10.0, 15.0]).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert!(slices[0].is_empty());
+        assert_eq!(slices[1].len(), 1);
+        assert!((slices[1][0].area_mm2() - 80.0).abs() < 1e-2);
+        assert!(slices[2].is_empty());
+
+        assert!(
+            build_modifier_primitive(ModifierPrimitive::Box {
+                width_mm: 0.0,
+                depth_mm: 5.0,
+                height_mm: 5.0,
+            })
             .is_err()
         );
     }

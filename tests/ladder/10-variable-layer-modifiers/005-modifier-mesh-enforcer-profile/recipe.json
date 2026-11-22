@@ -1,0 +1,32 @@
+{
+  "name": "005-modifier-mesh-enforcer-profile",
+  "description": "Bridge arch with JSON profile enabling adaptive layer config keys & shell thicknesses plus cylinder mesh SupportEnforcer forcing support without global support",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 5.0,
+    "span_mm": 16.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 9.0,
+    "deck_height_mm": 2.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "process": "adaptive_020"
+  },
+  "modifiers": [
+    {
+      "name": "span_enforcer",
+      "role": "support_enforcer",
+      "shape": {
+        "kind": "cylinder",
+        "radius_mm": 4.5,
+        "height_mm": 11.0,
+        "segments": 24
+      },
+      "transform": {
+        "position_xyz_mm": [125.0, 125.0, 5.5]
+      }
+    }
+  ]
+}

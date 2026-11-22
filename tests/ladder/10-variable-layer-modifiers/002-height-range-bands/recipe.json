@@ -1,0 +1,38 @@
+{
+  "name": "002-height-range-bands",
+  "description": "20x20x12 mm box with three Z height-range bands varying layer height (0.25 / 0.10 / 0.20 mm), infill pattern/density, and wall loops",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 20.0,
+    "height_mm": 12.0
+  },
+  "config": {
+    "process": {
+      "height_ranges": [
+        {
+          "min_z_mm": 0.0,
+          "max_z_mm": 4.0,
+          "layer_height_mm": 0.25
+        },
+        {
+          "min_z_mm": 4.0,
+          "max_z_mm": 8.0,
+          "layer_height_mm": 0.10,
+          "overrides": {
+            "sparse_infill_density": 0.50,
+            "sparse_infill_pattern": "gyroid"
+          }
+        },
+        {
+          "min_z_mm": 8.0,
+          "max_z_mm": 12.0,
+          "layer_height_mm": 0.20,
+          "overrides": {
+            "wall_loops": 4
+          }
+        }
+      ]
+    }
+  }
+}

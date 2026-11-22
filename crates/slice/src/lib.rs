@@ -1,7 +1,10 @@
 //! Deterministic FDM slicing pipeline: slice -> perimeters -> skins -> infill -> adhesion.
 
 mod arachne;
+mod modifiers;
 mod tree_support;
+
+pub use modifiers::ModifierVolume;
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};
 
@@ -11,7 +14,11 @@ use layercraft_clip::{
 };
 use layercraft_config::{InfillPattern, IroningType, PrintConfig, SupportStyle, WallGenerator};
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
-use layercraft_mesh::{MeshError, RawSliceLayer, prepare_for_plate, slice_mesh};
+use layercraft_mesh::{
+    ExplicitHeightRange, MeshError, RawSliceLayer, VariableScheduleParams,
+    build_variable_layer_schedule, prepare_for_plate, slice_mesh, slice_mesh_with_schedule,
+};
+use modifiers::{EffectiveLayerParams, partition_regions, slice_modifier_volumes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -190,13 +197,22 @@ pub fn slice_single_mesh(
     mesh: &TriangleMesh,
     config: &PrintConfig,
 ) -> Result<SlicedPlate, SliceError> {
+    slice_single_mesh_with_modifiers(mesh, config, &[])
+}
+
+/// Run the full slicing pipeline for a single mesh with modifier volumes and/or support masks.
+pub fn slice_single_mesh_with_modifiers(
+    mesh: &TriangleMesh,
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+) -> Result<SlicedPlate, SliceError> {
     config.validate()?;
     let prepared = prepare_for_plate(
         mesh,
         config.machine.bed_width_mm,
         config.machine.bed_depth_mm,
     )?;
-    slice_prepared_mesh(&prepared, config)
+    slice_prepared_mesh_with_modifiers(&prepared, config, modifiers)
 }
 
 /// Run the full slicing pipeline on an already positioned/grounded plate mesh without re-centering.
@@ -204,13 +220,58 @@ pub fn slice_prepared_mesh(
     prepared: &TriangleMesh,
     config: &PrintConfig,
 ) -> Result<SlicedPlate, SliceError> {
+    slice_prepared_mesh_with_modifiers(prepared, config, &[])
+}
+
+/// Run the full slicing pipeline on a prepared plate mesh with optional modifier volumes.
+pub fn slice_prepared_mesh_with_modifiers(
+    prepared: &TriangleMesh,
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+) -> Result<SlicedPlate, SliceError> {
     config.validate()?;
-    let raw_layers = slice_mesh(
-        prepared,
-        config.process.first_layer_height_mm,
-        config.process.layer_height_mm,
-    )?;
-    slice_from_raw_layers(&raw_layers, config)
+    for m in modifiers {
+        m.overrides.validate()?;
+    }
+
+    let al = &config.process.adaptive_layer_height;
+    let explicit_ranges: Vec<ExplicitHeightRange> = config
+        .process
+        .height_ranges
+        .iter()
+        .filter_map(|hr| {
+            hr.layer_height_mm.map(|h| ExplicitHeightRange {
+                min_z_mm: hr.min_z_mm,
+                max_z_mm: hr.max_z_mm,
+                layer_height_mm: h,
+            })
+        })
+        .collect();
+
+    let raw_layers = if al.enabled || !explicit_ranges.is_empty() {
+        let nozzle_d = config.machine.nozzle_diameter_mm;
+        let nom_h = config.process.layer_height_mm;
+        let sched_params = VariableScheduleParams {
+            first_layer_height_mm: config.process.first_layer_height_mm,
+            nominal_layer_height_mm: nom_h,
+            adaptive: al.enabled,
+            min_layer_height_mm: al.effective_min_layer_height_mm(nozzle_d, nom_h),
+            max_layer_height_mm: al.effective_max_layer_height_mm(nozzle_d, nom_h),
+            quality: al.quality,
+            smooth_radius_mm: al.smooth_radius_mm,
+            max_step_ratio: al.max_step_ratio,
+            explicit_ranges,
+        };
+        let schedule = build_variable_layer_schedule(prepared, &sched_params)?;
+        slice_mesh_with_schedule(prepared, &schedule)?
+    } else {
+        slice_mesh(
+            prepared,
+            config.process.first_layer_height_mm,
+            config.process.layer_height_mm,
+        )?
+    };
+    slice_from_raw_layers_with_modifiers(&raw_layers, config, modifiers)
 }
 
 /// Merge multiple prepared plate meshes and slice them together while preserving their transforms.
@@ -218,9 +279,18 @@ pub fn slice_meshes(
     prepared_meshes: &[TriangleMesh],
     config: &PrintConfig,
 ) -> Result<SlicedPlate, SliceError> {
+    slice_meshes_with_modifiers(prepared_meshes, config, &[])
+}
+
+/// Merge multiple prepared plate meshes and slice them together with optional modifier volumes.
+pub fn slice_meshes_with_modifiers(
+    prepared_meshes: &[TriangleMesh],
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+) -> Result<SlicedPlate, SliceError> {
     config.validate()?;
     let combined = TriangleMesh::merge(prepared_meshes)?;
-    slice_prepared_mesh(&combined, config)
+    slice_prepared_mesh_with_modifiers(&combined, config, modifiers)
 }
 
 /// Execute perimeters, skin detection, infill, supports, and adhesion from pre-sliced Z layers.
@@ -228,19 +298,233 @@ pub fn slice_from_raw_layers(
     raw_layers: &[RawSliceLayer],
     config: &PrintConfig,
 ) -> Result<SlicedPlate, SliceError> {
-    config.validate()?;
+    slice_from_raw_layers_with_modifiers(raw_layers, config, &[])
+}
+
+fn union_if_multi(mut polys: Vec<ExPolygon>) -> Result<Vec<ExPolygon>, SliceError> {
+    if polys.len() > 1 {
+        polys = union(&polys)?;
+    }
+    Ok(polys)
+}
+
+fn bottom_shell_start_idx(
+    raw_layers: &[RawSliceLayer],
+    idx: usize,
+    min_layers: usize,
+    min_thickness_mm: Option<f64>,
+) -> usize {
+    if min_layers == 0 {
+        return idx + 1;
+    }
+    let mut start = idx.saturating_sub(min_layers - 1);
+    if let Some(thick) = min_thickness_mm
+        && thick > 0.0
+        && let Some(cur) = raw_layers.get(idx)
+    {
+        let z_top_idx = cur.plane.z_top_mm;
+        for j in (0..idx).rev() {
+            let Some(cand) = raw_layers.get(j) else {
+                continue;
+            };
+            let z_bot_j = cand.plane.z_top_mm - cand.plane.height_mm;
+            if z_top_idx - z_bot_j <= thick + 1e-4 {
+                start = start.min(j);
+            } else {
+                break;
+            }
+        }
+    }
+    start
+}
+
+fn top_shell_end_idx(
+    raw_layers: &[RawSliceLayer],
+    idx: usize,
+    min_layers: usize,
+    min_thickness_mm: Option<f64>,
+) -> usize {
     let n = raw_layers.len();
-    let support_paths_per_layer = generate_support_paths(raw_layers, config)?;
+    if min_layers == 0 || n == 0 {
+        return idx;
+    }
+    let mut end = (idx + min_layers - 1).min(n - 1);
+    if let Some(thick) = min_thickness_mm
+        && thick > 0.0
+        && let Some(cur) = raw_layers.get(idx)
+    {
+        let z_bot_idx = cur.plane.z_top_mm - cur.plane.height_mm;
+        for j in (idx + 1)..n {
+            let Some(cand) = raw_layers.get(j) else {
+                continue;
+            };
+            if cand.plane.z_top_mm - z_bot_idx <= thick + 1e-4 {
+                end = end.max(j);
+            } else {
+                break;
+            }
+        }
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_sparse_infill_for_region(
+    sparse_region: &[ExPolygon],
+    layer_idx: usize,
+    z_top_mm: f64,
+    height_mm: f64,
+    density: f64,
+    pattern: InfillPattern,
+    width_mm: f64,
+    speed_mm_s: f64,
+) -> Result<Vec<ExtrusionPath>, SliceError> {
+    if sparse_region.is_empty() || density <= 1e-6 {
+        return Ok(Vec::new());
+    }
+    match pattern {
+        InfillPattern::Rectilinear => {
+            let pitch = (width_mm / density).max(width_mm);
+            let angle = if layer_idx.is_multiple_of(2) {
+                FRAC_PI_4
+            } else {
+                -FRAC_PI_4
+            };
+            generate_rectilinear_hatch(
+                sparse_region,
+                angle,
+                pitch,
+                0.0,
+                false,
+                ExtrusionRole::SparseInfill,
+                width_mm,
+                height_mm,
+                speed_mm_s,
+                1.0,
+            )
+        }
+        InfillPattern::Grid => {
+            // Two orthogonal hatch families at pitch = 2 * width / density yield effective
+            // area fill density = density.
+            let pitch = (2.0 * width_mm / density).max(width_mm);
+            let mut out = Vec::new();
+            for angle in [FRAC_PI_4, -FRAC_PI_4] {
+                let hatched = generate_rectilinear_hatch(
+                    sparse_region,
+                    angle,
+                    pitch,
+                    0.0,
+                    false,
+                    ExtrusionRole::SparseInfill,
+                    width_mm,
+                    height_mm,
+                    speed_mm_s,
+                    1.0,
+                )?;
+                out.extend(hatched);
+            }
+            Ok(out)
+        }
+        InfillPattern::Cubic => {
+            let pitch = (3.0 * width_mm / density).max(width_mm);
+            let phase = -z_top_mm / SQRT_2;
+            let mut out = Vec::new();
+            for j in 0..3 {
+                let theta = (j as f64) * (2.0 * PI / 3.0);
+                let hatch_angle = theta - FRAC_PI_2;
+                let hatched = generate_rectilinear_hatch(
+                    sparse_region,
+                    hatch_angle,
+                    pitch,
+                    phase,
+                    false,
+                    ExtrusionRole::SparseInfill,
+                    width_mm,
+                    height_mm,
+                    speed_mm_s,
+                    1.0,
+                )?;
+                out.extend(hatched);
+            }
+            Ok(out)
+        }
+        InfillPattern::Gyroid => generate_gyroid_infill(
+            sparse_region,
+            z_top_mm,
+            density,
+            width_mm,
+            height_mm,
+            speed_mm_s,
+        ),
+    }
+}
+
+/// Execute perimeters, skin detection, infill, supports, and adhesion from pre-sliced Z layers with modifiers.
+pub fn slice_from_raw_layers_with_modifiers(
+    raw_layers: &[RawSliceLayer],
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+) -> Result<SlicedPlate, SliceError> {
+    config.validate()?;
+    for m in modifiers {
+        m.overrides.validate()?;
+    }
+
+    let n = raw_layers.len();
+    let sliced_mods = slice_modifier_volumes(modifiers, raw_layers)?;
+    let support_paths_per_layer = generate_support_paths(
+        raw_layers,
+        config,
+        &sliced_mods.blocker_masks,
+        &sliced_mods.enforcer_masks,
+    )?;
+
+    let mut per_layer_base_params: Vec<EffectiveLayerParams> = Vec::with_capacity(n);
+    for raw in raw_layers {
+        let mut base_p = EffectiveLayerParams::from_config(config);
+        base_p.apply_height_ranges(&config.process.height_ranges, raw.plane.z_slice_mm);
+        per_layer_base_params.push(base_p);
+    }
 
     let mut per_layer_walls: Vec<Vec<ExtrusionPath>> = Vec::with_capacity(n);
     let mut per_layer_infill_areas: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
 
     // Stage 2: Perimeters & infill boundary extraction.
-    for raw in raw_layers {
+    for (idx, raw) in raw_layers.iter().enumerate() {
         let h = raw.plane.height_mm;
-        let (walls, infill_area) = build_perimeters(&raw.regions, raw.plane.index, h, config)?;
-        per_layer_walls.push(walls);
-        per_layer_infill_areas.push(infill_area);
+        let Some(base_p) = per_layer_base_params.get(idx) else {
+            continue;
+        };
+        let active_perim = sliced_mods.active_param_mods(idx, |ov| ov.affects_perimeters());
+        if active_perim.is_empty() {
+            let layer_cfg = if base_p.wall_loops != config.process.wall_loops
+                || (base_p.outer_wall_speed_mm_s - config.process.outer_wall_speed_mm_s).abs()
+                    > 1e-9
+                || (base_p.inner_wall_speed_mm_s - config.process.inner_wall_speed_mm_s).abs()
+                    > 1e-9
+            {
+                Some(base_p.to_layer_config(config))
+            } else {
+                None
+            };
+            let cfg_ref = layer_cfg.as_ref().unwrap_or(config);
+            let (walls, infill_area) = build_perimeters(&raw.regions, raw.plane.index, h, cfg_ref)?;
+            per_layer_walls.push(walls);
+            per_layer_infill_areas.push(infill_area);
+        } else {
+            let buckets = partition_regions(&raw.regions, base_p, &active_perim)?;
+            let mut layer_walls = Vec::new();
+            let mut combined_infill = Vec::new();
+            for (sub_regs, b_params) in buckets {
+                let bucket_cfg = b_params.to_layer_config(config);
+                let (walls, sub_infill) =
+                    build_perimeters(&sub_regs, raw.plane.index, h, &bucket_cfg)?;
+                layer_walls.extend(walls);
+                combined_infill.extend(sub_infill);
+            }
+            per_layer_walls.push(layer_walls);
+            per_layer_infill_areas.push(union_if_multi(combined_infill)?);
+        }
     }
 
     // Stage 3: Top / bottom exposed surface detection & shell propagation.
@@ -264,15 +548,15 @@ pub fn slice_from_raw_layers(
         top_exposed.push(difference(infill_here, above)?);
     }
 
-    let bottom_shells = config.process.bottom_shell_layers as usize;
-    let top_shells = config.process.top_shell_layers as usize;
-
     let mut layers = Vec::with_capacity(n);
     for idx in 0..n {
         let Some(raw) = raw_layers.get(idx) else {
             continue;
         };
         let Some(infill_here) = per_layer_infill_areas.get(idx) else {
+            continue;
+        };
+        let Some(base_p) = per_layer_base_params.get(idx) else {
             continue;
         };
         let h = raw.plane.height_mm;
@@ -304,45 +588,135 @@ pub fn slice_from_raw_layers(
             }
         }
 
-        // Gather solid shell regions from nearby bottom/top exposed layers.
-        let mut shell_sources: Vec<ExPolygon> = Vec::new();
-        if bottom_shells > 0 {
-            let min_j = idx.saturating_sub(bottom_shells - 1);
-            for j in min_j..=idx {
-                if let Some(exp) = bottom_exposed.get(j) {
-                    shell_sources.extend(exp.iter().cloned());
-                }
-            }
-        }
-        if top_shells > 0 {
-            let max_j = (idx + top_shells - 1).min(n.saturating_sub(1));
-            for j in idx..=max_j {
-                if let Some(exp) = top_exposed.get(j) {
-                    shell_sources.extend(exp.iter().cloned());
-                }
-            }
-        }
+        let active_shells = sliced_mods.active_param_mods(idx, |ov| ov.affects_shells());
+        let (top_here, mut bottom_here, mut internal_solid, mut sparse_region) =
+            if active_shells.is_empty() {
+                let bottom_shells = base_p.bottom_shell_layers as usize;
+                let top_shells = base_p.top_shell_layers as usize;
 
-        let solid_union = if shell_sources.is_empty() {
-            Vec::new()
-        } else {
-            intersection(infill_here, &union(&shell_sources)?)?
-        };
+                let mut shell_sources: Vec<ExPolygon> = Vec::new();
+                if bottom_shells > 0 {
+                    let min_j = bottom_shell_start_idx(
+                        raw_layers,
+                        idx,
+                        bottom_shells,
+                        config.process.bottom_shell_thickness_mm,
+                    );
+                    for j in min_j..=idx {
+                        if let Some(exp) = bottom_exposed.get(j) {
+                            shell_sources.extend(exp.iter().cloned());
+                        }
+                    }
+                }
+                if top_shells > 0 {
+                    let max_j = top_shell_end_idx(
+                        raw_layers,
+                        idx,
+                        top_shells,
+                        config.process.top_shell_thickness_mm,
+                    );
+                    for j in idx..=max_j {
+                        if let Some(exp) = top_exposed.get(j) {
+                            shell_sources.extend(exp.iter().cloned());
+                        }
+                    }
+                }
 
-        let top_here = if top_shells > 0 {
-            top_exposed.get(idx).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut bottom_here = if bottom_shells > 0 {
-            let b = bottom_exposed.get(idx).cloned().unwrap_or_default();
-            difference(&b, &top_here)?
-        } else {
-            Vec::new()
-        };
-        let exposed_here = union(&[top_here.as_slice(), bottom_here.as_slice()].concat())?;
-        let mut internal_solid = difference(&solid_union, &exposed_here)?;
-        let mut sparse_region = difference(infill_here, &solid_union)?;
+                let solid_union = if shell_sources.is_empty() {
+                    Vec::new()
+                } else {
+                    intersection(infill_here, &union(&shell_sources)?)?
+                };
+
+                let top_h = if top_shells > 0 {
+                    top_exposed.get(idx).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let bot_h = if bottom_shells > 0 {
+                    let b = bottom_exposed.get(idx).cloned().unwrap_or_default();
+                    difference(&b, &top_h)?
+                } else {
+                    Vec::new()
+                };
+                let exposed_h = union(&[top_h.as_slice(), bot_h.as_slice()].concat())?;
+                let internal_h = difference(&solid_union, &exposed_h)?;
+                let sparse_h = difference(infill_here, &solid_union)?;
+                (top_h, bot_h, internal_h, sparse_h)
+            } else {
+                let shell_buckets = partition_regions(infill_here, base_p, &active_shells)?;
+                let top_exp_here = top_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                let bot_exp_here = bottom_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                let mut acc_top = Vec::new();
+                let mut acc_bot = Vec::new();
+                let mut acc_int = Vec::new();
+                let mut acc_spr = Vec::new();
+
+                for (sub_infill, b_params) in shell_buckets {
+                    let b_bottom_n = b_params.bottom_shell_layers as usize;
+                    let b_top_n = b_params.top_shell_layers as usize;
+
+                    let mut shell_sources: Vec<ExPolygon> = Vec::new();
+                    if b_bottom_n > 0 {
+                        let min_j = bottom_shell_start_idx(
+                            raw_layers,
+                            idx,
+                            b_bottom_n,
+                            config.process.bottom_shell_thickness_mm,
+                        );
+                        for j in min_j..=idx {
+                            if let Some(exp) = bottom_exposed.get(j) {
+                                shell_sources.extend(exp.iter().cloned());
+                            }
+                        }
+                    }
+                    if b_top_n > 0 {
+                        let max_j = top_shell_end_idx(
+                            raw_layers,
+                            idx,
+                            b_top_n,
+                            config.process.top_shell_thickness_mm,
+                        );
+                        for j in idx..=max_j {
+                            if let Some(exp) = top_exposed.get(j) {
+                                shell_sources.extend(exp.iter().cloned());
+                            }
+                        }
+                    }
+
+                    let solid_union = if shell_sources.is_empty() {
+                        Vec::new()
+                    } else {
+                        intersection(&sub_infill, &union(&shell_sources)?)?
+                    };
+                    let b_top = if b_top_n > 0 && !top_exp_here.is_empty() {
+                        intersection(&sub_infill, top_exp_here)?
+                    } else {
+                        Vec::new()
+                    };
+                    let b_bot = if b_bottom_n > 0 && !bot_exp_here.is_empty() {
+                        let raw_b = intersection(&sub_infill, bot_exp_here)?;
+                        difference(&raw_b, &b_top)?
+                    } else {
+                        Vec::new()
+                    };
+                    let b_exposed = union(&[b_top.as_slice(), b_bot.as_slice()].concat())?;
+                    let b_internal = difference(&solid_union, &b_exposed)?;
+                    let b_sparse = difference(&sub_infill, &solid_union)?;
+
+                    acc_top.extend(b_top);
+                    acc_bot.extend(b_bot);
+                    acc_int.extend(b_internal);
+                    acc_spr.extend(b_sparse);
+                }
+
+                (
+                    union_if_multi(acc_top)?,
+                    union_if_multi(acc_bot)?,
+                    union_if_multi(acc_int)?,
+                    union_if_multi(acc_spr)?,
+                )
+            };
 
         let solid_speed = if is_first {
             config.process.effective_first_layer_infill_speed_mm_s()
@@ -432,96 +806,48 @@ pub fn slice_from_raw_layers(
         }
         paths.extend(bridge_paths);
 
-        // Stage 4: Sparse infill.
-        let density = config.process.sparse_infill_density;
-        if !sparse_region.is_empty() && density > 1e-6 {
+        // Stage 4: Sparse infill (partitioned across active modifier volumes when present).
+        if !sparse_region.is_empty() {
             let sparse_w = config.process.sparse_infill_width_mm;
-            let sparse_speed = if is_first {
-                config.process.effective_first_layer_infill_speed_mm_s()
-            } else {
-                config.process.infill_speed_mm_s
-            };
-            match config.process.sparse_infill_pattern {
-                InfillPattern::Rectilinear => {
-                    let pitch = (sparse_w / density).max(sparse_w);
-                    let angle = if idx % 2 == 0 { FRAC_PI_4 } else { -FRAC_PI_4 };
-                    let hatched = generate_rectilinear_hatch(
-                        &sparse_region,
-                        angle,
-                        pitch,
-                        0.0,
-                        false,
-                        ExtrusionRole::SparseInfill,
-                        sparse_w,
-                        h,
-                        sparse_speed,
-                        1.0,
-                    )?;
-                    paths.extend(hatched);
+            let active_infill = sliced_mods.active_param_mods(idx, |ov| {
+                ov.sparse_infill_density.is_some()
+                    || ov.sparse_infill_pattern.is_some()
+                    || ov.infill_speed_mm_s.is_some()
+            });
+            let infill_buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
+            for (sub_sparse, b_params) in infill_buckets {
+                if sub_sparse.is_empty() || b_params.sparse_infill_density <= 1e-6 {
+                    continue;
                 }
-                InfillPattern::Grid => {
-                    // Two orthogonal hatch families at pitch = 2 * width / density yield effective
-                    // area fill density = density.
-                    let pitch = (2.0 * sparse_w / density).max(sparse_w);
-                    for angle in [FRAC_PI_4, -FRAC_PI_4] {
-                        let hatched = generate_rectilinear_hatch(
-                            &sparse_region,
-                            angle,
-                            pitch,
-                            0.0,
-                            false,
-                            ExtrusionRole::SparseInfill,
-                            sparse_w,
-                            h,
-                            sparse_speed,
-                            1.0,
-                        )?;
-                        paths.extend(hatched);
-                    }
-                }
-                InfillPattern::Cubic => {
-                    let pitch = (3.0 * sparse_w / density).max(sparse_w);
-                    let phase = -raw.plane.z_top_mm / SQRT_2;
-                    for j in 0..3 {
-                        let theta = (j as f64) * (2.0 * PI / 3.0);
-                        let hatch_angle = theta - FRAC_PI_2;
-                        let hatched = generate_rectilinear_hatch(
-                            &sparse_region,
-                            hatch_angle,
-                            pitch,
-                            phase,
-                            false,
-                            ExtrusionRole::SparseInfill,
-                            sparse_w,
-                            h,
-                            sparse_speed,
-                            1.0,
-                        )?;
-                        paths.extend(hatched);
-                    }
-                }
-                InfillPattern::Gyroid => {
-                    let gyroid = generate_gyroid_infill(
-                        &sparse_region,
-                        raw.plane.z_top_mm,
-                        density,
-                        sparse_w,
-                        h,
-                        sparse_speed,
-                    )?;
-                    paths.extend(gyroid);
-                }
+                let speed = if is_first
+                    && (b_params.infill_speed_mm_s - config.process.infill_speed_mm_s).abs() < 1e-9
+                {
+                    config.process.effective_first_layer_infill_speed_mm_s()
+                } else {
+                    b_params.infill_speed_mm_s
+                };
+                let hatched = generate_sparse_infill_for_region(
+                    &sub_sparse,
+                    idx,
+                    raw.plane.z_top_mm,
+                    h,
+                    b_params.sparse_infill_density,
+                    b_params.sparse_infill_pattern,
+                    sparse_w,
+                    speed,
+                )?;
+                paths.extend(hatched);
             }
         }
 
-        // Stage 6 (Optional): Top-surface ironing pass.
+        // Stage 6 (Optional): Top-surface ironing pass (global, height-range, or modifier-local).
         let iron = &config.process.ironing;
-        let iron_here = match iron.mode {
-            IroningType::Off => false,
-            IroningType::TopmostSurface => idx + 1 == n,
-            IroningType::AllTopSurfaces => true,
-        };
-        if iron_here && !raw.regions.is_empty() {
+        let active_iron = sliced_mods.active_param_mods(idx, |ov| ov.ironing_mode.is_some());
+        let any_iron = base_p.ironing_mode != IroningType::Off
+            || active_iron
+                .iter()
+                .any(|(_, ov)| ov.ironing_mode.is_some_and(|m| m != IroningType::Off));
+        if any_iron && !raw.regions.is_empty() {
             let above = raw_layers
                 .get(idx + 1)
                 .map(|l| l.regions.as_slice())
@@ -538,21 +864,31 @@ pub fn slice_from_raw_layers(
                     exposed_top
                 };
                 if !iron_regions.is_empty() {
+                    let iron_buckets = partition_regions(&iron_regions, base_p, &active_iron)?;
                     let iron_angle = solid_angle + iron.angle_offset_deg.to_radians();
                     let scaled_flow = (iron.flow_ratio * iron.line_spacing_mm / solid_w).max(0.005);
-                    let iron_paths = generate_rectilinear_hatch(
-                        &iron_regions,
-                        iron_angle,
-                        iron.line_spacing_mm,
-                        0.0,
-                        true,
-                        ExtrusionRole::Ironing,
-                        solid_w,
-                        h,
-                        iron.speed_mm_s,
-                        scaled_flow,
-                    )?;
-                    paths.extend(iron_paths);
+                    for (sub_iron, b_params) in iron_buckets {
+                        let iron_here = match b_params.ironing_mode {
+                            IroningType::Off => false,
+                            IroningType::TopmostSurface => idx + 1 == n,
+                            IroningType::AllTopSurfaces => true,
+                        };
+                        if iron_here && !sub_iron.is_empty() {
+                            let iron_paths = generate_rectilinear_hatch(
+                                &sub_iron,
+                                iron_angle,
+                                iron.line_spacing_mm,
+                                0.0,
+                                true,
+                                ExtrusionRole::Ironing,
+                                solid_w,
+                                h,
+                                iron.speed_mm_s,
+                                scaled_flow,
+                            )?;
+                            paths.extend(iron_paths);
+                        }
+                    }
                 }
             }
         }
@@ -964,17 +1300,67 @@ pub(crate) fn bed_clamp_expolygon(config: &PrintConfig) -> Result<ExPolygon, Sli
     Ok(ExPolygon::new(outer, Vec::new()))
 }
 
+pub(crate) fn find_support_contact_layer(
+    raw_layers: &[RawSliceLayer],
+    overhang_idx: usize,
+    gap_mm: f64,
+) -> Option<usize> {
+    if overhang_idx == 0 {
+        return None;
+    }
+    let ovh_layer = raw_layers.get(overhang_idx)?;
+    let z_ovh_bot = ovh_layer.plane.z_top_mm - ovh_layer.plane.height_mm;
+    if gap_mm <= 1e-6 {
+        return Some(overhang_idx - 1);
+    }
+
+    let mut best_diff = (z_ovh_bot - gap_mm).abs();
+    let mut best_gap = z_ovh_bot;
+    let mut best_idx: Option<usize> = None;
+
+    for j in (0..overhang_idx).rev() {
+        let Some(cand) = raw_layers.get(j) else {
+            continue;
+        };
+        let gap = (z_ovh_bot - cand.plane.z_top_mm).max(0.0);
+        let diff = (gap - gap_mm).abs();
+        if diff + 1e-9 < best_diff || ((diff - best_diff).abs() <= 1e-9 && gap > best_gap) {
+            best_diff = diff;
+            best_gap = gap;
+            best_idx = Some(j);
+        }
+        if gap > gap_mm && diff > best_diff + 1e-6 {
+            break;
+        }
+    }
+    best_idx
+}
+
+pub(crate) fn bottom_gap_exclusion_range(
+    raw_layers: &[RawSliceLayer],
+    idx: usize,
+    gap_mm: f64,
+) -> std::ops::Range<usize> {
+    if idx == 0 || gap_mm <= 1e-6 {
+        return 0..0;
+    }
+    let start = match find_support_contact_layer(raw_layers, idx, gap_mm) {
+        Some(keep_below) => keep_below + 1,
+        None => 0,
+    };
+    start..idx
+}
+
 pub(crate) fn detect_contact_overhangs(
     raw_layers: &[RawSliceLayer],
     bed_slice: &[ExPolygon],
     config: &PrintConfig,
+    blocker_masks: &[Vec<ExPolygon>],
+    enforcer_masks: &[Vec<ExPolygon>],
 ) -> Result<Vec<Vec<ExPolygon>>, SliceError> {
     let n = raw_layers.len();
     let s = &config.process.support;
     let join = JoinType::Miter { limit: 2.0 };
-    let top_gap_layers = (s.top_z_distance_mm / config.process.layer_height_mm)
-        .round()
-        .max(0.0) as usize;
     let mut contact_overhangs: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
 
     for idx in 1..n {
@@ -988,20 +1374,67 @@ pub(crate) fn detect_contact_overhangs(
             continue;
         }
         let h = here_layer.plane.height_mm;
-        let dx_safe = h * s.threshold_angle_deg.to_radians().tan();
-        let supported = offset(&below_layer.regions, mm_to_nm(dx_safe)?, join)?;
-        let mut ovh = difference(&here_layer.regions, &supported)?;
+        let mut ovh = if s.enabled {
+            let dx_safe = h * s.threshold_angle_deg.to_radians().tan();
+            let supported = offset(&below_layer.regions, mm_to_nm(dx_safe)?, join)?;
+            difference(&here_layer.regions, &supported)?
+        } else {
+            Vec::new()
+        };
+
+        let enf_here = enforcer_masks.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+        let enf_below = enforcer_masks
+            .get(idx - 1)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !enf_here.is_empty() || !enf_below.is_empty() {
+            let raw_unsupported = difference(&here_layer.regions, &below_layer.regions)?;
+            if !raw_unsupported.is_empty() {
+                let combined_enf = if enf_here.is_empty() {
+                    enf_below.to_vec()
+                } else if enf_below.is_empty() {
+                    enf_here.to_vec()
+                } else {
+                    union(&[enf_here, enf_below].concat())?
+                };
+                let forced = intersection(&raw_unsupported, &combined_enf)?;
+                if !forced.is_empty() {
+                    if ovh.is_empty() {
+                        ovh = forced;
+                    } else {
+                        ovh.extend(forced);
+                        ovh = union(&ovh)?;
+                    }
+                }
+            }
+        }
+
+        let blocker_here = blocker_masks.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+        if !blocker_here.is_empty() && !ovh.is_empty() {
+            ovh = difference(&ovh, blocker_here)?;
+        }
         if ovh.is_empty() {
             continue;
         }
+
         if s.style == SupportStyle::Grid {
             let expanded = offset(&ovh, mm_to_nm(0.5 * s.line_width_mm)?, join)?;
             ovh = intersection(&expanded, bed_slice)?;
         }
-        if idx > top_gap_layers
-            && let Some(slot) = contact_overhangs.get_mut(idx - 1 - top_gap_layers)
-        {
-            slot.extend(ovh);
+
+        if let Some(target_idx) = find_support_contact_layer(raw_layers, idx, s.top_z_distance_mm) {
+            let blocker_target = blocker_masks
+                .get(target_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !blocker_target.is_empty() {
+                ovh = difference(&ovh, blocker_target)?;
+            }
+            if !ovh.is_empty()
+                && let Some(slot) = contact_overhangs.get_mut(target_idx)
+            {
+                slot.extend(ovh);
+            }
         }
     }
 
@@ -1017,15 +1450,23 @@ pub(crate) fn detect_contact_overhangs(
 fn generate_support_paths(
     raw_layers: &[RawSliceLayer],
     config: &PrintConfig,
+    blocker_masks: &[Vec<ExPolygon>],
+    enforcer_masks: &[Vec<ExPolygon>],
 ) -> Result<Vec<Vec<ExtrusionPath>>, SliceError> {
     let n = raw_layers.len();
     let mut per_layer = vec![Vec::new(); n];
     let s = &config.process.support;
-    if !s.enabled || n < 2 {
+    let has_enforcer = enforcer_masks.iter().any(|m| !m.is_empty());
+    if (!s.enabled && !has_enforcer) || n < 2 {
         return Ok(per_layer);
     }
     if s.style == SupportStyle::Tree {
-        return tree_support::generate_tree_support_paths(raw_layers, config);
+        return tree_support::generate_tree_support_paths(
+            raw_layers,
+            config,
+            blocker_masks,
+            enforcer_masks,
+        );
     }
 
     let join = JoinType::Miter { limit: 2.0 };
@@ -1033,12 +1474,10 @@ fn generate_support_paths(
     let bed_slice = std::slice::from_ref(&bed_box);
 
     // Pass 1: Overhang detection & top Z contact mapping.
-    let contact_overhangs = detect_contact_overhangs(raw_layers, bed_slice, config)?;
+    let contact_overhangs =
+        detect_contact_overhangs(raw_layers, bed_slice, config, blocker_masks, enforcer_masks)?;
 
     // Pass 2: Top-down column projection with XY & bottom-Z model clearance.
-    let bottom_gap_layers = (s.bottom_z_distance_mm / config.process.layer_height_mm)
-        .round()
-        .max(0.0) as usize;
     let mut support_volume: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
     let mut carried: Vec<ExPolygon> = Vec::new();
 
@@ -1056,13 +1495,15 @@ fn generate_support_paths(
         } else {
             Vec::new()
         };
-        if bottom_gap_layers > 0 {
-            let min_j = idx.saturating_sub(bottom_gap_layers);
-            for j in min_j..idx {
-                if let Some(rl) = raw_layers.get(j) {
-                    excl_sources.extend(rl.regions.iter().cloned());
-                }
+        for j in bottom_gap_exclusion_range(raw_layers, idx, s.bottom_z_distance_mm) {
+            if let Some(rl) = raw_layers.get(j) {
+                excl_sources.extend(rl.regions.iter().cloned());
             }
+        }
+        if let Some(bm) = blocker_masks.get(idx)
+            && !bm.is_empty()
+        {
+            excl_sources.extend(bm.iter().cloned());
         }
         let clipped = if excl_sources.is_empty() {
             combined
@@ -2744,5 +3185,370 @@ mod tests {
         }
         assert!(saw_sup, "expected Support paths on 60 deg overhang ramp");
         assert!(saw_iface, "expected SupportInterface paths on ramp");
+    }
+
+    #[test]
+    fn adaptive_dome_and_top_shell_thickness_propagate_heights() {
+        let dome = layercraft_mesh::build_sample_shape(layercraft_mesh::SampleShape::Dome).unwrap();
+        let mut cfg = PrintConfig::default();
+        cfg.process.adaptive_layer_height.enabled = true;
+        cfg.process.adaptive_layer_height.min_layer_height_mm = Some(0.08);
+        cfg.process.adaptive_layer_height.max_layer_height_mm = Some(0.28);
+        cfg.process.adaptive_layer_height.quality = 0.6;
+        cfg.process.top_shell_layers = 3;
+        cfg.process.top_shell_thickness_mm = Some(0.6);
+
+        let plate = slice_single_mesh(&dome, &cfg).unwrap();
+        assert!((plate.layers.last().unwrap().z_top_mm - 18.0).abs() < 1e-6);
+
+        let heights: Vec<f64> = plate.layers.iter().skip(1).map(|l| l.height_mm).collect();
+        let min_h = heights.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_h = heights.iter().copied().fold(0.0, f64::max);
+        assert!(
+            min_h <= 0.10,
+            "expected fine layers near dome cap, got {min_h}"
+        );
+        assert!(
+            max_h >= 0.24,
+            "expected thick layers on vertical base, got {max_h}"
+        );
+
+        // Every path in a variable-height layer carries the layer's exact height_mm.
+        for layer in &plate.layers {
+            for path in &layer.paths {
+                assert!((path.height_mm - layer.height_mm).abs() < 1e-9);
+            }
+        }
+        // Verify physical top_shell_thickness_mm propagates across > top_shell_layers thin layers.
+        let flat_top = make_box_mesh(16.0, 16.0, 4.0);
+        let mut cfg_thick = PrintConfig::default();
+        cfg_thick.process.layer_height_mm = 0.08;
+        cfg_thick.process.first_layer_height_mm = 0.2;
+        cfg_thick.process.top_shell_layers = 2;
+        cfg_thick.process.top_shell_thickness_mm = Some(0.6);
+        let mut cfg_no_thick = cfg_thick.clone();
+        cfg_no_thick.process.top_shell_thickness_mm = None;
+
+        let plate_with_thick = slice_single_mesh(&flat_top, &cfg_thick).unwrap();
+        let plate_no_thick = slice_single_mesh(&flat_top, &cfg_no_thick).unwrap();
+        let top_region_solid_len = |pl: &SlicedPlate| -> f64 {
+            pl.layers
+                .iter()
+                .filter(|l| l.z_top_mm > 2.0)
+                .flat_map(|l| l.paths.iter())
+                .filter(|p| {
+                    matches!(
+                        p.role,
+                        ExtrusionRole::TopSurface | ExtrusionRole::InternalSolidInfill
+                    )
+                })
+                .map(path_length_mm)
+                .sum()
+        };
+        let len_with_thick = top_region_solid_len(&plate_with_thick);
+        let len_without_thick = top_region_solid_len(&plate_no_thick);
+        assert!(
+            len_with_thick > len_without_thick * 2.5,
+            "expected 0.6 mm top_shell_thickness to propagate across thin 0.08 mm layers ({len_with_thick:.1} vs {len_without_thick:.1})"
+        );
+    }
+
+    #[test]
+    fn height_ranges_override_height_infill_and_walls() {
+        let mesh = make_box_mesh(20.0, 20.0, 12.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.height_ranges = vec![
+            layercraft_config::HeightRangeModifier {
+                min_z_mm: 0.0,
+                max_z_mm: 4.0,
+                layer_height_mm: Some(0.25),
+                overrides: Default::default(),
+            },
+            layercraft_config::HeightRangeModifier {
+                min_z_mm: 4.0,
+                max_z_mm: 8.0,
+                layer_height_mm: Some(0.10),
+                overrides: layercraft_config::ModifierOverrides {
+                    sparse_infill_density: Some(0.55),
+                    sparse_infill_pattern: Some(InfillPattern::Gyroid),
+                    ..Default::default()
+                },
+            },
+            layercraft_config::HeightRangeModifier {
+                min_z_mm: 8.0,
+                max_z_mm: 12.0,
+                layer_height_mm: Some(0.20),
+                overrides: layercraft_config::ModifierOverrides {
+                    wall_loops: Some(4),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        assert!((plate.layers.last().unwrap().z_top_mm - 12.0).abs() < 1e-6);
+        let mid_layer = plate
+            .layers
+            .iter()
+            .find(|l| l.z_top_mm > 5.0 && l.z_top_mm < 7.0)
+            .unwrap();
+        assert!((mid_layer.height_mm - 0.10).abs() < 1e-4);
+
+        let low_inner_walls = plate
+            .layers
+            .iter()
+            .find(|l| l.z_top_mm > 1.5 && l.z_top_mm < 3.0)
+            .unwrap()
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::InnerWall)
+            .count();
+        let top_inner_walls = plate
+            .layers
+            .iter()
+            .find(|l| l.z_top_mm > 9.0 && l.z_top_mm < 11.0)
+            .unwrap()
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::InnerWall)
+            .count();
+        assert_eq!(low_inner_walls, 1);
+        assert_eq!(top_inner_walls, 3);
+    }
+
+    #[test]
+    fn modifier_volumes_override_infill_walls_ironing_and_overlap_disjointly() {
+        let mesh = make_box_mesh(30.0, 20.0, 12.0);
+        let cfg = PrintConfig::default();
+
+        // Modifier 1: high infill + more walls in center Box
+        let box_raw =
+            layercraft_mesh::build_modifier_primitive(layercraft_mesh::ModifierPrimitive::Box {
+                width_mm: 12.0,
+                depth_mm: 12.0,
+                height_mm: 12.0,
+            })
+            .unwrap();
+        let box_mod = ModifierVolume {
+            id: 1,
+            name: "dense_core".to_owned(),
+            role: layercraft_config::ModifierRole::Modifier,
+            mesh: layercraft_mesh::prepare_modifier_mesh(
+                &box_raw,
+                layercraft_mesh::ModifierTransform {
+                    position_xyz_mm: [125.0, 125.0, 6.0],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            overrides: layercraft_config::ModifierOverrides {
+                sparse_infill_density: Some(0.60),
+                sparse_infill_pattern: Some(InfillPattern::Gyroid),
+                wall_loops: Some(4),
+                ..Default::default()
+            },
+        };
+
+        // Modifier 2: overlapping Cylinder overriding density even higher (0.80) + topmost ironing
+        let cyl_raw = layercraft_mesh::build_modifier_primitive(
+            layercraft_mesh::ModifierPrimitive::Cylinder {
+                radius_mm: 4.0,
+                height_mm: 6.0,
+                segments: 24,
+            },
+        )
+        .unwrap();
+        let cyl_mod = ModifierVolume {
+            id: 2,
+            name: "iron_boss".to_owned(),
+            role: layercraft_config::ModifierRole::Modifier,
+            mesh: layercraft_mesh::prepare_modifier_mesh(
+                &cyl_raw,
+                layercraft_mesh::ModifierTransform {
+                    position_xyz_mm: [125.0, 125.0, 10.0],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            overrides: layercraft_config::ModifierOverrides {
+                sparse_infill_density: Some(0.80),
+                ironing_mode: Some(IroningType::TopmostSurface),
+                ..Default::default()
+            },
+        };
+
+        // Out-of-bounds modifier outside the bed/part should cleanly be a no-op without panicking
+        let off_mod = ModifierVolume {
+            id: 3,
+            name: "off_bed".to_owned(),
+            role: layercraft_config::ModifierRole::Modifier,
+            mesh: layercraft_mesh::prepare_modifier_mesh(
+                &box_raw,
+                layercraft_mesh::ModifierTransform {
+                    position_xyz_mm: [10.0, 10.0, 5.0],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            overrides: layercraft_config::ModifierOverrides {
+                sparse_infill_density: Some(0.90),
+                ..Default::default()
+            },
+        };
+
+        let base_plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mod_plate =
+            slice_single_mesh_with_modifiers(&mesh, &cfg, &[box_mod, cyl_mod, off_mod]).unwrap();
+
+        let infill_len = |plate: &SlicedPlate| -> f64 {
+            plate
+                .layers
+                .iter()
+                .flat_map(|l| l.paths.iter())
+                .filter(|p| p.role == ExtrusionRole::SparseInfill)
+                .map(path_length_mm)
+                .sum()
+        };
+        assert!(infill_len(&mod_plate) > infill_len(&base_plate));
+
+        // Topmost ironing present ONLY on the last layer, and strictly inside cylinder footprint
+        let iron_lower = mod_plate.layers[..mod_plate.layers.len() - 1]
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| p.role == ExtrusionRole::Ironing)
+            .count();
+        assert_eq!(iron_lower, 0);
+        let iron_top: Vec<&ExtrusionPath> = mod_plate
+            .layers
+            .last()
+            .unwrap()
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::Ironing)
+            .collect();
+        assert!(!iron_top.is_empty());
+        for p in iron_top {
+            for pt in &p.points {
+                let (x, y) = pt.to_mm();
+                assert!(
+                    (x - 125.0).hypot(y - 125.0) <= 4.1,
+                    "ironing leaked outside modifier cylinder at ({x:.2}, {y:.2})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn support_blocker_and_enforcer_modifiers_control_supports() {
+        // 1) SupportBlocker removes tree support over CBracket overhang
+        let cbracket = make_c_bracket_mesh(20.0, 8.0, 3.0, 5.0, 8.0, 3.0);
+        let mut cfg_sup = PrintConfig::default();
+        cfg_sup.process.support.enabled = true;
+        cfg_sup.process.support.style = SupportStyle::Tree;
+        cfg_sup.process.support.on_build_plate_only = true;
+
+        let blocker_box =
+            layercraft_mesh::build_modifier_primitive(layercraft_mesh::ModifierPrimitive::Box {
+                width_mm: 30.0,
+                depth_mm: 20.0,
+                height_mm: 16.0,
+            })
+            .unwrap();
+        let blocker = ModifierVolume {
+            id: 1,
+            name: "blocker".to_owned(),
+            role: layercraft_config::ModifierRole::SupportBlocker,
+            mesh: layercraft_mesh::prepare_modifier_mesh(
+                &blocker_box,
+                layercraft_mesh::ModifierTransform {
+                    position_xyz_mm: [125.0, 125.0, 8.0],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            overrides: Default::default(),
+        };
+        let blocked_plate =
+            slice_single_mesh_with_modifiers(&cbracket, &cfg_sup, &[blocker]).unwrap();
+        let sup_count = blocked_plate
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            })
+            .count();
+        assert_eq!(
+            sup_count, 0,
+            "support blocker should suppress all support paths"
+        );
+
+        // 2) SupportEnforcer forces support under BridgeArch span even when global support.enabled == false
+        let bridge = make_bridge_arch_mesh(5.0, 16.0, 10.0, 10.0, 2.0);
+        let mut cfg_no_sup = PrintConfig::default();
+        cfg_no_sup.process.support.enabled = false;
+        cfg_no_sup.process.support.interface_layers = 2;
+
+        let cyl_raw = layercraft_mesh::build_modifier_primitive(
+            layercraft_mesh::ModifierPrimitive::Cylinder {
+                radius_mm: 4.5,
+                height_mm: 12.0,
+                segments: 24,
+            },
+        )
+        .unwrap();
+        let enforcer = ModifierVolume {
+            id: 2,
+            name: "enforcer".to_owned(),
+            role: layercraft_config::ModifierRole::SupportEnforcer,
+            mesh: layercraft_mesh::prepare_modifier_mesh(
+                &cyl_raw,
+                layercraft_mesh::ModifierTransform {
+                    position_xyz_mm: [125.0, 125.0, 6.0],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            overrides: Default::default(),
+        };
+        let enforced_plate =
+            slice_single_mesh_with_modifiers(&bridge, &cfg_no_sup, &[enforcer]).unwrap();
+        let has_sup = enforced_plate
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .any(|p| p.role == ExtrusionRole::Support);
+        let has_iface = enforced_plate
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .any(|p| p.role == ExtrusionRole::SupportInterface);
+        assert!(has_sup, "support enforcer should emit Support paths");
+        assert!(
+            has_iface,
+            "support enforcer should emit SupportInterface paths"
+        );
+
+        // 3) Hostile modifier overrides fail cleanly via ConfigError
+        let bad_mod = ModifierVolume {
+            id: 3,
+            name: "hostile".to_owned(),
+            role: layercraft_config::ModifierRole::Modifier,
+            mesh: blocker_box,
+            overrides: layercraft_config::ModifierOverrides {
+                sparse_infill_density: Some(-0.5),
+                ..Default::default()
+            },
+        };
+        assert!(
+            slice_single_mesh_with_modifiers(&mesh_for_bad_mod(), &cfg_no_sup, &[bad_mod]).is_err()
+        );
+    }
+
+    fn mesh_for_bad_mod() -> TriangleMesh {
+        make_box_mesh(10.0, 10.0, 4.0)
     }
 }

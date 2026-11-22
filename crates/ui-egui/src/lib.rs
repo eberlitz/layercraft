@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use layercraft_config::{
-    GcodeFlavor, InfillPattern, IroningType, ProfileApplyResult, ProfileKind, ProfileSummary,
-    SeamPosition, SupportStyle, WallGenerator,
+    GcodeFlavor, HeightRangeModifier, InfillPattern, IroningType, ModifierOverrides, ModifierRole,
+    ProfileApplyResult, ProfileKind, ProfileSummary, SeamPosition, SupportStyle, WallGenerator,
 };
 use layercraft_engine::{Session, execute};
-use layercraft_mesh::{SampleShape, inspect_mesh};
+use layercraft_mesh::{ModifierPrimitive, ModifierTransform, SampleShape, inspect_mesh};
 use layercraft_slice::ExtrusionRole;
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, build_bed_grid, build_mesh_vertices, build_toolpath_mesh,
@@ -34,6 +34,7 @@ pub struct LayerCraftApp {
     show_ghost_mesh: bool,
     selected_sample: SampleShape,
     selected_object_id: Option<u64>,
+    selected_modifier_id: Option<u64>,
     selected_machine_profile: Option<String>,
     selected_filament_profile: Option<String>,
     selected_process_profile: Option<String>,
@@ -74,6 +75,7 @@ impl LayerCraftApp {
             show_ghost_mesh: false,
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
             selected_object_id: None,
+            selected_modifier_id: None,
             selected_machine_profile: None,
             selected_filament_profile: None,
             selected_process_profile: None,
@@ -356,12 +358,20 @@ impl LayerCraftApp {
     fn rebuild_scene(&mut self) {
         self.scene_revision = self.scene_revision.wrapping_add(1);
         let bed = build_bed_grid(&self.session.config);
-        let mesh = self
+        let mut mesh = self
             .session
             .prepared_mesh
             .as_ref()
             .map(|m| build_mesh_vertices(m, [0.34, 0.65, 0.94, 1.0]))
             .unwrap_or_default();
+        for m in &self.session.modifiers {
+            let col = match m.role {
+                ModifierRole::Modifier => [0.95, 0.72, 0.18, 0.35],
+                ModifierRole::SupportBlocker => [0.92, 0.26, 0.26, 0.35],
+                ModifierRole::SupportEnforcer => [0.20, 0.85, 0.45, 0.35],
+            };
+            mesh.extend(build_mesh_vertices(&m.prepared_mesh, col));
+        }
         let ghost = self
             .session
             .prepared_mesh
@@ -1387,6 +1397,189 @@ impl LayerCraftApp {
                                 });
                         });
 
+                    egui::CollapsingHeader::new("Variable Layer Height")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let max_nozzle_h =
+                                (self.session.config.machine.nozzle_diameter_mm * 1.25).max(0.04);
+                            let proc_cfg = &mut self.session.config.process;
+                            let al = &mut proc_cfg.adaptive_layer_height;
+                            egui::Grid::new("var_layer_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Adaptive height");
+                                    ui.checkbox(&mut al.enabled, "");
+                                    ui.end_row();
+
+                                    let mut min_v = al.min_layer_height_mm.unwrap_or(0.0);
+                                    ui.label("Min height (0=auto)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut min_v)
+                                                .speed(0.01)
+                                                .range(0.0..=max_nozzle_h),
+                                        )
+                                        .changed()
+                                    {
+                                        al.min_layer_height_mm = if min_v <= 1e-4 {
+                                            None
+                                        } else {
+                                            Some(min_v.clamp(0.02, max_nozzle_h))
+                                        };
+                                    }
+                                    ui.end_row();
+
+                                    let mut max_v = al.max_layer_height_mm.unwrap_or(0.0);
+                                    ui.label("Max height (0=auto)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut max_v)
+                                                .speed(0.01)
+                                                .range(0.0..=max_nozzle_h),
+                                        )
+                                        .changed()
+                                    {
+                                        al.max_layer_height_mm = if max_v <= 1e-4 {
+                                            None
+                                        } else {
+                                            Some(max_v.clamp(0.02, max_nozzle_h))
+                                        };
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Quality (0..1)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut al.quality)
+                                            .speed(0.02)
+                                            .range(0.0..=1.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Smooth radius (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut al.smooth_radius_mm)
+                                            .speed(0.1)
+                                            .range(0.0..=20.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Max step ratio");
+                                    ui.add(
+                                        egui::DragValue::new(&mut al.max_step_ratio)
+                                            .speed(0.05)
+                                            .range(1.05..=3.0),
+                                    );
+                                    ui.end_row();
+
+                                    let mut top_thick =
+                                        proc_cfg.top_shell_thickness_mm.unwrap_or(0.0);
+                                    ui.label("Top min thick (mm)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut top_thick)
+                                                .speed(0.05)
+                                                .range(0.0..=10.0),
+                                        )
+                                        .changed()
+                                    {
+                                        proc_cfg.top_shell_thickness_mm = if top_thick <= 1e-4 {
+                                            None
+                                        } else {
+                                            Some(top_thick)
+                                        };
+                                    }
+                                    ui.end_row();
+
+                                    let mut bot_thick =
+                                        proc_cfg.bottom_shell_thickness_mm.unwrap_or(0.0);
+                                    ui.label("Bot min thick (mm)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut bot_thick)
+                                                .speed(0.05)
+                                                .range(0.0..=10.0),
+                                        )
+                                        .changed()
+                                    {
+                                        proc_cfg.bottom_shell_thickness_mm = if bot_thick <= 1e-4 {
+                                            None
+                                        } else {
+                                            Some(bot_thick)
+                                        };
+                                    }
+                                    ui.end_row();
+                                });
+
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.strong("Height Ranges");
+                                if ui.small_button("+ Add Z Range").clicked() {
+                                    let z0 = proc_cfg
+                                        .height_ranges
+                                        .last()
+                                        .map(|r| r.max_z_mm)
+                                        .unwrap_or(0.0);
+                                    proc_cfg.height_ranges.push(HeightRangeModifier {
+                                        min_z_mm: z0,
+                                        max_z_mm: z0 + 5.0,
+                                        layer_height_mm: Some(proc_cfg.layer_height_mm),
+                                        overrides: ModifierOverrides::default(),
+                                    });
+                                }
+                            });
+                            let mut rm_hr_idx: Option<usize> = None;
+                            for (ri, hr) in proc_cfg.height_ranges.iter_mut().enumerate() {
+                                ui.push_id(ri, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Z:");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut hr.min_z_mm)
+                                                    .speed(0.2)
+                                                    .range(0.0..=500.0),
+                                            )
+                                            .changed()
+                                            && hr.max_z_mm <= hr.min_z_mm
+                                        {
+                                            hr.max_z_mm = hr.min_z_mm + 0.5;
+                                        }
+                                        ui.label("..");
+                                        let min_hi = hr.min_z_mm + 0.1;
+                                        ui.add(
+                                            egui::DragValue::new(&mut hr.max_z_mm)
+                                                .speed(0.2)
+                                                .range(min_hi..=500.0),
+                                        );
+                                        let mut h_val = hr.layer_height_mm.unwrap_or(0.0);
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut h_val)
+                                                    .speed(0.01)
+                                                    .prefix("h:")
+                                                    .range(0.0..=max_nozzle_h),
+                                            )
+                                            .changed()
+                                        {
+                                            hr.layer_height_mm = if h_val <= 1e-4 {
+                                                None
+                                            } else {
+                                                Some(h_val.clamp(0.02, max_nozzle_h))
+                                            };
+                                        }
+                                        if ui.small_button("x").clicked() {
+                                            rm_hr_idx = Some(ri);
+                                        }
+                                    });
+                                });
+                            }
+                            if let Some(ri) = rm_hr_idx
+                                && ri < proc_cfg.height_ranges.len()
+                            {
+                                proc_cfg.height_ranges.remove(ri);
+                            }
+                        });
+
                     egui::CollapsingHeader::new("Surface & Motion Finish")
                         .default_open(false)
                         .show(ui, |ui| {
@@ -1640,6 +1833,367 @@ impl LayerCraftApp {
                         None => {}
                     }
 
+                    enum ModAction {
+                        AddPrimitive(ModifierPrimitive),
+                        Remove(u64),
+                        Update {
+                            id: u64,
+                            role: ModifierRole,
+                            pos: [f64; 3],
+                            rot: [f64; 3],
+                            scale: [f64; 3],
+                            overrides: ModifierOverrides,
+                        },
+                    }
+                    let mut mod_action: Option<ModAction> = None;
+                    egui::CollapsingHeader::new("Modifier Volumes")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("+ Box").clicked() {
+                                    mod_action =
+                                        Some(ModAction::AddPrimitive(ModifierPrimitive::Box {
+                                            width_mm: 12.0,
+                                            depth_mm: 12.0,
+                                            height_mm: 10.0,
+                                        }));
+                                }
+                                if ui.small_button("+ Cylinder").clicked() {
+                                    mod_action = Some(ModAction::AddPrimitive(
+                                        ModifierPrimitive::Cylinder {
+                                            radius_mm: 6.0,
+                                            height_mm: 10.0,
+                                            segments: 32,
+                                        },
+                                    ));
+                                }
+                            });
+
+                            if self.session.modifiers.is_empty() {
+                                ui.weak("No modifier volumes on plate.");
+                            } else {
+                                let mods_snapshot: Vec<(
+                                    u64,
+                                    String,
+                                    ModifierRole,
+                                    ModifierTransform,
+                                    ModifierOverrides,
+                                )> = self
+                                    .session
+                                    .modifiers
+                                    .iter()
+                                    .map(|m| {
+                                        (
+                                            m.id,
+                                            m.name.clone(),
+                                            m.role,
+                                            m.transform,
+                                            m.overrides.clone(),
+                                        )
+                                    })
+                                    .collect();
+                                for (id, name, role, _, _) in &mods_snapshot {
+                                    let selected = self.selected_modifier_id == Some(*id);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .selectable_label(
+                                                selected,
+                                                format!("#{id} {name} ({})", role.label()),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.selected_modifier_id = Some(*id);
+                                        }
+                                        if ui.small_button("x").clicked() {
+                                            mod_action = Some(ModAction::Remove(*id));
+                                        }
+                                    });
+                                }
+
+                                if let Some(sel_id) = self.selected_modifier_id
+                                    && let Some((_, _, role_cur, xf, ov_cur)) =
+                                        mods_snapshot.iter().find(|(id, _, _, _, _)| *id == sel_id)
+                                {
+                                    let mut role = *role_cur;
+                                    let mut pos = xf.position_xyz_mm;
+                                    let mut rot = xf.rotation_deg;
+                                    let mut scale = xf.scale;
+                                    let mut ov = ov_cur.clone();
+                                    let mut changed = false;
+                                    let bw = self.session.config.machine.bed_width_mm;
+                                    let bd = self.session.config.machine.bed_depth_mm;
+                                    let bh = self.session.config.machine.bed_height_mm;
+
+                                    ui.separator();
+                                    egui::Grid::new("mod_xf_grid")
+                                        .num_columns(2)
+                                        .spacing([8.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label("Role");
+                                            egui::ComboBox::from_id_salt("mod_role_combo")
+                                                .selected_text(role.label())
+                                                .show_ui(ui, |ui| {
+                                                    for r in ModifierRole::ALL {
+                                                        changed |= ui
+                                                            .selectable_value(
+                                                                &mut role,
+                                                                r,
+                                                                r.label(),
+                                                            )
+                                                            .changed();
+                                                    }
+                                                });
+                                            ui.end_row();
+
+                                            ui.label("X (mm)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut pos[0])
+                                                        .speed(0.5)
+                                                        .range(0.0..=bw),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Y (mm)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut pos[1])
+                                                        .speed(0.5)
+                                                        .range(0.0..=bd),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Z (mm)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut pos[2])
+                                                        .speed(0.5)
+                                                        .range(0.0..=bh),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Rot Z (deg)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut rot[2])
+                                                        .speed(1.0)
+                                                        .range(-180.0..=180.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Scale X");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut scale[0])
+                                                        .speed(0.05)
+                                                        .range(0.1..=10.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Scale Y");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut scale[1])
+                                                        .speed(0.05)
+                                                        .range(0.1..=10.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Scale Z");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut scale[2])
+                                                        .speed(0.05)
+                                                        .range(0.1..=10.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            if role == ModifierRole::Modifier {
+                                                let mut has_dens =
+                                                    ov.sparse_infill_density.is_some();
+                                                if ui.checkbox(&mut has_dens, "Infill %").changed()
+                                                {
+                                                    ov.sparse_infill_density =
+                                                        if has_dens { Some(0.50) } else { None };
+                                                    changed = true;
+                                                }
+                                                if let Some(d) = &mut ov.sparse_infill_density {
+                                                    let mut pct = *d * 100.0;
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(&mut pct)
+                                                                .speed(1.0)
+                                                                .range(0.0..=100.0),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        *d = (pct / 100.0).clamp(0.0, 1.0);
+                                                        changed = true;
+                                                    }
+                                                } else {
+                                                    ui.weak("(inherit)");
+                                                }
+                                                ui.end_row();
+
+                                                let mut has_pat =
+                                                    ov.sparse_infill_pattern.is_some();
+                                                if ui
+                                                    .checkbox(&mut has_pat, "Infill pattern")
+                                                    .changed()
+                                                {
+                                                    ov.sparse_infill_pattern = if has_pat {
+                                                        Some(InfillPattern::Gyroid)
+                                                    } else {
+                                                        None
+                                                    };
+                                                    changed = true;
+                                                }
+                                                if let Some(pat) = &mut ov.sparse_infill_pattern {
+                                                    egui::ComboBox::from_id_salt("mod_pat_combo")
+                                                        .selected_text(pat.label())
+                                                        .show_ui(ui, |ui| {
+                                                            for candidate in InfillPattern::ALL {
+                                                                changed |= ui
+                                                                    .selectable_value(
+                                                                        pat,
+                                                                        candidate,
+                                                                        candidate.label(),
+                                                                    )
+                                                                    .changed();
+                                                            }
+                                                        });
+                                                } else {
+                                                    ui.weak("(inherit)");
+                                                }
+                                                ui.end_row();
+
+                                                let mut has_walls = ov.wall_loops.is_some();
+                                                if ui
+                                                    .checkbox(&mut has_walls, "Wall loops")
+                                                    .changed()
+                                                {
+                                                    ov.wall_loops =
+                                                        if has_walls { Some(4) } else { None };
+                                                    changed = true;
+                                                }
+                                                if let Some(w) = &mut ov.wall_loops {
+                                                    changed |= ui
+                                                        .add(egui::DragValue::new(w).range(0..=20))
+                                                        .changed();
+                                                } else {
+                                                    ui.weak("(inherit)");
+                                                }
+                                                ui.end_row();
+
+                                                let mut has_iron = ov.ironing_mode.is_some();
+                                                if ui.checkbox(&mut has_iron, "Ironing").changed() {
+                                                    ov.ironing_mode = if has_iron {
+                                                        Some(IroningType::TopmostSurface)
+                                                    } else {
+                                                        None
+                                                    };
+                                                    changed = true;
+                                                }
+                                                if let Some(im) = &mut ov.ironing_mode {
+                                                    egui::ComboBox::from_id_salt("mod_iron_combo")
+                                                        .selected_text(im.label())
+                                                        .show_ui(ui, |ui| {
+                                                            for mode in IroningType::ALL {
+                                                                changed |= ui
+                                                                    .selectable_value(
+                                                                        im,
+                                                                        mode,
+                                                                        mode.label(),
+                                                                    )
+                                                                    .changed();
+                                                            }
+                                                        });
+                                                } else {
+                                                    ui.weak("(inherit)");
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
+
+                                    if changed && mod_action.is_none() {
+                                        mod_action = Some(ModAction::Update {
+                                            id: sel_id,
+                                            role,
+                                            pos,
+                                            rot,
+                                            scale,
+                                            overrides: ov,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+
+                    match mod_action {
+                        Some(ModAction::AddPrimitive(prim)) => match execute(
+                            &mut self.session,
+                            "plate.add_modifier_primitive",
+                            serde_json::json!({ "primitive": prim }),
+                        ) {
+                            Ok(_) => {
+                                self.last_error = None;
+                                self.selected_modifier_id =
+                                    self.session.modifiers.last().map(|m| m.id);
+                                self.view_mode = ViewMode::Prepare;
+                                self.rebuild_scene();
+                            }
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        },
+                        Some(ModAction::Remove(id)) => match execute(
+                            &mut self.session,
+                            "plate.remove_modifier",
+                            serde_json::json!({ "id": id }),
+                        ) {
+                            Ok(_) => {
+                                self.last_error = None;
+                                self.selected_modifier_id =
+                                    self.session.modifiers.last().map(|m| m.id);
+                                self.view_mode = ViewMode::Prepare;
+                                self.rebuild_scene();
+                            }
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        },
+                        Some(ModAction::Update {
+                            id,
+                            role,
+                            pos,
+                            rot,
+                            scale,
+                            overrides,
+                        }) => match execute(
+                            &mut self.session,
+                            "plate.update_modifier",
+                            serde_json::json!({
+                                "id": id,
+                                "role": role,
+                                "position_xyz_mm": pos,
+                                "rotation_deg": rot,
+                                "scale": scale,
+                                "overrides": overrides,
+                            }),
+                        ) {
+                            Ok(_) => {
+                                self.last_error = None;
+                                self.view_mode = ViewMode::Prepare;
+                                self.rebuild_scene();
+                            }
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        },
+                        None => {}
+                    }
+
                     if let Some(mesh) = &self.session.prepared_mesh {
                         ui.separator();
                         ui.heading("Mesh Summary");
@@ -1691,10 +2245,15 @@ impl LayerCraftApp {
         if self.max_layer >= total {
             self.max_layer = total - 1;
         }
-        let layer_info = sliced
-            .layers
-            .get(self.max_layer)
-            .map(|l| (l.z_top_mm, l.paths.len(), l.fan_percent, l.estimated_time_s));
+        let layer_info = sliced.layers.get(self.max_layer).map(|l| {
+            (
+                l.z_top_mm,
+                l.height_mm,
+                l.paths.len(),
+                l.fan_percent,
+                l.estimated_time_s,
+            )
+        });
 
         egui::Panel::right("layercraft_preview_panel")
             .default_size(195.0)
@@ -1712,8 +2271,10 @@ impl LayerCraftApp {
                     self.max_layer = layer_1based.saturating_sub(1);
                 }
 
-                if let Some((z_top_mm, path_count, fan_percent, est_time_s)) = layer_info {
+                if let Some((z_top_mm, height_mm, path_count, fan_percent, est_time_s)) = layer_info
+                {
                     ui.label(format!("Z = {z_top_mm:.2} mm"));
+                    ui.label(format!("Height = {height_mm:.3} mm"));
                     ui.label(format!("Paths: {path_count}"));
                     ui.label(format!("Fan: {fan_percent}%"));
                     ui.label(format!("Est. layer time: {est_time_s:.1} s"));
@@ -1732,7 +2293,10 @@ impl LayerCraftApp {
                     .radio_value(&mut self.color_mode, ColorMode::Speed, "Speed")
                     .changed();
                 changed |= ui
-                    .radio_value(&mut self.color_mode, ColorMode::Layer, "Layer height")
+                    .radio_value(&mut self.color_mode, ColorMode::LayerHeight, "Layer height")
+                    .changed();
+                changed |= ui
+                    .radio_value(&mut self.color_mode, ColorMode::Layer, "Layer Z")
                     .changed();
                 if changed {
                     self.rebuild_scene();

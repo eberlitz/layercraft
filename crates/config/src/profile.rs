@@ -1166,6 +1166,24 @@ fn apply_machine_settings(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["min_layer_height"])
+        && !is_nil_value(v)
+    {
+        let mh = parse_f64_val(k, v)?;
+        cfg.process.adaptive_layer_height.min_layer_height_mm =
+            if mh > 0.0 { Some(mh) } else { None };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["max_layer_height"])
+        && !is_nil_value(v)
+    {
+        let mh = parse_f64_val(k, v)?;
+        cfg.process.adaptive_layer_height.max_layer_height_mm =
+            if mh > 0.0 { Some(mh) } else { None };
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["printer_model"])
         && !is_nil_value(v)
     {
@@ -1591,6 +1609,64 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &["enable_adaptive_layer_height", "adaptive_layer_height"],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.adaptive_layer_height.enabled = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["min_layer_height"])
+        && !is_nil_value(v)
+    {
+        let mh = parse_f64_val(k, v)?;
+        cfg.process.adaptive_layer_height.min_layer_height_mm =
+            if mh > 0.0 { Some(mh) } else { None };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["max_layer_height"])
+        && !is_nil_value(v)
+    {
+        let mh = parse_f64_val(k, v)?;
+        cfg.process.adaptive_layer_height.max_layer_height_mm =
+            if mh > 0.0 { Some(mh) } else { None };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "adaptive_layer_height_quality",
+            "adaptive_layer_height_variation",
+        ],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.adaptive_layer_height.quality = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "adaptive_layer_height_smooth_radius",
+            "layer_height_smooth_radius",
+        ],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.adaptive_layer_height.smooth_radius_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["adaptive_layer_height_max_step_ratio"])
+        && !is_nil_value(v)
+    {
+        cfg.process.adaptive_layer_height.max_step_ratio = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["wall_loops", "perimeters"])
         && !is_nil_value(v)
     {
@@ -1674,6 +1750,22 @@ fn apply_process_settings_pass1(
         && !is_nil_value(v)
     {
         cfg.process.bottom_shell_layers = parse_u16_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["top_shell_thickness"])
+        && !is_nil_value(v)
+    {
+        let t = parse_f64_val(k, v)?;
+        cfg.process.top_shell_thickness_mm = if t > 0.0 { Some(t) } else { None };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["bottom_shell_thickness"])
+        && !is_nil_value(v)
+    {
+        let t = parse_f64_val(k, v)?;
+        cfg.process.bottom_shell_thickness_mm = if t > 0.0 { Some(t) } else { None };
         ctx.mark_applied(k);
     }
 
@@ -3163,5 +3255,61 @@ mod tests {
         assert!((res.config.process.support.tree.branch_distance_mm - 3.2).abs() < 1e-9);
         assert_eq!(res.config.process.support.tree.branch_wall_loops, 2);
         assert!((res.config.process.support.tree.trunk_base_flare_mm - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adaptive_layer_profile_keys_map_without_warnings() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"{
+                "type": "machine",
+                "name": "adapt_machine",
+                "min_layer_height": ["0.06"],
+                "max_layer_height": ["0.32"]
+            }"#,
+        )
+        .unwrap();
+        lib.load_json_str(
+            r#"{
+                "type": "process",
+                "name": "adapt_020",
+                "layer_height": "0.2",
+                "enable_adaptive_layer_height": "1",
+                "min_layer_height": "0.08",
+                "max_layer_height": "0.28",
+                "adaptive_layer_height_quality": "75%",
+                "adaptive_layer_height_smooth_radius": "2.5",
+                "adaptive_layer_height_max_step_ratio": "1.6",
+                "top_shell_thickness": "0.8",
+                "bottom_shell_thickness": "0.6"
+            }"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("adapt_machine"),
+                None,
+                Some("adapt_020"),
+            )
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert!(res.config.process.adaptive_layer_height.enabled);
+        assert_eq!(
+            res.config.process.adaptive_layer_height.min_layer_height_mm,
+            Some(0.08)
+        );
+        assert_eq!(
+            res.config.process.adaptive_layer_height.max_layer_height_mm,
+            Some(0.28)
+        );
+        assert!((res.config.process.adaptive_layer_height.quality - 0.75).abs() < 1e-9);
+        assert!((res.config.process.adaptive_layer_height.smooth_radius_mm - 2.5).abs() < 1e-9);
+        assert!((res.config.process.adaptive_layer_height.max_step_ratio - 1.6).abs() < 1e-9);
+        assert_eq!(res.config.process.top_shell_thickness_mm, Some(0.8));
+        assert_eq!(res.config.process.bottom_shell_thickness_mm, Some(0.6));
     }
 }

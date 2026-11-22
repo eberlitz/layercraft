@@ -1588,9 +1588,19 @@ pub struct GcodeReport {
     pub scarf_ramp_moves_count: usize,
     #[serde(default = "default_wall_variation_ratio")]
     pub wall_width_variation_ratio: f64,
+    #[serde(default)]
+    pub min_layer_height_mm: f64,
+    #[serde(default)]
+    pub max_layer_height_mm: f64,
+    #[serde(default = "default_layer_height_variation_ratio")]
+    pub layer_height_variation_ratio: f64,
 }
 
 fn default_wall_variation_ratio() -> f64 {
+    1.0
+}
+
+fn default_layer_height_variation_ratio() -> f64 {
     1.0
 }
 
@@ -2203,6 +2213,30 @@ pub fn evaluate_gcode(
     safety.max_retraction_imbalance_mm = max_retraction_imbalance_mm;
     let max_wall_variation = wall_variation.flush_layer();
 
+    let (min_layer_height_mm, max_layer_height_mm, layer_height_variation_ratio) =
+        if layer_z_mm.len() >= 2 {
+            let mut min_h = f64::INFINITY;
+            let mut max_h = 0.0_f64;
+            for pair in layer_z_mm.windows(2) {
+                if let (Some(&z0), Some(&z1)) = (pair.first(), pair.get(1)) {
+                    let dz = z1 - z0;
+                    if dz > 1e-6 && dz.is_finite() {
+                        min_h = min_h.min(dz);
+                        max_h = max_h.max(dz);
+                    }
+                }
+            }
+            if min_h.is_finite() && min_h > 1e-6 {
+                (min_h, max_h, max_h / min_h)
+            } else {
+                (0.0, 0.0, 1.0)
+            }
+        } else if let Some(&z0) = layer_z_mm.first() {
+            (z0, z0, 1.0)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+
     let report = GcodeReport {
         active_layer_count: layer_z_mm.len(),
         layer_z_mm,
@@ -2229,6 +2263,9 @@ pub fn evaluate_gcode(
         arc_moves_count,
         scarf_ramp_moves_count,
         wall_width_variation_ratio: max_wall_variation,
+        min_layer_height_mm,
+        max_layer_height_mm,
+        layer_height_variation_ratio,
     };
 
     Ok((report, segments))
@@ -2974,6 +3011,97 @@ mod tests {
             (36.0..=46.0).contains(&rep.total_filament_volume_mm3),
             "unexpected filament volume {}",
             rep.total_filament_volume_mm3
+        );
+    }
+
+    fn make_dome(radius: f64, base_h: f64, segs: usize, rings: usize) -> TriangleMesh {
+        let mut tris = Vec::with_capacity(segs * (rings * 2 + 3));
+        let cb = Point3::new(0.0, 0.0, 0.0);
+        let mut ring_pts: Vec<Vec<Point3>> = Vec::with_capacity(rings);
+        for ri in 0..rings {
+            let phi = std::f64::consts::FRAC_PI_2 * (ri as f64) / (rings as f64);
+            let rr = radius * phi.cos();
+            let zz = base_h + radius * phi.sin();
+            let mut pts = Vec::with_capacity(segs);
+            for i in 0..segs {
+                let a = TAU * (i as f64) / (segs as f64);
+                pts.push(Point3::new(rr * a.cos(), rr * a.sin(), zz));
+            }
+            ring_pts.push(pts);
+        }
+        let base_top = &ring_pts[0];
+        for i in 0..segs {
+            let i1 = (i + 1) % segs;
+            let a0 = TAU * (i as f64) / (segs as f64);
+            let a1 = TAU * (i1 as f64) / (segs as f64);
+            let b0 = Point3::new(radius * a0.cos(), radius * a0.sin(), 0.0);
+            let b1 = Point3::new(radius * a1.cos(), radius * a1.sin(), 0.0);
+            tris.push(Triangle::new(cb, b1, b0));
+            tris.push(Triangle::new(b0, b1, base_top[i1]));
+            tris.push(Triangle::new(b0, base_top[i1], base_top[i]));
+        }
+        for ri in 0..rings.saturating_sub(1) {
+            let cur = &ring_pts[ri];
+            let nxt = &ring_pts[ri + 1];
+            for i in 0..segs {
+                let i1 = (i + 1) % segs;
+                tris.push(Triangle::new(cur[i], cur[i1], nxt[i1]));
+                tris.push(Triangle::new(cur[i], nxt[i1], nxt[i]));
+            }
+        }
+        let apex = Point3::new(0.0, 0.0, base_h + radius);
+        let last_ring = &ring_pts[rings - 1];
+        for i in 0..segs {
+            let i1 = (i + 1) % segs;
+            tris.push(Triangle::new(last_ring[i], last_ring[i1], apex));
+        }
+        TriangleMesh::new(tris).unwrap()
+    }
+
+    #[test]
+    fn evaluate_gcode_reports_variable_and_uniform_layer_height_ratios() {
+        let mut cfg_uni = PrintConfig::default();
+        cfg_uni.process.first_layer_height_mm = 0.28;
+        cfg_uni.process.layer_height_mm = 0.20;
+        let cube_plate = slice_single_mesh(&make_box(16.0, 16.0, 4.08), &cfg_uni).unwrap();
+        let cube_out = emit_gcode(&cube_plate, &cfg_uni).unwrap();
+        let (cube_rep, _) = evaluate_gcode(&cube_out.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(cube_rep.safety.is_clean(), "{:?}", cube_rep.safety);
+        assert!(
+            cube_rep.layer_height_variation_ratio < 1.02,
+            "uniform cube reported variation ratio {}",
+            cube_rep.layer_height_variation_ratio
+        );
+
+        let dome = make_dome(10.0, 8.0, 48, 16);
+        let mut cfg_adapt = PrintConfig::default();
+        cfg_adapt.process.adaptive_layer_height.enabled = true;
+        cfg_adapt.process.adaptive_layer_height.min_layer_height_mm = Some(0.08);
+        cfg_adapt.process.adaptive_layer_height.max_layer_height_mm = Some(0.28);
+        cfg_adapt.process.adaptive_layer_height.quality = 0.6;
+        let dome_plate = slice_single_mesh(&dome, &cfg_adapt).unwrap();
+        let dome_out = emit_gcode(&dome_plate, &cfg_adapt).unwrap();
+        let (dome_rep, _) = evaluate_gcode(&dome_out.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(dome_rep.safety.is_clean(), "{:?}", dome_rep.safety);
+        assert!(
+            (dome_rep.max_z_mm - 18.0).abs() < 0.01,
+            "unexpected dome max_z {}",
+            dome_rep.max_z_mm
+        );
+        assert!(
+            dome_rep.layer_height_variation_ratio > 2.0,
+            "ratio={} <= 2.0",
+            dome_rep.layer_height_variation_ratio
+        );
+        assert!(
+            dome_rep.min_layer_height_mm <= 0.10,
+            "min_h={}",
+            dome_rep.min_layer_height_mm
+        );
+        assert!(
+            dome_rep.max_layer_height_mm >= 0.24,
+            "max_h={}",
+            dome_rep.max_layer_height_mm
         );
     }
 }

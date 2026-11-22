@@ -1,0 +1,16 @@
+{
+  "type": "process",
+  "name": "adaptive_020",
+  "instantiation": true,
+  "layer_height": "0.2",
+  "enable_adaptive_layer_height": "1",
+  "min_layer_height": "0.08",
+  "max_layer_height": "0.28",
+  "adaptive_layer_height_quality": "60%",
+  "adaptive_layer_height_smooth_radius": "2.0",
+  "adaptive_layer_height_max_step_ratio": "1.5",
+  "top_shell_thickness": "0.6",
+  "bottom_shell_thickness": "0.6",
+  "enable_support": "0",
+  "support_interface_layers": "2"
+}

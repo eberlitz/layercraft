@@ -42,6 +42,7 @@ pub enum ColorMode {
     Feature,
     Speed,
     Layer,
+    LayerHeight,
 }
 
 /// Interactive Z-up orbit camera looking at a target point on the build plate.
@@ -253,6 +254,16 @@ pub fn path_color(
     layer_idx: usize,
     total_layers: usize,
 ) -> [f32; 4] {
+    path_color_with_height_range(path, mode, layer_idx, total_layers, (0.04, 0.32))
+}
+
+fn path_color_with_height_range(
+    path: &ExtrusionPath,
+    mode: ColorMode,
+    layer_idx: usize,
+    total_layers: usize,
+    height_range_mm: (f64, f64),
+) -> [f32; 4] {
     match mode {
         ColorMode::Feature => role_color(path.role),
         ColorMode::Speed => {
@@ -263,6 +274,12 @@ pub fn path_color(
             let denom = total_layers.saturating_sub(1).max(1) as f32;
             let t = (layer_idx as f32) / denom;
             lerp_color([0.16, 0.76, 0.78], [0.95, 0.42, 0.24], t)
+        }
+        ColorMode::LayerHeight => {
+            let (min_h, max_h) = height_range_mm;
+            let span = (max_h - min_h).max(1e-4);
+            let t = ((path.height_mm - min_h) / span) as f32;
+            lerp_color([0.16, 0.72, 0.94], [0.95, 0.36, 0.22], t)
         }
     }
 }
@@ -378,6 +395,21 @@ pub struct ToolpathGeometry {
 /// Build 3D extruded bead ribbons (top cap + two side walls) for every layer in `plate`.
 pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeometry {
     let total_layers = plate.layers.len();
+    let height_range_mm = if mode == ColorMode::LayerHeight && !plate.layers.is_empty() {
+        let mut min_h = f64::INFINITY;
+        let mut max_h = 0.0_f64;
+        for l in &plate.layers {
+            min_h = min_h.min(l.height_mm);
+            max_h = max_h.max(l.height_mm);
+        }
+        if max_h - min_h > 1e-4 {
+            (min_h, max_h)
+        } else {
+            (0.04, 0.32)
+        }
+    } else {
+        (0.04, 0.32)
+    };
     let mut vertices = Vec::new();
     let mut layer_ranges = Vec::with_capacity(total_layers);
 
@@ -391,7 +423,8 @@ pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeom
             if n < 2 {
                 continue;
             }
-            let color = path_color(path, mode, layer_idx, total_layers);
+            let color =
+                path_color_with_height_range(path, mode, layer_idx, total_layers, height_range_mm);
             let seg_count = if path.closed { n } else { n - 1 };
 
             for i in 0..seg_count {

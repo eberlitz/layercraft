@@ -8,8 +8,8 @@ use layercraft_geom::{ExPolygon, Point2, Polygon, mm_to_nm};
 use layercraft_mesh::RawSliceLayer;
 
 use crate::{
-    ExtrusionPath, ExtrusionRole, SliceError, bed_clamp_expolygon, detect_contact_overhangs,
-    generate_rectilinear_hatch, push_closed_poly, stadium_spacing_mm,
+    ExtrusionPath, ExtrusionRole, SliceError, bed_clamp_expolygon, bottom_gap_exclusion_range,
+    detect_contact_overhangs, generate_rectilinear_hatch, push_closed_poly, stadium_spacing_mm,
 };
 
 const CONE_SIMPLIFY_EPS_NM: i64 = 25_000;
@@ -41,11 +41,14 @@ struct LayerDisk {
 pub(crate) fn generate_tree_support_paths(
     raw_layers: &[RawSliceLayer],
     config: &PrintConfig,
+    blocker_masks: &[Vec<ExPolygon>],
+    enforcer_masks: &[Vec<ExPolygon>],
 ) -> Result<Vec<Vec<ExtrusionPath>>, SliceError> {
     let n = raw_layers.len();
     let mut per_layer = vec![Vec::new(); n];
     let s = &config.process.support;
-    if !s.enabled || n < 2 {
+    let has_enforcer = enforcer_masks.iter().any(|m| !m.is_empty());
+    if (!s.enabled && !has_enforcer) || n < 2 {
         return Ok(per_layer);
     }
 
@@ -54,7 +57,8 @@ pub(crate) fn generate_tree_support_paths(
     let bed_slice = std::slice::from_ref(&bed_box);
 
     // Pass 1: Overhang detection & top Z contact mapping.
-    let contact_overhangs = detect_contact_overhangs(raw_layers, bed_slice, config)?;
+    let contact_overhangs =
+        detect_contact_overhangs(raw_layers, bed_slice, config, blocker_masks, enforcer_masks)?;
     if contact_overhangs.iter().all(Vec::is_empty) {
         return Ok(per_layer);
     }
@@ -294,10 +298,6 @@ pub(crate) fn generate_tree_support_paths(
     }
 
     // Pass 4: Union branch disks per layer, clip exact model/Z-gap clearances, emit hollow tubes & interface caps.
-    let bottom_gap_layers = (s.bottom_z_distance_mm / config.process.layer_height_mm)
-        .round()
-        .max(0.0) as usize;
-
     for idx in 0..n {
         let Some(disks) = layer_disks.get(idx) else {
             continue;
@@ -337,13 +337,15 @@ pub(crate) fn generate_tree_support_paths(
         } else {
             Vec::new()
         };
-        if bottom_gap_layers > 0 {
-            let min_j = idx.saturating_sub(bottom_gap_layers);
-            for j in min_j..idx {
-                if let Some(rl) = raw_layers.get(j) {
-                    excl_sources.extend(rl.regions.iter().cloned());
-                }
+        for j in bottom_gap_exclusion_range(raw_layers, idx, s.bottom_z_distance_mm) {
+            if let Some(rl) = raw_layers.get(j) {
+                excl_sources.extend(rl.regions.iter().cloned());
             }
+        }
+        if let Some(bm) = blocker_masks.get(idx)
+            && !bm.is_empty()
+        {
+            excl_sources.extend(bm.iter().cloned());
         }
         let excl = if excl_sources.is_empty() {
             Vec::new()

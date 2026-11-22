@@ -265,6 +265,242 @@ impl Default for ArachneConfig {
     }
 }
 
+/// Curvature-driven adaptive layer height settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AdaptiveLayerConfig {
+    /// Enable curvature-driven adaptive layer heights.
+    pub enabled: bool,
+    /// Optional minimum adaptive layer height in mm (`None` = `0.20 * nozzle_diameter_mm`, >= 0.04).
+    pub min_layer_height_mm: Option<f64>,
+    /// Optional maximum adaptive layer height in mm (`None` = `max(nominal, 0.75 * nozzle_diameter_mm)`).
+    pub max_layer_height_mm: Option<f64>,
+    /// Speed vs surface-quality bias (`0.0` = fastest / coarser, `1.0` = finest detail).
+    pub quality: f64,
+    /// 1D Gaussian Z-smoothing radius in mm across layer height targets (`0.0..=20.0`).
+    pub smooth_radius_mm: f64,
+    /// Maximum multiplicative step ratio between adjacent adaptive layers (`1.05..=3.0`).
+    pub max_step_ratio: f64,
+}
+
+impl Default for AdaptiveLayerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_layer_height_mm: None,
+            max_layer_height_mm: None,
+            quality: 0.5,
+            smooth_radius_mm: 2.0,
+            max_step_ratio: 1.5,
+        }
+    }
+}
+
+impl AdaptiveLayerConfig {
+    /// Effective maximum layer height (mm), clamped to physical nozzle bounds and >= min.
+    pub fn effective_max_layer_height_mm(&self, nozzle_d: f64, nominal_h: f64) -> f64 {
+        let max_limit = (1.25 * nozzle_d).max(0.02);
+        let default_max = (0.75 * nozzle_d).max(nominal_h).min(max_limit);
+        let eff_max = self
+            .max_layer_height_mm
+            .unwrap_or(default_max)
+            .clamp(0.02, max_limit);
+        if let Some(explicit_min) = self.min_layer_height_mm {
+            eff_max.max(explicit_min.clamp(0.02, max_limit))
+        } else {
+            eff_max
+        }
+    }
+
+    /// Effective minimum layer height (mm), guaranteed `<= effective_max_layer_height_mm`.
+    pub fn effective_min_layer_height_mm(&self, nozzle_d: f64, nominal_h: f64) -> f64 {
+        let eff_max = self.effective_max_layer_height_mm(nozzle_d, nominal_h);
+        let default_min = (0.20 * nozzle_d)
+            .max(0.04)
+            .min(nominal_h.max(0.02))
+            .min(eff_max);
+        self.min_layer_height_mm
+            .unwrap_or(default_min)
+            .clamp(0.02, eff_max)
+    }
+}
+
+/// Functional role of a 3D modifier volume on the build plate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModifierRole {
+    /// Override local print parameters inside the volume.
+    #[default]
+    Modifier,
+    /// Suppress automatic support generation and contact placement inside the volume.
+    SupportBlocker,
+    /// Force support generation for overhangs intersecting the volume.
+    SupportEnforcer,
+}
+
+impl ModifierRole {
+    /// All supported modifier volume roles.
+    pub const ALL: [Self; 3] = [Self::Modifier, Self::SupportBlocker, Self::SupportEnforcer];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Modifier => "Modifier",
+            Self::SupportBlocker => "Support blocker",
+            Self::SupportEnforcer => "Support enforcer",
+        }
+    }
+}
+
+/// Optional per-region process parameter overrides applied by height ranges or 3D modifier volumes.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ModifierOverrides {
+    pub sparse_infill_density: Option<f64>,
+    pub sparse_infill_pattern: Option<InfillPattern>,
+    pub wall_loops: Option<u16>,
+    pub top_shell_layers: Option<u16>,
+    pub bottom_shell_layers: Option<u16>,
+    pub ironing_mode: Option<IroningType>,
+    pub infill_speed_mm_s: Option<f64>,
+    pub outer_wall_speed_mm_s: Option<f64>,
+    pub inner_wall_speed_mm_s: Option<f64>,
+}
+
+impl ModifierOverrides {
+    /// Returns `true` if no local parameter override field is set.
+    pub fn is_empty(&self) -> bool {
+        self.sparse_infill_density.is_none()
+            && self.sparse_infill_pattern.is_none()
+            && self.wall_loops.is_none()
+            && self.top_shell_layers.is_none()
+            && self.bottom_shell_layers.is_none()
+            && self.ironing_mode.is_none()
+            && self.infill_speed_mm_s.is_none()
+            && self.outer_wall_speed_mm_s.is_none()
+            && self.inner_wall_speed_mm_s.is_none()
+    }
+
+    /// Returns `true` if any perimeter wall count or speed override is set.
+    pub fn affects_perimeters(&self) -> bool {
+        self.wall_loops.is_some()
+            || self.outer_wall_speed_mm_s.is_some()
+            || self.inner_wall_speed_mm_s.is_some()
+    }
+
+    /// Returns `true` if top or bottom shell counts are overridden.
+    pub fn affects_shells(&self) -> bool {
+        self.top_shell_layers.is_some() || self.bottom_shell_layers.is_some()
+    }
+
+    /// Merge set fields from `other`, giving `other` precedence over existing values.
+    pub fn merge_from(&mut self, other: &Self) {
+        if let Some(v) = other.sparse_infill_density {
+            self.sparse_infill_density = Some(v);
+        }
+        if let Some(v) = other.sparse_infill_pattern {
+            self.sparse_infill_pattern = Some(v);
+        }
+        if let Some(v) = other.wall_loops {
+            self.wall_loops = Some(v);
+        }
+        if let Some(v) = other.top_shell_layers {
+            self.top_shell_layers = Some(v);
+        }
+        if let Some(v) = other.bottom_shell_layers {
+            self.bottom_shell_layers = Some(v);
+        }
+        if let Some(v) = other.ironing_mode {
+            self.ironing_mode = Some(v);
+        }
+        if let Some(v) = other.infill_speed_mm_s {
+            self.infill_speed_mm_s = Some(v);
+        }
+        if let Some(v) = other.outer_wall_speed_mm_s {
+            self.outer_wall_speed_mm_s = Some(v);
+        }
+        if let Some(v) = other.inner_wall_speed_mm_s {
+            self.inner_wall_speed_mm_s = Some(v);
+        }
+    }
+
+    /// Validate numeric bounds on all set override fields.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(d) = self.sparse_infill_density
+            && (!d.is_finite() || !(0.0..=1.0).contains(&d))
+        {
+            return Err(ConfigError::Invalid {
+                field: "modifier.overrides.sparse_infill_density",
+                reason: "must be within 0.0..=1.0",
+            });
+        }
+        if let Some(w) = self.wall_loops
+            && w > 20
+        {
+            return Err(ConfigError::Invalid {
+                field: "modifier.overrides.wall_loops",
+                reason: "must be <= 20",
+            });
+        }
+        if let Some(t) = self.top_shell_layers
+            && t > 20
+        {
+            return Err(ConfigError::Invalid {
+                field: "modifier.overrides.top_shell_layers",
+                reason: "must be <= 20",
+            });
+        }
+        if let Some(b) = self.bottom_shell_layers
+            && b > 20
+        {
+            return Err(ConfigError::Invalid {
+                field: "modifier.overrides.bottom_shell_layers",
+                reason: "must be <= 20",
+            });
+        }
+        for (field, opt_v) in [
+            (
+                "modifier.overrides.infill_speed_mm_s",
+                self.infill_speed_mm_s,
+            ),
+            (
+                "modifier.overrides.outer_wall_speed_mm_s",
+                self.outer_wall_speed_mm_s,
+            ),
+            (
+                "modifier.overrides.inner_wall_speed_mm_s",
+                self.inner_wall_speed_mm_s,
+            ),
+        ] {
+            if let Some(v) = opt_v {
+                check_pos(field, v)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Explicit Z-height band overriding layer height and/or local slicing settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct HeightRangeModifier {
+    pub min_z_mm: f64,
+    pub max_z_mm: f64,
+    pub layer_height_mm: Option<f64>,
+    pub overrides: ModifierOverrides,
+}
+
+impl Default for HeightRangeModifier {
+    fn default() -> Self {
+        Self {
+            min_z_mm: 0.0,
+            max_z_mm: 1.0,
+            layer_height_mm: None,
+            overrides: ModifierOverrides::default(),
+        }
+    }
+}
+
 /// Slicing process parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -276,6 +512,10 @@ pub struct ProcessConfig {
     pub arachne: ArachneConfig,
     pub top_shell_layers: u16,
     pub bottom_shell_layers: u16,
+    pub top_shell_thickness_mm: Option<f64>,
+    pub bottom_shell_thickness_mm: Option<f64>,
+    pub adaptive_layer_height: AdaptiveLayerConfig,
+    pub height_ranges: Vec<HeightRangeModifier>,
     /// Fraction in `0.0..=1.0` (e.g. `0.20` for 20%).
     pub sparse_infill_density: f64,
     pub sparse_infill_pattern: InfillPattern,
@@ -493,6 +733,10 @@ impl Default for ProcessConfig {
             arachne: ArachneConfig::default(),
             top_shell_layers: 3,
             bottom_shell_layers: 3,
+            top_shell_thickness_mm: None,
+            bottom_shell_thickness_mm: None,
+            adaptive_layer_height: AdaptiveLayerConfig::default(),
+            height_ranges: Vec::new(),
             sparse_infill_density: 0.20,
             sparse_infill_pattern: InfillPattern::Grid,
             outer_wall_width_mm: 0.42,
@@ -1032,17 +1276,114 @@ impl PrintConfig {
             }
         }
 
-        if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
+        let max_nozzle_h = self.machine.nozzle_diameter_mm * 1.25;
+        if self.process.layer_height_mm > max_nozzle_h {
             return Err(ConfigError::Invalid {
                 field: "process.layer_height_mm",
                 reason: "exceeds 1.25x nozzle diameter",
             });
         }
-        if self.process.first_layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
+        if self.process.first_layer_height_mm > max_nozzle_h {
             return Err(ConfigError::Invalid {
                 field: "process.first_layer_height_mm",
                 reason: "exceeds 1.25x nozzle diameter",
             });
+        }
+        for (field, opt_thick) in [
+            (
+                "process.top_shell_thickness_mm",
+                self.process.top_shell_thickness_mm,
+            ),
+            (
+                "process.bottom_shell_thickness_mm",
+                self.process.bottom_shell_thickness_mm,
+            ),
+        ] {
+            if let Some(t) = opt_thick
+                && (!t.is_finite() || !(0.0..=50.0).contains(&t))
+            {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "must be within 0.0..=50.0",
+                });
+            }
+        }
+
+        let al = &self.process.adaptive_layer_height;
+        if let Some(min_h) = al.min_layer_height_mm
+            && (!min_h.is_finite() || min_h < 0.02 || min_h > max_nozzle_h)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.adaptive_layer_height.min_layer_height_mm",
+                reason: "must be within 0.02..=1.25x nozzle diameter",
+            });
+        }
+        if let Some(max_h) = al.max_layer_height_mm
+            && (!max_h.is_finite() || max_h < 0.02 || max_h > max_nozzle_h)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.adaptive_layer_height.max_layer_height_mm",
+                reason: "must be within 0.02..=1.25x nozzle diameter",
+            });
+        }
+        if let (Some(min_h), Some(max_h)) = (al.min_layer_height_mm, al.max_layer_height_mm)
+            && min_h > max_h
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.adaptive_layer_height.min_layer_height_mm",
+                reason: "must be <= max_layer_height_mm",
+            });
+        }
+        for (field, val, min, max) in [
+            (
+                "process.adaptive_layer_height.quality",
+                al.quality,
+                0.0,
+                1.0,
+            ),
+            (
+                "process.adaptive_layer_height.smooth_radius_mm",
+                al.smooth_radius_mm,
+                0.0,
+                20.0,
+            ),
+            (
+                "process.adaptive_layer_height.max_step_ratio",
+                al.max_step_ratio,
+                1.05,
+                3.0,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+
+        for hr in &self.process.height_ranges {
+            if !hr.min_z_mm.is_finite() || hr.min_z_mm < 0.0 {
+                return Err(ConfigError::Invalid {
+                    field: "process.height_ranges.min_z_mm",
+                    reason: "must be finite and >= 0",
+                });
+            }
+            if !hr.max_z_mm.is_finite() || hr.max_z_mm <= hr.min_z_mm {
+                return Err(ConfigError::Invalid {
+                    field: "process.height_ranges.max_z_mm",
+                    reason: "must be finite and > min_z_mm",
+                });
+            }
+            if let Some(h) = hr.layer_height_mm
+                && (!h.is_finite() || h < 0.02 || h > max_nozzle_h)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "process.height_ranges.layer_height_mm",
+                    reason: "must be within 0.02..=1.25x nozzle diameter",
+                });
+            }
+            hr.overrides.validate()?;
         }
         Ok(())
     }
@@ -1239,5 +1580,64 @@ mod tests {
         bad_tree.process.support.tree.branch_wall_loops = 2;
         bad_tree.process.support.tree.tip_diameter_mm = 9.0;
         assert!(bad_tree.validate().is_err());
+
+        // Phase 4D adaptive layer height, height ranges & modifier overrides validation
+        let mut adapt_ok = PrintConfig::default();
+        adapt_ok.process.adaptive_layer_height.enabled = true;
+        adapt_ok.process.adaptive_layer_height.min_layer_height_mm = Some(0.08);
+        adapt_ok.process.adaptive_layer_height.max_layer_height_mm = Some(0.28);
+        adapt_ok.process.top_shell_thickness_mm = Some(0.6);
+        adapt_ok.process.bottom_shell_thickness_mm = Some(0.6);
+        adapt_ok.process.height_ranges.push(HeightRangeModifier {
+            min_z_mm: 2.0,
+            max_z_mm: 6.0,
+            layer_height_mm: Some(0.12),
+            overrides: ModifierOverrides {
+                sparse_infill_density: Some(0.45),
+                wall_loops: Some(4),
+                ..ModifierOverrides::default()
+            },
+        });
+        assert!(adapt_ok.validate().is_ok());
+
+        let al_def = AdaptiveLayerConfig::default();
+        assert!((al_def.effective_min_layer_height_mm(0.4, 0.2) - 0.08).abs() < 1e-9);
+        assert!((al_def.effective_max_layer_height_mm(0.4, 0.2) - 0.30).abs() < 1e-9);
+        assert_eq!(ModifierRole::SupportBlocker.label(), "Support blocker");
+
+        let mut bad_adapt = PrintConfig::default();
+        bad_adapt.process.adaptive_layer_height.min_layer_height_mm = Some(0.30);
+        bad_adapt.process.adaptive_layer_height.max_layer_height_mm = Some(0.15);
+        assert!(bad_adapt.validate().is_err());
+        bad_adapt.process.adaptive_layer_height.max_layer_height_mm = Some(0.32);
+        bad_adapt.process.adaptive_layer_height.quality = 1.2;
+        assert!(bad_adapt.validate().is_err());
+        bad_adapt.process.adaptive_layer_height.quality = 0.5;
+        bad_adapt.process.adaptive_layer_height.max_step_ratio = 4.0;
+        assert!(bad_adapt.validate().is_err());
+        bad_adapt.process.adaptive_layer_height.max_step_ratio = 1.5;
+        bad_adapt.process.top_shell_thickness_mm = Some(-0.2);
+        assert!(bad_adapt.validate().is_err());
+
+        let mut bad_hr = PrintConfig::default();
+        bad_hr.process.height_ranges.push(HeightRangeModifier {
+            min_z_mm: 5.0,
+            max_z_mm: 4.0,
+            layer_height_mm: Some(0.15),
+            overrides: ModifierOverrides::default(),
+        });
+        assert!(bad_hr.validate().is_err());
+
+        let mut bad_ov = ModifierOverrides {
+            sparse_infill_density: Some(1.5),
+            ..ModifierOverrides::default()
+        };
+        assert!(bad_ov.validate().is_err());
+        bad_ov.sparse_infill_density = Some(0.5);
+        bad_ov.wall_loops = Some(25);
+        assert!(bad_ov.validate().is_err());
+        bad_ov.wall_loops = Some(3);
+        bad_ov.infill_speed_mm_s = Some(0.0);
+        assert!(bad_ov.validate().is_err());
     }
 }

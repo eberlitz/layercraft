@@ -1,0 +1,11 @@
+{
+  "min_layer_count": 65,
+  "max_layer_count": 140,
+  "max_z_mm": 18.0,
+  "require_outer_wall": true,
+  "require_bottom_surface": true,
+  "require_sparse_infill": true,
+  "min_layer_height_variation_ratio": 2.5,
+  "max_min_layer_height_mm": 0.10,
+  "min_max_layer_height_mm": 0.24
+}
