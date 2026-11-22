@@ -1,20 +1,28 @@
 //! Shared desktop and WebAssembly `egui` + `wgpu` slicer application (`LayerCraftApp`).
 
+mod icons;
+mod sidebar;
+mod theme;
+mod toolbar;
+mod ui_kit;
+mod viewport_hud;
+
 use std::sync::Arc;
 
+use egui::{Align, Margin, RichText, Stroke, pos2};
 use layercraft_config::{
-    GcodeFlavor, HeightRangeModifier, InfillPattern, IroningType, ModifierOverrides, ModifierRole,
-    ProfileApplyResult, ProfileKind, ProfileSummary, SeamPosition, SupportStyle, WallGenerator,
+    ModifierOverrides, ModifierRole, ProfileApplyResult, ProfileKind, ProfileSummary,
 };
 use layercraft_engine::{Session, execute};
-use layercraft_mesh::{ModifierPrimitive, ModifierTransform, SampleShape, inspect_mesh};
-use layercraft_slice::ExtrusionRole;
+use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, build_bed_grid, build_mesh_vertices, build_toolpath_mesh,
-    role_color,
 };
 use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
+
+use crate::sidebar::SidebarTab;
+use crate::theme::{ThemeMode, ThemePalette};
 
 /// Active workspace view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,33 +33,34 @@ pub enum ViewMode {
 
 /// Shared application state driving both native `eframe` and browser `WebRunner`.
 pub struct LayerCraftApp {
-    session: Session,
-    camera: OrbitCamera,
-    view_mode: ViewMode,
-    color_mode: ColorMode,
-    max_layer: usize,
-    single_layer_only: bool,
-    show_ghost_mesh: bool,
-    selected_sample: SampleShape,
-    selected_object_id: Option<u64>,
-    selected_modifier_id: Option<u64>,
-    selected_machine_profile: Option<String>,
-    selected_filament_profile: Option<String>,
-    selected_process_profile: Option<String>,
+    pub(crate) session: Session,
+    pub(crate) camera: OrbitCamera,
+    pub(crate) view_mode: ViewMode,
+    pub(crate) color_mode: ColorMode,
+    pub(crate) max_layer: usize,
+    pub(crate) single_layer_only: bool,
+    pub(crate) show_ghost_mesh: bool,
+    pub(crate) show_bed_grid: bool,
+    pub(crate) selected_sample: SampleShape,
+    pub(crate) selected_object_id: Option<u64>,
+    pub(crate) selected_modifier_id: Option<u64>,
+    pub(crate) selected_machine_profile: Option<String>,
+    pub(crate) selected_filament_profile: Option<String>,
+    pub(crate) selected_process_profile: Option<String>,
+    pub(crate) profile_warning_count: usize,
+    pub(crate) status_message: String,
+    pub(crate) last_error: Option<String>,
+    pub(crate) scene_revision: u64,
+    pub(crate) scene: Arc<GpuSceneSnapshot>,
+    pub(crate) viewport_aspect: f32,
+    pub(crate) theme_mode: ThemeMode,
+    pub(crate) styles_installed: bool,
+    pub(crate) sidebar_open: bool,
+    pub(crate) sidebar_tab: SidebarTab,
+    pub(crate) ribbon_collapsed: bool,
+    pub(crate) show_legend_hud: bool,
     #[cfg(not(target_arch = "wasm32"))]
-    profile_path_input: String,
-    profile_warning_count: usize,
-    #[cfg(not(target_arch = "wasm32"))]
-    file_path_input: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    export_path_input: String,
-    status_message: String,
-    last_error: Option<String>,
-    scene_revision: u64,
-    scene: Arc<GpuSceneSnapshot>,
-    viewport_aspect: f32,
-    #[cfg(not(target_arch = "wasm32"))]
-    last_slice_ms: Option<f64>,
+    pub(crate) last_slice_ms: Option<f64>,
     #[cfg(target_arch = "wasm32")]
     pending_drops: std::rc::Rc<std::cell::RefCell<Vec<(String, Result<Vec<u8>, String>)>>>,
 }
@@ -73,25 +82,26 @@ impl LayerCraftApp {
             max_layer: 0,
             single_layer_only: false,
             show_ghost_mesh: false,
+            show_bed_grid: true,
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
             selected_object_id: None,
             selected_modifier_id: None,
             selected_machine_profile: None,
             selected_filament_profile: None,
             selected_process_profile: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            profile_path_input: String::new(),
             profile_warning_count: 0,
-            #[cfg(not(target_arch = "wasm32"))]
-            file_path_input: String::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            export_path_input: "layercraft_out.gcode".to_owned(),
             status_message: "Drop an .stl or .3mf onto the window, or load a sample part."
                 .to_owned(),
             last_error: None,
             scene_revision: 0,
             scene: Arc::new(GpuSceneSnapshot::default()),
             viewport_aspect: 1.5,
+            theme_mode: ThemeMode::Dark,
+            styles_installed: false,
+            sidebar_open: true,
+            sidebar_tab: SidebarTab::Plate,
+            ribbon_collapsed: false,
+            show_legend_hud: true,
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(target_arch = "wasm32")]
@@ -121,6 +131,7 @@ impl LayerCraftApp {
             Ok(_) => {
                 self.last_error = None;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{name}`.");
                 self.frame_camera(CameraPreset::Isometric);
@@ -226,7 +237,7 @@ impl LayerCraftApp {
         }
     }
 
-    fn apply_selected_profiles(&mut self) {
+    pub(crate) fn apply_selected_profiles(&mut self) {
         match execute(
             &mut self.session,
             "profile.apply",
@@ -274,6 +285,7 @@ impl LayerCraftApp {
             Ok(_) => {
                 self.last_error = None;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
                 let verb = if append { "Added" } else { "Loaded" };
                 self.status_message = format!("{verb} sample `{}`.", shape.label());
@@ -286,7 +298,7 @@ impl LayerCraftApp {
         }
     }
 
-    fn auto_arrange_plate(&mut self) {
+    pub(crate) fn auto_arrange_plate(&mut self) {
         match execute(
             &mut self.session,
             "plate.auto_arrange",
@@ -305,6 +317,117 @@ impl LayerCraftApp {
             Err(e) => {
                 self.last_error = Some(e.to_string());
             }
+        }
+    }
+
+    pub(crate) fn remove_object(&mut self, id: u64) {
+        match execute(
+            &mut self.session,
+            "plate.remove_object",
+            serde_json::json!({ "id": id }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.view_mode = ViewMode::Prepare;
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) fn transform_object(
+        &mut self,
+        id: u64,
+        pos: [f64; 2],
+        rot: [f64; 3],
+        scale: [f64; 3],
+    ) {
+        match execute(
+            &mut self.session,
+            "plate.transform_object",
+            serde_json::json!({
+                "id": id,
+                "position_xy_mm": pos,
+                "rotation_deg": rot,
+                "scale": scale,
+            }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.view_mode = ViewMode::Prepare;
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) fn add_modifier_primitive(
+        &mut self,
+        primitive: ModifierPrimitive,
+        role: ModifierRole,
+    ) {
+        match execute(
+            &mut self.session,
+            "plate.add_modifier_primitive",
+            serde_json::json!({ "primitive": primitive, "role": role }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+                self.selected_object_id = None;
+                self.sidebar_tab = SidebarTab::Plate;
+                self.view_mode = ViewMode::Prepare;
+                self.status_message = format!("Added {} volume.", role.label());
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) fn remove_modifier(&mut self, id: u64) {
+        match execute(
+            &mut self.session,
+            "plate.remove_modifier",
+            serde_json::json!({ "id": id }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+                self.view_mode = ViewMode::Prepare;
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) fn update_modifier(
+        &mut self,
+        id: u64,
+        role: ModifierRole,
+        pos: [f64; 3],
+        rot: [f64; 3],
+        scale: [f64; 3],
+        overrides: ModifierOverrides,
+    ) {
+        match execute(
+            &mut self.session,
+            "plate.update_modifier",
+            serde_json::json!({
+                "id": id,
+                "role": role,
+                "position_xyz_mm": pos,
+                "rotation_deg": rot,
+                "scale": scale,
+                "overrides": overrides,
+            }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.view_mode = ViewMode::Prepare;
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
         }
     }
 
@@ -346,7 +469,7 @@ impl LayerCraftApp {
         self.rebuild_scene();
     }
 
-    fn frame_camera(&mut self, preset: CameraPreset) {
+    pub(crate) fn frame_camera(&mut self, preset: CameraPreset) {
         let bw = self.session.config.machine.bed_width_mm as f32;
         let bd = self.session.config.machine.bed_depth_mm as f32;
         self.camera = match self.session.prepared_mesh.as_ref().and_then(|m| m.aabb()) {
@@ -355,9 +478,13 @@ impl LayerCraftApp {
         };
     }
 
-    fn rebuild_scene(&mut self) {
+    pub(crate) fn rebuild_scene(&mut self) {
         self.scene_revision = self.scene_revision.wrapping_add(1);
-        let bed = build_bed_grid(&self.session.config);
+        let bed = if self.show_bed_grid {
+            build_bed_grid(&self.session.config)
+        } else {
+            Vec::new()
+        };
         let mut mesh = self
             .session
             .prepared_mesh
@@ -442,7 +569,7 @@ impl LayerCraftApp {
                     if is_json {
                         self.load_native_profile_path(&p);
                     } else {
-                        self.load_native_path(&p);
+                        self.load_native_path_with_mode(&p, false);
                     }
                 }
             }
@@ -461,15 +588,16 @@ impl LayerCraftApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn load_native_path(&mut self, path: &str) {
+    pub(crate) fn load_native_path_with_mode(&mut self, path: &str, append: bool) {
         match execute(
             &mut self.session,
             "plate.add_mesh_file",
-            serde_json::json!({ "path": path }),
+            serde_json::json!({ "path": path, "append": append }),
         ) {
             Ok(_) => {
                 self.last_error = None;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{path}`.");
                 self.frame_camera(CameraPreset::Isometric);
@@ -481,1879 +609,140 @@ impl LayerCraftApp {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("layercraft_top_bar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("LayerCraft");
-                ui.separator();
-
-                egui::ComboBox::from_id_salt("sample_combo")
-                    .selected_text(self.selected_sample.label())
-                    .show_ui(ui, |ui| {
-                        for shape in SampleShape::ALL {
-                            if ui
-                                .selectable_value(&mut self.selected_sample, shape, shape.label())
-                                .clicked()
-                            {
-                                self.load_sample(shape);
-                            }
-                        }
-                    });
-                if ui.button("Load Sample").clicked() {
-                    self.load_sample_with_mode(self.selected_sample, false);
-                }
-                if ui.button("Add Sample").clicked() {
-                    self.load_sample_with_mode(self.selected_sample, true);
-                }
-                if self.session.objects.len() > 1 && ui.button("Arrange").clicked() {
-                    self.auto_arrange_plate();
-                }
-
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    ui.separator();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.file_path_input)
-                            .hint_text("path/to/model.stl or .3mf")
-                            .desired_width(170.0),
-                    );
-                    if ui.button("Open").clicked() && !self.file_path_input.trim().is_empty() {
-                        let p = self.file_path_input.trim().to_owned();
-                        self.load_native_path(&p);
-                    }
-                }
-
-                ui.separator();
-                ui.selectable_value(&mut self.view_mode, ViewMode::Prepare, "Prepare");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Preview, "Preview");
-
-                ui.separator();
-                if ui.button("Iso").clicked() {
-                    self.frame_camera(CameraPreset::Isometric);
-                }
-                if ui.button("Top").clicked() {
-                    self.frame_camera(CameraPreset::Top);
-                }
-                if ui.button("Front").clicked() {
-                    self.frame_camera(CameraPreset::Front);
-                }
-                if ui.button("Right").clicked() {
-                    self.frame_camera(CameraPreset::Right);
-                }
-
-                ui.separator();
-                if ui
-                    .button(egui::RichText::new("Slice Plate").strong())
-                    .clicked()
-                {
-                    self.run_slice();
-                }
-
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(g) = &self.session.last_gcode {
-                    ui.separator();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.export_path_input)
-                            .desired_width(140.0),
-                    );
-                    if ui.button("Export G-code").clicked() {
-                        let path = self.export_path_input.trim().to_owned();
-                        match std::fs::write(&path, &g.gcode) {
-                            Ok(()) => {
-                                self.last_error = None;
-                                self.status_message = format!("Exported `{path}`.");
-                            }
-                            Err(e) => {
-                                self.last_error = Some(format!("Export failed: {e}"));
-                            }
-                        }
-                    }
-                }
-
-                #[cfg(target_arch = "wasm32")]
-                if let Some(g) = &self.session.last_gcode {
-                    ui.separator();
-                    if ui.button("Download G-code").clicked() {
-                        match trigger_browser_download("layercraft_out.gcode", &g.gcode) {
-                            Ok(()) => {
-                                self.last_error = None;
-                                self.status_message =
-                                    "Triggered browser download `layercraft_out.gcode`.".to_owned();
-                            }
-                            Err(e) => {
-                                self.last_error = Some(format!("Download failed: {e}"));
-                            }
-                        }
-                    }
-                }
-            });
-        });
-    }
-
-    fn left_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("layercraft_settings_panel")
-            .default_size(275.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut profile_apply_requested = false;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let mut native_profile_load_path: Option<String> = None;
-
-                    egui::CollapsingHeader::new("Profiles")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            let machines = self
-                                .session
-                                .profiles
-                                .list(Some(ProfileKind::Machine), false);
-                            let filaments = self
-                                .session
-                                .profiles
-                                .list(Some(ProfileKind::Filament), false);
-                            let processes = self
-                                .session
-                                .profiles
-                                .list(Some(ProfileKind::Process), false);
-
-                            egui::Grid::new("profiles_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Machine");
-                                    let m_text = self
-                                        .selected_machine_profile
-                                        .as_deref()
-                                        .unwrap_or("(Default)");
-                                    egui::ComboBox::from_id_salt("prof_machine")
-                                        .selected_text(m_text)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_machine_profile.is_none(),
-                                                    "(Default)",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_machine_profile = None;
-                                                profile_apply_requested = true;
-                                            }
-                                            for item in &machines {
-                                                let sel = self.selected_machine_profile.as_deref()
-                                                    == Some(item.name.as_str());
-                                                if ui.selectable_label(sel, &item.name).clicked() {
-                                                    self.selected_machine_profile =
-                                                        Some(item.name.clone());
-                                                    profile_apply_requested = true;
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    ui.label("Filament");
-                                    let f_text = self
-                                        .selected_filament_profile
-                                        .as_deref()
-                                        .unwrap_or("(Default)");
-                                    egui::ComboBox::from_id_salt("prof_filament")
-                                        .selected_text(f_text)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_filament_profile.is_none(),
-                                                    "(Default)",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_filament_profile = None;
-                                                profile_apply_requested = true;
-                                            }
-                                            for item in &filaments {
-                                                let sel = self.selected_filament_profile.as_deref()
-                                                    == Some(item.name.as_str());
-                                                if ui.selectable_label(sel, &item.name).clicked() {
-                                                    self.selected_filament_profile =
-                                                        Some(item.name.clone());
-                                                    profile_apply_requested = true;
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    ui.label("Process");
-                                    let p_text = self
-                                        .selected_process_profile
-                                        .as_deref()
-                                        .unwrap_or("(Default)");
-                                    egui::ComboBox::from_id_salt("prof_process")
-                                        .selected_text(p_text)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_process_profile.is_none(),
-                                                    "(Default)",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_process_profile = None;
-                                                profile_apply_requested = true;
-                                            }
-                                            for item in &processes {
-                                                let sel = self.selected_process_profile.as_deref()
-                                                    == Some(item.name.as_str());
-                                                if ui.selectable_label(sel, &item.name).clicked() {
-                                                    self.selected_process_profile =
-                                                        Some(item.name.clone());
-                                                    profile_apply_requested = true;
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
-                                });
-
-                            ui.horizontal(|ui| {
-                                if ui.button("Apply").clicked() {
-                                    profile_apply_requested = true;
-                                }
-                                if self.profile_warning_count > 0 {
-                                    ui.weak(format!("{} warning(s)", self.profile_warning_count));
-                                }
-                            });
-
-                            #[cfg(not(target_arch = "wasm32"))]
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.profile_path_input)
-                                        .hint_text("path/to/profiles or .json")
-                                        .desired_width(145.0),
-                                );
-                                if ui.button("Load JSON/Dir").clicked()
-                                    && !self.profile_path_input.trim().is_empty()
-                                {
-                                    native_profile_load_path =
-                                        Some(self.profile_path_input.trim().to_owned());
-                                }
-                            });
-                        });
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(p) = native_profile_load_path {
-                        self.load_native_profile_path(&p);
-                    }
-                    if profile_apply_requested {
-                        self.apply_selected_profiles();
-                    }
-
-                    ui.add_space(4.0);
-                    ui.heading("Process Settings");
-                    ui.add_space(4.0);
-
-                    let p = &mut self.session.config.process;
-                    egui::Grid::new("process_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("Layer height (mm)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.layer_height_mm)
-                                    .speed(0.01)
-                                    .range(0.04..=0.80),
-                            );
-                            ui.end_row();
-
-                            ui.label("First layer (mm)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.first_layer_height_mm)
-                                    .speed(0.01)
-                                    .range(0.05..=0.80),
-                            );
-                            ui.end_row();
-
-                            ui.label("Wall loops");
-                            ui.add(egui::DragValue::new(&mut p.wall_loops).range(0..=12));
-                            ui.end_row();
-
-                            ui.label("Wall generator");
-                            egui::ComboBox::from_id_salt("wall_gen")
-                                .selected_text(p.wall_generator.label())
-                                .show_ui(ui, |ui| {
-                                    for wg in WallGenerator::ALL {
-                                        ui.selectable_value(&mut p.wall_generator, wg, wg.label());
-                                    }
-                                });
-                            ui.end_row();
-
-                            if p.wall_generator == WallGenerator::Arachne {
-                                let mut min_pct = p.arachne.min_bead_width_ratio * 100.0;
-                                ui.label("Min bead width (%)");
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut min_pct)
-                                            .speed(1.0)
-                                            .range(20.0..=100.0),
-                                    )
-                                    .changed()
-                                {
-                                    p.arachne.min_bead_width_ratio =
-                                        (min_pct / 100.0).clamp(0.20, 1.00);
-                                }
-                                ui.end_row();
-
-                                let mut max_pct = p.arachne.max_bead_width_ratio * 100.0;
-                                ui.label("Max bead width (%)");
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut max_pct)
-                                            .speed(1.0)
-                                            .range(100.0..=300.0),
-                                    )
-                                    .changed()
-                                {
-                                    p.arachne.max_bead_width_ratio =
-                                        (max_pct / 100.0).clamp(1.00, 3.00);
-                                }
-                                ui.end_row();
-
-                                let mut feat_pct = p.arachne.min_feature_size_ratio * 100.0;
-                                ui.label("Min feature size (%)");
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut feat_pct)
-                                            .speed(1.0)
-                                            .range(5.0..=100.0),
-                                    )
-                                    .changed()
-                                {
-                                    p.arachne.min_feature_size_ratio =
-                                        (feat_pct / 100.0).clamp(0.05, 1.00);
-                                }
-                                ui.end_row();
-
-                                ui.label("Wall dist count");
-                                ui.add(
-                                    egui::DragValue::new(&mut p.arachne.wall_distribution_count)
-                                        .range(1..=8),
-                                );
-                                ui.end_row();
-                            }
-
-                            ui.label("Top shell layers");
-                            ui.add(egui::DragValue::new(&mut p.top_shell_layers).range(0..=20));
-                            ui.end_row();
-
-                            ui.label("Bottom shell layers");
-                            ui.add(egui::DragValue::new(&mut p.bottom_shell_layers).range(0..=20));
-                            ui.end_row();
-
-                            let mut pct = p.sparse_infill_density * 100.0;
-                            ui.label("Infill density (%)");
-                            if ui
-                                .add(egui::DragValue::new(&mut pct).speed(1.0).range(0.0..=100.0))
-                                .changed()
-                            {
-                                p.sparse_infill_density = (pct / 100.0).clamp(0.0, 1.0);
-                            }
-                            ui.end_row();
-
-                            ui.label("Infill pattern");
-                            egui::ComboBox::from_id_salt("infill_pat")
-                                .selected_text(p.sparse_infill_pattern.label())
-                                .show_ui(ui, |ui| {
-                                    for pat in InfillPattern::ALL {
-                                        ui.selectable_value(
-                                            &mut p.sparse_infill_pattern,
-                                            pat,
-                                            pat.label(),
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("Outer wall (mm)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.outer_wall_width_mm)
-                                    .speed(0.01)
-                                    .range(0.10..=1.20),
-                            );
-                            ui.end_row();
-
-                            ui.label("Inner wall (mm)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.inner_wall_width_mm)
-                                    .speed(0.01)
-                                    .range(0.10..=1.20),
-                            );
-                            ui.end_row();
-
-                            ui.label("Skirt loops");
-                            ui.add(egui::DragValue::new(&mut p.skirt_loops).range(0..=10));
-                            ui.end_row();
-
-                            ui.label("Brim width (mm)");
-                            ui.add(
-                                egui::DragValue::new(&mut p.brim_width_mm)
-                                    .speed(0.2)
-                                    .range(0.0..=20.0),
-                            );
-                            ui.end_row();
-
-                            ui.label("Seam position");
-                            egui::ComboBox::from_id_salt("seam_pos")
-                                .selected_text(p.seam_position.label())
-                                .show_ui(ui, |ui| {
-                                    for pos in SeamPosition::ALL {
-                                        ui.selectable_value(&mut p.seam_position, pos, pos.label());
-                                    }
-                                });
-                            ui.end_row();
-                        });
-
-                    ui.add_space(6.0);
-                    ui.heading("Machine & Filament");
-                    let mut bed_changed = false;
-                    {
-                        let m = &mut self.session.config.machine;
-                        let f = &mut self.session.config.filament;
-                        egui::Grid::new("machine_grid")
-                            .num_columns(2)
-                            .spacing([8.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.label("Flavor");
-                                egui::ComboBox::from_id_salt("flavor_sel")
-                                    .selected_text(m.flavor.label())
-                                    .show_ui(ui, |ui| {
-                                        for fl in GcodeFlavor::ALL {
-                                            ui.selectable_value(&mut m.flavor, fl, fl.label());
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label("Nozzle (mm)");
-                                ui.add(
-                                    egui::DragValue::new(&mut m.nozzle_diameter_mm)
-                                        .speed(0.05)
-                                        .range(0.15..=1.20),
-                                );
-                                ui.end_row();
-
-                                ui.label("High-flow nozzle");
-                                ui.checkbox(&mut m.nozzle_high_flow, "");
-                                ui.end_row();
-
-                                ui.label("Bed X (mm)");
-                                bed_changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut m.bed_width_mm)
-                                            .speed(1.0)
-                                            .range(50.0..=600.0),
-                                    )
-                                    .changed();
-                                ui.end_row();
-
-                                ui.label("Bed Y (mm)");
-                                bed_changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut m.bed_depth_mm)
-                                            .speed(1.0)
-                                            .range(50.0..=600.0),
-                                    )
-                                    .changed();
-                                ui.end_row();
-
-                                ui.label("Bed Z (mm)");
-                                ui.add(
-                                    egui::DragValue::new(&mut m.bed_height_mm)
-                                        .speed(1.0)
-                                        .range(50.0..=600.0),
-                                );
-                                ui.end_row();
-
-                                ui.label("Relative E");
-                                ui.checkbox(&mut m.relative_extrusion, "");
-                                ui.end_row();
-
-                                ui.label("Nozzle temp (C)");
-                                ui.add(egui::DragValue::new(&mut f.nozzle_temp_c).range(150..=340));
-                                ui.end_row();
-
-                                ui.label("Bed temp (C)");
-                                ui.add(egui::DragValue::new(&mut f.bed_temp_c).range(0..=130));
-                                ui.end_row();
-
-                                let mut ch_val = f.chamber_temp_c.unwrap_or(0);
-                                ui.label("Chamber C (0=off)");
-                                if ui
-                                    .add(egui::DragValue::new(&mut ch_val).range(0..=100))
-                                    .changed()
-                                {
-                                    f.chamber_temp_c =
-                                        if ch_val == 0 { None } else { Some(ch_val) };
-                                }
-                                ui.end_row();
-
-                                let mut pa_val = f.pressure_advance.unwrap_or(0.0);
-                                ui.label("PA (0=off)");
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut pa_val)
-                                            .speed(0.002)
-                                            .range(0.0..=1.0),
-                                    )
-                                    .changed()
-                                {
-                                    f.pressure_advance =
-                                        if pa_val <= 0.0 { None } else { Some(pa_val) };
-                                }
-                                ui.end_row();
-                            });
-                    }
-                    if bed_changed {
-                        self.rebuild_scene();
-                    }
-
-                    let m = &mut self.session.config.machine;
-                    let f = &mut self.session.config.filament;
-
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Cooling & Flow")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::Grid::new("cooling_flow_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Max flow (mm³/s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut f.max_volumetric_speed_mm3_s)
-                                            .speed(0.2)
-                                            .range(0.5..=60.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Fan min (%)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut f.fan_min_percent)
-                                                .range(0..=100),
-                                        )
-                                        .changed()
-                                        && f.fan_min_percent > f.fan_max_percent
-                                    {
-                                        f.fan_max_percent = f.fan_min_percent;
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Fan max (%)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut f.fan_max_percent)
-                                                .range(0..=100),
-                                        )
-                                        .changed()
-                                        && f.fan_max_percent < f.fan_min_percent
-                                    {
-                                        f.fan_min_percent = f.fan_max_percent;
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Disable fan layers");
-                                    ui.add(
-                                        egui::DragValue::new(&mut f.disable_fan_first_layers)
-                                            .range(0..=20),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Slowdown layer (s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut f.slow_down_layer_time_s)
-                                            .speed(0.2)
-                                            .range(0.0..=60.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Min speed (mm/s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut f.slow_down_min_speed_mm_s)
-                                            .speed(0.5)
-                                            .range(1.0..=100.0),
-                                    );
-                                    ui.end_row();
-                                });
-                        });
-
-                    egui::CollapsingHeader::new("Retraction & Travel")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::Grid::new("retract_travel_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Retract len (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut m.retraction_length_mm)
-                                            .speed(0.05)
-                                            .range(0.0..=15.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Z-hop (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut m.z_hop_mm)
-                                            .speed(0.05)
-                                            .range(0.0..=5.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Wipe on retract");
-                                    ui.checkbox(&mut m.wipe_on_retract, "");
-                                    ui.end_row();
-
-                                    ui.label("Wipe dist (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut m.wipe_distance_mm)
-                                            .speed(0.1)
-                                            .range(0.0..=10.0),
-                                    );
-                                    ui.end_row();
-                                });
-                        });
-
-                    egui::CollapsingHeader::new("Acceleration & Firmware")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let proc_cfg = &mut self.session.config.process;
-                            let mach_cfg = &mut self.session.config.machine;
-                            egui::Grid::new("accel_fw_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    for (label, opt_val) in [
-                                        (
-                                            "Default accel (0=fw)",
-                                            &mut proc_cfg.default_acceleration_mm_s2,
-                                        ),
-                                        (
-                                            "Outer wall accel",
-                                            &mut proc_cfg.outer_wall_acceleration_mm_s2,
-                                        ),
-                                        (
-                                            "First layer accel",
-                                            &mut proc_cfg.first_layer_acceleration_mm_s2,
-                                        ),
-                                        ("Travel accel", &mut proc_cfg.travel_acceleration_mm_s2),
-                                    ] {
-                                        let mut v = opt_val.unwrap_or(0.0);
-                                        ui.label(label);
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut v)
-                                                    .speed(50.0)
-                                                    .range(0.0..=50_000.0),
-                                            )
-                                            .changed()
-                                        {
-                                            *opt_val =
-                                                if v <= 0.0 { None } else { Some(v.max(10.0)) };
-                                        }
-                                        ui.end_row();
-                                    }
-
-                                    ui.label("Emit M73 progress");
-                                    ui.checkbox(&mut mach_cfg.emit_progress_m73, "");
-                                    ui.end_row();
-                                });
-                        });
-
-                    egui::CollapsingHeader::new("Start / End G-code")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let mach_cfg = &mut self.session.config.machine;
-                            ui.label("Start G-code (empty = built-in):");
-                            let mut start_buf = mach_cfg.start_gcode.clone().unwrap_or_default();
-                            if ui
-                                .add(
-                                    egui::TextEdit::multiline(&mut start_buf)
-                                        .desired_rows(4)
-                                        .code_editor(),
-                                )
-                                .changed()
-                            {
-                                mach_cfg.start_gcode = if start_buf.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(start_buf)
-                                };
-                            }
-
-                            ui.add_space(4.0);
-                            ui.label("End G-code (empty = built-in):");
-                            let mut end_buf = mach_cfg.end_gcode.clone().unwrap_or_default();
-                            if ui
-                                .add(
-                                    egui::TextEdit::multiline(&mut end_buf)
-                                        .desired_rows(4)
-                                        .code_editor(),
-                                )
-                                .changed()
-                            {
-                                mach_cfg.end_gcode = if end_buf.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(end_buf)
-                                };
-                            }
-                        });
-
-                    egui::CollapsingHeader::new("Bridges & Overhangs")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let proc_cfg = &mut self.session.config.process;
-                            egui::Grid::new("bridge_overhang_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Detect bridges");
-                                    ui.checkbox(&mut proc_cfg.detect_bridges, "");
-                                    ui.end_row();
-
-                                    ui.label("Bridge speed (mm/s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.bridge_speed_mm_s)
-                                            .speed(1.0)
-                                            .range(5.0..=150.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Bridge flow ratio");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.bridge_flow_ratio)
-                                            .speed(0.02)
-                                            .range(0.5..=1.5),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Bridge fan (%)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut f.bridge_fan_percent)
-                                            .range(0..=100),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Detect overhangs");
-                                    ui.checkbox(&mut proc_cfg.detect_overhangs, "");
-                                    ui.end_row();
-
-                                    ui.label("Overhang angle (deg)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.overhang_threshold_deg)
-                                            .speed(1.0)
-                                            .range(10.0..=85.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Overhang speed (mm/s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.overhang_speed_mm_s)
-                                            .speed(1.0)
-                                            .range(5.0..=150.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Monotonic top/bottom");
-                                    ui.checkbox(&mut proc_cfg.monotonic_solid_infill, "");
-                                    ui.end_row();
-                                });
-                        });
-
-                    egui::CollapsingHeader::new("Supports")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let sup = &mut self.session.config.process.support;
-                            egui::Grid::new("supports_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Enable supports");
-                                    ui.checkbox(&mut sup.enabled, "");
-                                    ui.end_row();
-
-                                    ui.label("Support style");
-                                    egui::ComboBox::from_id_salt("support_style")
-                                        .selected_text(sup.style.label())
-                                        .show_ui(ui, |ui| {
-                                            for st in SupportStyle::ALL {
-                                                ui.selectable_value(&mut sup.style, st, st.label());
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    ui.label("On build plate only");
-                                    ui.checkbox(&mut sup.on_build_plate_only, "");
-                                    ui.end_row();
-
-                                    ui.label("Threshold angle (deg)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut sup.threshold_angle_deg)
-                                            .speed(1.0)
-                                            .range(10.0..=85.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Top Z gap (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut sup.top_z_distance_mm)
-                                            .speed(0.05)
-                                            .range(0.0..=2.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("XY gap (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut sup.xy_distance_mm)
-                                            .speed(0.05)
-                                            .range(0.0..=5.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Pattern spacing (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut sup.base_pattern_spacing_mm)
-                                            .speed(0.1)
-                                            .range(0.5..=20.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Interface layers");
-                                    ui.add(
-                                        egui::DragValue::new(&mut sup.interface_layers)
-                                            .range(0..=8),
-                                    );
-                                    ui.end_row();
-
-                                    if sup.style == SupportStyle::Tree {
-                                        let tr = &mut sup.tree;
-                                        ui.label("Max branch angle (deg)");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.max_branch_angle_deg)
-                                                .speed(1.0)
-                                                .range(10.0..=70.0),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Tip diameter (mm)");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.tip_diameter_mm)
-                                                .speed(0.1)
-                                                .range(0.4..=tr.max_trunk_diameter_mm.min(10.0)),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Branch diameter (mm)");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.branch_diameter_mm)
-                                                .speed(0.1)
-                                                .range(0.6..=tr.max_trunk_diameter_mm.min(20.0)),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Max trunk diam (mm)");
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut tr.max_trunk_diameter_mm)
-                                                    .speed(0.2)
-                                                    .range(1.0..=50.0),
-                                            )
-                                            .changed()
-                                        {
-                                            tr.tip_diameter_mm =
-                                                tr.tip_diameter_mm.min(tr.max_trunk_diameter_mm);
-                                            tr.branch_diameter_mm =
-                                                tr.branch_diameter_mm.min(tr.max_trunk_diameter_mm);
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Branch distance (mm)");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.branch_distance_mm)
-                                                .speed(0.2)
-                                                .range(0.8..=25.0),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Branch walls");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.branch_wall_loops)
-                                                .range(1..=6),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Trunk base flare (mm)");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tr.trunk_base_flare_mm)
-                                                .speed(0.1)
-                                                .range(0.0..=10.0),
-                                        );
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-
-                    egui::CollapsingHeader::new("Variable Layer Height")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let max_nozzle_h =
-                                (self.session.config.machine.nozzle_diameter_mm * 1.25).max(0.04);
-                            let proc_cfg = &mut self.session.config.process;
-                            let al = &mut proc_cfg.adaptive_layer_height;
-                            egui::Grid::new("var_layer_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Adaptive height");
-                                    ui.checkbox(&mut al.enabled, "");
-                                    ui.end_row();
-
-                                    let mut min_v = al.min_layer_height_mm.unwrap_or(0.0);
-                                    ui.label("Min height (0=auto)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut min_v)
-                                                .speed(0.01)
-                                                .range(0.0..=max_nozzle_h),
-                                        )
-                                        .changed()
-                                    {
-                                        al.min_layer_height_mm = if min_v <= 1e-4 {
-                                            None
-                                        } else {
-                                            Some(min_v.clamp(0.02, max_nozzle_h))
-                                        };
-                                    }
-                                    ui.end_row();
-
-                                    let mut max_v = al.max_layer_height_mm.unwrap_or(0.0);
-                                    ui.label("Max height (0=auto)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut max_v)
-                                                .speed(0.01)
-                                                .range(0.0..=max_nozzle_h),
-                                        )
-                                        .changed()
-                                    {
-                                        al.max_layer_height_mm = if max_v <= 1e-4 {
-                                            None
-                                        } else {
-                                            Some(max_v.clamp(0.02, max_nozzle_h))
-                                        };
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Quality (0..1)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut al.quality)
-                                            .speed(0.02)
-                                            .range(0.0..=1.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Smooth radius (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut al.smooth_radius_mm)
-                                            .speed(0.1)
-                                            .range(0.0..=20.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Max step ratio");
-                                    ui.add(
-                                        egui::DragValue::new(&mut al.max_step_ratio)
-                                            .speed(0.05)
-                                            .range(1.05..=3.0),
-                                    );
-                                    ui.end_row();
-
-                                    let mut top_thick =
-                                        proc_cfg.top_shell_thickness_mm.unwrap_or(0.0);
-                                    ui.label("Top min thick (mm)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut top_thick)
-                                                .speed(0.05)
-                                                .range(0.0..=10.0),
-                                        )
-                                        .changed()
-                                    {
-                                        proc_cfg.top_shell_thickness_mm = if top_thick <= 1e-4 {
-                                            None
-                                        } else {
-                                            Some(top_thick)
-                                        };
-                                    }
-                                    ui.end_row();
-
-                                    let mut bot_thick =
-                                        proc_cfg.bottom_shell_thickness_mm.unwrap_or(0.0);
-                                    ui.label("Bot min thick (mm)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut bot_thick)
-                                                .speed(0.05)
-                                                .range(0.0..=10.0),
-                                        )
-                                        .changed()
-                                    {
-                                        proc_cfg.bottom_shell_thickness_mm = if bot_thick <= 1e-4 {
-                                            None
-                                        } else {
-                                            Some(bot_thick)
-                                        };
-                                    }
-                                    ui.end_row();
-                                });
-
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.strong("Height Ranges");
-                                if ui.small_button("+ Add Z Range").clicked() {
-                                    let z0 = proc_cfg
-                                        .height_ranges
-                                        .last()
-                                        .map(|r| r.max_z_mm)
-                                        .unwrap_or(0.0);
-                                    proc_cfg.height_ranges.push(HeightRangeModifier {
-                                        min_z_mm: z0,
-                                        max_z_mm: z0 + 5.0,
-                                        layer_height_mm: Some(proc_cfg.layer_height_mm),
-                                        overrides: ModifierOverrides::default(),
-                                    });
-                                }
-                            });
-                            let mut rm_hr_idx: Option<usize> = None;
-                            for (ri, hr) in proc_cfg.height_ranges.iter_mut().enumerate() {
-                                ui.push_id(ri, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Z:");
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut hr.min_z_mm)
-                                                    .speed(0.2)
-                                                    .range(0.0..=500.0),
-                                            )
-                                            .changed()
-                                            && hr.max_z_mm <= hr.min_z_mm
-                                        {
-                                            hr.max_z_mm = hr.min_z_mm + 0.5;
-                                        }
-                                        ui.label("..");
-                                        let min_hi = hr.min_z_mm + 0.1;
-                                        ui.add(
-                                            egui::DragValue::new(&mut hr.max_z_mm)
-                                                .speed(0.2)
-                                                .range(min_hi..=500.0),
-                                        );
-                                        let mut h_val = hr.layer_height_mm.unwrap_or(0.0);
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut h_val)
-                                                    .speed(0.01)
-                                                    .prefix("h:")
-                                                    .range(0.0..=max_nozzle_h),
-                                            )
-                                            .changed()
-                                        {
-                                            hr.layer_height_mm = if h_val <= 1e-4 {
-                                                None
-                                            } else {
-                                                Some(h_val.clamp(0.02, max_nozzle_h))
-                                            };
-                                        }
-                                        if ui.small_button("x").clicked() {
-                                            rm_hr_idx = Some(ri);
-                                        }
-                                    });
-                                });
-                            }
-                            if let Some(ri) = rm_hr_idx
-                                && ri < proc_cfg.height_ranges.len()
-                            {
-                                proc_cfg.height_ranges.remove(ri);
-                            }
-                        });
-
-                    egui::CollapsingHeader::new("Surface & Motion Finish")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let proc_cfg = &mut self.session.config.process;
-                            egui::Grid::new("surface_motion_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Ironing");
-                                    egui::ComboBox::from_id_salt("ironing_mode")
-                                        .selected_text(proc_cfg.ironing.mode.label())
-                                        .show_ui(ui, |ui| {
-                                            for mode in IroningType::ALL {
-                                                ui.selectable_value(
-                                                    &mut proc_cfg.ironing.mode,
-                                                    mode,
-                                                    mode.label(),
-                                                );
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    let mut iron_flow_pct = proc_cfg.ironing.flow_ratio * 100.0;
-                                    ui.label("Iron flow (%)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut iron_flow_pct)
-                                                .speed(0.5)
-                                                .range(1.0..=50.0),
-                                        )
-                                        .changed()
-                                    {
-                                        proc_cfg.ironing.flow_ratio =
-                                            (iron_flow_pct / 100.0).clamp(0.01, 0.5);
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Iron spacing (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.ironing.line_spacing_mm)
-                                            .speed(0.01)
-                                            .range(0.04..=1.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Iron inset (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.ironing.inset_mm)
-                                            .speed(0.02)
-                                            .range(0.0..=5.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Iron speed (mm/s)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.ironing.speed_mm_s)
-                                            .speed(1.0)
-                                            .range(5.0..=200.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Scarf seams");
-                                    ui.checkbox(&mut proc_cfg.scarf_seam.enabled, "");
-                                    ui.end_row();
-
-                                    ui.label("Scarf len (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.scarf_seam.length_mm)
-                                            .speed(0.5)
-                                            .range(1.0..=200.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label("Scarf steps");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.scarf_seam.steps)
-                                            .range(2..=64),
-                                    );
-                                    ui.end_row();
-
-                                    let mut start_pct =
-                                        proc_cfg.scarf_seam.start_height_ratio * 100.0;
-                                    ui.label("Scarf start (%)");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut start_pct)
-                                                .speed(1.0)
-                                                .range(2.0..=50.0),
-                                        )
-                                        .changed()
-                                    {
-                                        proc_cfg.scarf_seam.start_height_ratio =
-                                            (start_pct / 100.0).clamp(0.02, 0.50);
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Arc fitting (G2/G3)");
-                                    ui.checkbox(&mut proc_cfg.arc_fitting, "");
-                                    ui.end_row();
-
-                                    ui.label("Arc tol (mm)");
-                                    ui.add(
-                                        egui::DragValue::new(&mut proc_cfg.arc_tolerance_mm)
-                                            .speed(0.005)
-                                            .range(0.002..=0.5),
-                                    );
-                                    ui.end_row();
-                                });
-                        });
-
-                    enum ObjAction {
-                        Remove(u64),
-                        Transform {
-                            id: u64,
-                            pos: [f64; 2],
-                            rot: [f64; 3],
-                            scale: [f64; 3],
-                        },
-                    }
-                    let mut obj_action: Option<ObjAction> = None;
-                    egui::CollapsingHeader::new("Plate Objects")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            if self.session.objects.is_empty() {
-                                ui.weak("No objects on plate.");
-                            } else {
-                                let entries: Vec<(u64, String, layercraft_mesh::ObjectTransform)> =
-                                    self.session
-                                        .objects
-                                        .iter()
-                                        .map(|o| (o.id, o.name.clone(), o.transform))
-                                        .collect();
-                                for (id, name, _) in &entries {
-                                    let selected = self.selected_object_id == Some(*id);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .selectable_label(selected, format!("#{id} {name}"))
-                                            .clicked()
-                                        {
-                                            self.selected_object_id = Some(*id);
-                                        }
-                                        if ui.small_button("x").clicked() {
-                                            obj_action = Some(ObjAction::Remove(*id));
-                                        }
-                                    });
-                                }
-                                if let Some(sel_id) = self.selected_object_id
-                                    && let Some((_, _, xf)) =
-                                        entries.iter().find(|(id, _, _)| *id == sel_id)
-                                {
-                                    let mut pos = xf.position_xy_mm;
-                                    let mut rot = xf.rotation_deg;
-                                    let mut uni_scale = xf.scale[0];
-                                    let mut changed = false;
-                                    let bw = self.session.config.machine.bed_width_mm;
-                                    let bd = self.session.config.machine.bed_depth_mm;
-
-                                    egui::Grid::new("obj_xf_grid")
-                                        .num_columns(2)
-                                        .spacing([8.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.label("X (mm)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut pos[0])
-                                                        .speed(0.5)
-                                                        .range(1.0..=bw),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Y (mm)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut pos[1])
-                                                        .speed(0.5)
-                                                        .range(1.0..=bd),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Rot Z (deg)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut rot[2])
-                                                        .speed(1.0)
-                                                        .range(-180.0..=180.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Scale");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut uni_scale)
-                                                        .speed(0.02)
-                                                        .range(0.1..=5.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-                                        });
-
-                                    if changed && obj_action.is_none() {
-                                        obj_action = Some(ObjAction::Transform {
-                                            id: sel_id,
-                                            pos,
-                                            rot,
-                                            scale: [uni_scale, uni_scale, uni_scale],
-                                        });
-                                    }
-                                }
-                            }
-                        });
-
-                    match obj_action {
-                        Some(ObjAction::Remove(id)) => match execute(
-                            &mut self.session,
-                            "plate.remove_object",
-                            serde_json::json!({ "id": id }),
-                        ) {
-                            Ok(_) => {
-                                self.last_error = None;
-                                self.selected_object_id = self.session.objects.last().map(|o| o.id);
-                                self.view_mode = ViewMode::Prepare;
-                                self.rebuild_scene();
-                            }
-                            Err(e) => self.last_error = Some(e.to_string()),
-                        },
-                        Some(ObjAction::Transform {
-                            id,
-                            pos,
-                            rot,
-                            scale,
-                        }) => match execute(
-                            &mut self.session,
-                            "plate.transform_object",
-                            serde_json::json!({
-                                "id": id,
-                                "position_xy_mm": pos,
-                                "rotation_deg": rot,
-                                "scale": scale,
-                            }),
-                        ) {
-                            Ok(_) => {
-                                self.last_error = None;
-                                self.view_mode = ViewMode::Prepare;
-                                self.rebuild_scene();
-                            }
-                            Err(e) => self.last_error = Some(e.to_string()),
-                        },
-                        None => {}
-                    }
-
-                    enum ModAction {
-                        AddPrimitive(ModifierPrimitive),
-                        Remove(u64),
-                        Update {
-                            id: u64,
-                            role: ModifierRole,
-                            pos: [f64; 3],
-                            rot: [f64; 3],
-                            scale: [f64; 3],
-                            overrides: ModifierOverrides,
-                        },
-                    }
-                    let mut mod_action: Option<ModAction> = None;
-                    egui::CollapsingHeader::new("Modifier Volumes")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("+ Box").clicked() {
-                                    mod_action =
-                                        Some(ModAction::AddPrimitive(ModifierPrimitive::Box {
-                                            width_mm: 12.0,
-                                            depth_mm: 12.0,
-                                            height_mm: 10.0,
-                                        }));
-                                }
-                                if ui.small_button("+ Cylinder").clicked() {
-                                    mod_action = Some(ModAction::AddPrimitive(
-                                        ModifierPrimitive::Cylinder {
-                                            radius_mm: 6.0,
-                                            height_mm: 10.0,
-                                            segments: 32,
-                                        },
-                                    ));
-                                }
-                            });
-
-                            if self.session.modifiers.is_empty() {
-                                ui.weak("No modifier volumes on plate.");
-                            } else {
-                                let mods_snapshot: Vec<(
-                                    u64,
-                                    String,
-                                    ModifierRole,
-                                    ModifierTransform,
-                                    ModifierOverrides,
-                                )> = self
-                                    .session
-                                    .modifiers
-                                    .iter()
-                                    .map(|m| {
-                                        (
-                                            m.id,
-                                            m.name.clone(),
-                                            m.role,
-                                            m.transform,
-                                            m.overrides.clone(),
-                                        )
-                                    })
-                                    .collect();
-                                for (id, name, role, _, _) in &mods_snapshot {
-                                    let selected = self.selected_modifier_id == Some(*id);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .selectable_label(
-                                                selected,
-                                                format!("#{id} {name} ({})", role.label()),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.selected_modifier_id = Some(*id);
-                                        }
-                                        if ui.small_button("x").clicked() {
-                                            mod_action = Some(ModAction::Remove(*id));
-                                        }
-                                    });
-                                }
-
-                                if let Some(sel_id) = self.selected_modifier_id
-                                    && let Some((_, _, role_cur, xf, ov_cur)) =
-                                        mods_snapshot.iter().find(|(id, _, _, _, _)| *id == sel_id)
-                                {
-                                    let mut role = *role_cur;
-                                    let mut pos = xf.position_xyz_mm;
-                                    let mut rot = xf.rotation_deg;
-                                    let mut scale = xf.scale;
-                                    let mut ov = ov_cur.clone();
-                                    let mut changed = false;
-                                    let bw = self.session.config.machine.bed_width_mm;
-                                    let bd = self.session.config.machine.bed_depth_mm;
-                                    let bh = self.session.config.machine.bed_height_mm;
-
-                                    ui.separator();
-                                    egui::Grid::new("mod_xf_grid")
-                                        .num_columns(2)
-                                        .spacing([8.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.label("Role");
-                                            egui::ComboBox::from_id_salt("mod_role_combo")
-                                                .selected_text(role.label())
-                                                .show_ui(ui, |ui| {
-                                                    for r in ModifierRole::ALL {
-                                                        changed |= ui
-                                                            .selectable_value(
-                                                                &mut role,
-                                                                r,
-                                                                r.label(),
-                                                            )
-                                                            .changed();
-                                                    }
-                                                });
-                                            ui.end_row();
-
-                                            ui.label("X (mm)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut pos[0])
-                                                        .speed(0.5)
-                                                        .range(0.0..=bw),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Y (mm)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut pos[1])
-                                                        .speed(0.5)
-                                                        .range(0.0..=bd),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Z (mm)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut pos[2])
-                                                        .speed(0.5)
-                                                        .range(0.0..=bh),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Rot Z (deg)");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut rot[2])
-                                                        .speed(1.0)
-                                                        .range(-180.0..=180.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Scale X");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut scale[0])
-                                                        .speed(0.05)
-                                                        .range(0.1..=10.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Scale Y");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut scale[1])
-                                                        .speed(0.05)
-                                                        .range(0.1..=10.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            ui.label("Scale Z");
-                                            changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut scale[2])
-                                                        .speed(0.05)
-                                                        .range(0.1..=10.0),
-                                                )
-                                                .changed();
-                                            ui.end_row();
-
-                                            if role == ModifierRole::Modifier {
-                                                let mut has_dens =
-                                                    ov.sparse_infill_density.is_some();
-                                                if ui.checkbox(&mut has_dens, "Infill %").changed()
-                                                {
-                                                    ov.sparse_infill_density =
-                                                        if has_dens { Some(0.50) } else { None };
-                                                    changed = true;
-                                                }
-                                                if let Some(d) = &mut ov.sparse_infill_density {
-                                                    let mut pct = *d * 100.0;
-                                                    if ui
-                                                        .add(
-                                                            egui::DragValue::new(&mut pct)
-                                                                .speed(1.0)
-                                                                .range(0.0..=100.0),
-                                                        )
-                                                        .changed()
-                                                    {
-                                                        *d = (pct / 100.0).clamp(0.0, 1.0);
-                                                        changed = true;
-                                                    }
-                                                } else {
-                                                    ui.weak("(inherit)");
-                                                }
-                                                ui.end_row();
-
-                                                let mut has_pat =
-                                                    ov.sparse_infill_pattern.is_some();
-                                                if ui
-                                                    .checkbox(&mut has_pat, "Infill pattern")
-                                                    .changed()
-                                                {
-                                                    ov.sparse_infill_pattern = if has_pat {
-                                                        Some(InfillPattern::Gyroid)
-                                                    } else {
-                                                        None
-                                                    };
-                                                    changed = true;
-                                                }
-                                                if let Some(pat) = &mut ov.sparse_infill_pattern {
-                                                    egui::ComboBox::from_id_salt("mod_pat_combo")
-                                                        .selected_text(pat.label())
-                                                        .show_ui(ui, |ui| {
-                                                            for candidate in InfillPattern::ALL {
-                                                                changed |= ui
-                                                                    .selectable_value(
-                                                                        pat,
-                                                                        candidate,
-                                                                        candidate.label(),
-                                                                    )
-                                                                    .changed();
-                                                            }
-                                                        });
-                                                } else {
-                                                    ui.weak("(inherit)");
-                                                }
-                                                ui.end_row();
-
-                                                let mut has_walls = ov.wall_loops.is_some();
-                                                if ui
-                                                    .checkbox(&mut has_walls, "Wall loops")
-                                                    .changed()
-                                                {
-                                                    ov.wall_loops =
-                                                        if has_walls { Some(4) } else { None };
-                                                    changed = true;
-                                                }
-                                                if let Some(w) = &mut ov.wall_loops {
-                                                    changed |= ui
-                                                        .add(egui::DragValue::new(w).range(0..=20))
-                                                        .changed();
-                                                } else {
-                                                    ui.weak("(inherit)");
-                                                }
-                                                ui.end_row();
-
-                                                let mut has_iron = ov.ironing_mode.is_some();
-                                                if ui.checkbox(&mut has_iron, "Ironing").changed() {
-                                                    ov.ironing_mode = if has_iron {
-                                                        Some(IroningType::TopmostSurface)
-                                                    } else {
-                                                        None
-                                                    };
-                                                    changed = true;
-                                                }
-                                                if let Some(im) = &mut ov.ironing_mode {
-                                                    egui::ComboBox::from_id_salt("mod_iron_combo")
-                                                        .selected_text(im.label())
-                                                        .show_ui(ui, |ui| {
-                                                            for mode in IroningType::ALL {
-                                                                changed |= ui
-                                                                    .selectable_value(
-                                                                        im,
-                                                                        mode,
-                                                                        mode.label(),
-                                                                    )
-                                                                    .changed();
-                                                            }
-                                                        });
-                                                } else {
-                                                    ui.weak("(inherit)");
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-
-                                    if changed && mod_action.is_none() {
-                                        mod_action = Some(ModAction::Update {
-                                            id: sel_id,
-                                            role,
-                                            pos,
-                                            rot,
-                                            scale,
-                                            overrides: ov,
-                                        });
-                                    }
-                                }
-                            }
-                        });
-
-                    match mod_action {
-                        Some(ModAction::AddPrimitive(prim)) => match execute(
-                            &mut self.session,
-                            "plate.add_modifier_primitive",
-                            serde_json::json!({ "primitive": prim }),
-                        ) {
-                            Ok(_) => {
-                                self.last_error = None;
-                                self.selected_modifier_id =
-                                    self.session.modifiers.last().map(|m| m.id);
-                                self.view_mode = ViewMode::Prepare;
-                                self.rebuild_scene();
-                            }
-                            Err(e) => self.last_error = Some(e.to_string()),
-                        },
-                        Some(ModAction::Remove(id)) => match execute(
-                            &mut self.session,
-                            "plate.remove_modifier",
-                            serde_json::json!({ "id": id }),
-                        ) {
-                            Ok(_) => {
-                                self.last_error = None;
-                                self.selected_modifier_id =
-                                    self.session.modifiers.last().map(|m| m.id);
-                                self.view_mode = ViewMode::Prepare;
-                                self.rebuild_scene();
-                            }
-                            Err(e) => self.last_error = Some(e.to_string()),
-                        },
-                        Some(ModAction::Update {
-                            id,
-                            role,
-                            pos,
-                            rot,
-                            scale,
-                            overrides,
-                        }) => match execute(
-                            &mut self.session,
-                            "plate.update_modifier",
-                            serde_json::json!({
-                                "id": id,
-                                "role": role,
-                                "position_xyz_mm": pos,
-                                "rotation_deg": rot,
-                                "scale": scale,
-                                "overrides": overrides,
-                            }),
-                        ) {
-                            Ok(_) => {
-                                self.last_error = None;
-                                self.view_mode = ViewMode::Prepare;
-                                self.rebuild_scene();
-                            }
-                            Err(e) => self.last_error = Some(e.to_string()),
-                        },
-                        None => {}
-                    }
-
-                    if let Some(mesh) = &self.session.prepared_mesh {
-                        ui.separator();
-                        ui.heading("Mesh Summary");
-                        let insp = inspect_mesh(mesh);
-                        ui.label(format!("Triangles: {}", insp.triangle_count));
-                        ui.label(format!("Volume: {:.1} mm³", insp.volume_mm3));
-                        if let Some(bb) = insp.aabb {
-                            let s = bb.size();
-                            ui.label(format!("Size: {:.1} × {:.1} × {:.1} mm", s.x, s.y, s.z));
-                        }
-                        ui.label(format!("Non-manifold edges: {}", insp.non_manifold_edges));
-                    }
-
-                    if let Some(g) = &self.session.last_gcode {
-                        ui.separator();
-                        ui.heading("Print Estimates");
-                        ui.label(format!("Layers: {}", g.stats.layer_count));
-                        ui.label(format!("Height: {:.2} mm", g.stats.max_z_mm));
-                        ui.label(format!(
-                            "Filament: {:.1} mm ({:.2} cm³, {:.2} g)",
-                            g.stats.filament_length_mm,
-                            g.stats.filament_volume_mm3 / 1000.0,
-                            g.stats.filament_weight_g
-                        ));
-                        let mins = (g.stats.estimated_time_s / 60.0).floor() as u64;
-                        let secs = (g.stats.estimated_time_s % 60.0).round() as u64;
-                        ui.label(format!("Est. time: {mins}m {secs:02}s"));
-
-                        ui.add_space(4.0);
-                        for (feat, fs) in &g.stats.features {
-                            ui.label(format!("{feat}: {:.1} mm³", fs.volume_mm3));
-                        }
-                    }
-                });
-            });
-    }
-
-    fn right_panel(&mut self, ui: &mut egui::Ui) {
-        if self.view_mode != ViewMode::Preview {
-            return;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn open_file_dialog(&mut self, append: bool) {
+        let title = if append {
+            "Add 3D Model to Plate"
+        } else {
+            "Open 3D Model"
+        };
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("3D Models", &["stl", "STL", "3mf", "3MF"])
+            .pick_file()
+        {
+            let p = path.to_string_lossy().into_owned();
+            self.load_native_path_with_mode(&p, append);
         }
-        let Some(sliced) = &self.session.sliced else {
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_profile_file_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Import Profile JSON")
+            .add_filter("JSON Profiles", &["json", "JSON"])
+            .pick_file()
+        {
+            let p = path.to_string_lossy().into_owned();
+            self.load_native_profile_path(&p);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_profile_dir_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Import Profile Folder")
+            .pick_folder()
+        {
+            let p = path.to_string_lossy().into_owned();
+            self.load_native_profile_path(&p);
+        }
+    }
+
+    pub(crate) fn export_gcode_action(&mut self) {
+        let Some(g) = &self.session.last_gcode else {
             return;
         };
-        let total = sliced.layers.len();
-        if total == 0 {
-            return;
-        }
-        if self.max_layer >= total {
-            self.max_layer = total - 1;
-        }
-        let layer_info = sliced.layers.get(self.max_layer).map(|l| {
-            (
-                l.z_top_mm,
-                l.height_mm,
-                l.paths.len(),
-                l.fan_percent,
-                l.estimated_time_s,
-            )
-        });
 
-        egui::Panel::right("layercraft_preview_panel")
-            .default_size(195.0)
-            .show(ui, |ui| {
-                ui.heading("Layer Preview");
-                let mut layer_1based = self.max_layer + 1;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut layer_1based, 1..=total)
-                            .vertical()
-                            .text("Layer"),
-                    )
-                    .changed()
-                {
-                    self.max_layer = layer_1based.saturating_sub(1);
-                }
-
-                if let Some((z_top_mm, height_mm, path_count, fan_percent, est_time_s)) = layer_info
-                {
-                    ui.label(format!("Z = {z_top_mm:.2} mm"));
-                    ui.label(format!("Height = {height_mm:.3} mm"));
-                    ui.label(format!("Paths: {path_count}"));
-                    ui.label(format!("Fan: {fan_percent}%"));
-                    ui.label(format!("Est. layer time: {est_time_s:.1} s"));
-                }
-
-                ui.checkbox(&mut self.single_layer_only, "Single layer only");
-                ui.checkbox(&mut self.show_ghost_mesh, "Ghost mesh");
-
-                ui.separator();
-                ui.label("Color scheme");
-                let mut changed = false;
-                changed |= ui
-                    .radio_value(&mut self.color_mode, ColorMode::Feature, "Feature type")
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut self.color_mode, ColorMode::Speed, "Speed")
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut self.color_mode, ColorMode::LayerHeight, "Layer height")
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut self.color_mode, ColorMode::Layer, "Layer Z")
-                    .changed();
-                if changed {
-                    self.rebuild_scene();
-                }
-
-                if self.color_mode == ColorMode::Feature {
-                    ui.separator();
-                    ui.label("Legend");
-                    for role in [
-                        ExtrusionRole::OuterWall,
-                        ExtrusionRole::InnerWall,
-                        ExtrusionRole::OverhangWall,
-                        ExtrusionRole::TopSurface,
-                        ExtrusionRole::Ironing,
-                        ExtrusionRole::BottomSurface,
-                        ExtrusionRole::InternalSolidInfill,
-                        ExtrusionRole::Bridge,
-                        ExtrusionRole::SparseInfill,
-                        ExtrusionRole::Support,
-                        ExtrusionRole::SupportInterface,
-                        ExtrusionRole::Skirt,
-                        ExtrusionRole::Brim,
-                    ] {
-                        let c = role_color(role);
-                        let col = egui::Color32::from_rgb(
-                            (c[0] * 255.0) as u8,
-                            (c[1] * 255.0) as u8,
-                            (c[2] * 255.0) as u8,
-                        );
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, col);
-                            ui.label(role.label());
-                        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Export G-code")
+                .set_file_name("layercraft_out.gcode")
+                .add_filter("G-code", &["gcode", "gco", "g"])
+                .save_file()
+            {
+                match std::fs::write(&path, &g.gcode) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.status_message = format!("Exported `{}`.", path.display());
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Export failed: {e}"));
                     }
                 }
-            });
-    }
+            }
+        }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("layercraft_status_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(err) = &self.last_error {
-                    ui.colored_label(egui::Color32::from_rgb(245, 105, 95), err);
-                } else {
-                    ui.label(&self.status_message);
+        #[cfg(target_arch = "wasm32")]
+        {
+            match trigger_browser_download("layercraft_out.gcode", &g.gcode) {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.status_message =
+                        "Triggered browser download `layercraft_out.gcode`.".to_owned();
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("Drag: orbit | Shift+Drag / Middle: pan | Wheel: zoom");
-                });
-            });
-        });
+                Err(e) => {
+                    self.last_error = Some(format!("Download failed: {e}"));
+                }
+            }
+        }
     }
 
-    fn viewport_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default()
+    fn draw_status_bar(&self, ui: &mut egui::Ui, p: &ThemePalette) {
+        let resp = egui::Panel::bottom("layercraft_status_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.bg_chrome)
+                    .inner_margin(Margin::symmetric(12, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(18.0);
+                    let dot_col = if self.last_error.is_some() {
+                        p.danger
+                    } else {
+                        p.success
+                    };
+                    let (dot_r, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 14.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
+
+                    if let Some(err) = &self.last_error {
+                        ui.label(RichText::new(err).size(11.5).color(p.danger));
+                    } else {
+                        ui.label(
+                            RichText::new(&self.status_message)
+                                .size(11.5)
+                                .color(p.text_secondary),
+                        );
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Bed {:.0}×{:.0}×{:.0} mm  ·  Drag: orbit · Shift+Drag: pan · Wheel: zoom · F: fit",
+                                self.session.config.machine.bed_width_mm,
+                                self.session.config.machine.bed_depth_mm,
+                                self.session.config.machine.bed_height_mm,
+                            ))
+                            .size(11.0)
+                            .color(p.text_muted),
+                        );
+                    });
+                });
+            })
+            .response;
+
+        let r = resp.rect;
+        ui.painter().line_segment(
+            [pos2(r.left(), r.top()), pos2(r.right(), r.top())],
+            Stroke::new(1.0, p.border_subtle),
+        );
+    }
+
+    fn viewport_panel(&mut self, ui: &mut egui::Ui, p: &ThemePalette) {
+        let rect = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
@@ -2422,18 +811,34 @@ impl LayerCraftApp {
                     },
                 );
                 ui.painter().add(cb);
-            });
+                rect
+            })
+            .inner;
+
+        viewport_hud::draw_viewport_hud(self, ui.ctx(), rect, p);
     }
 }
 
 impl eframe::App for LayerCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.styles_installed {
+            theme::install_styles(ui.ctx());
+            self.styles_installed = true;
+        }
+        ui.ctx().set_theme(self.theme_mode.to_preference());
+        let palette = theme::active_palette(ui.ctx());
+
         self.handle_dropped_files(ui.ctx());
-        self.top_bar(ui);
-        self.status_bar(ui);
-        self.left_panel(ui);
-        self.right_panel(ui);
-        self.viewport_panel(ui);
+
+        if !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::F)) {
+            self.frame_camera(CameraPreset::Isometric);
+        }
+
+        toolbar::draw_header_bar(self, ui, &palette);
+        toolbar::draw_ribbon_bar(self, ui, &palette);
+        self.draw_status_bar(ui, &palette);
+        sidebar::draw_sidebar(self, ui, &palette);
+        self.viewport_panel(ui, &palette);
     }
 }
 
@@ -2471,4 +876,39 @@ fn trigger_browser_download(filename: &str, contents: &str) -> Result<(), String
     let _ = body.remove_child(&anchor);
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_palettes_and_styles_build_cleanly() {
+        let dark = ThemePalette::dark_studio();
+        let light = ThemePalette::light_drafting();
+        assert!(dark.dark);
+        assert!(!light.dark);
+        assert_eq!(dark.accent, egui::Color32::from_rgb(20, 184, 166));
+        assert_eq!(light.accent, egui::Color32::from_rgb(13, 148, 136));
+
+        let dark_style = theme::build_egui_style(&dark, true);
+        let light_style = theme::build_egui_style(&light, false);
+        assert!(dark_style.visuals.dark_mode);
+        assert!(!light_style.visuals.dark_mode);
+        assert_eq!(ThemeMode::Dark.cycle().cycle().cycle(), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn app_loads_slices_and_switches_modes_cleanly() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        assert_eq!(app.view_mode, ViewMode::Prepare);
+        assert_eq!(app.session.objects.len(), 1);
+        assert!(app.last_error.is_none());
+
+        app.run_slice();
+        assert_eq!(app.view_mode, ViewMode::Preview);
+        assert!(app.session.sliced.is_some());
+        assert!(app.session.last_gcode.is_some());
+        assert!(app.last_error.is_none());
+    }
 }

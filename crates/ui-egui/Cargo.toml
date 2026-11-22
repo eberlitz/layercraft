@@ -23,6 +23,9 @@ layercraft-viewport-gpu.workspace = true
 serde_json.workspace = true
 web-time.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys.workspace = true
 wasm-bindgen.workspace = true
