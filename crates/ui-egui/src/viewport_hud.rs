@@ -197,7 +197,7 @@ fn draw_preview_summary_hud(
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
             hud_frame(p).show(ui, |ui| {
-                ui.set_max_width(232.0);
+                ui.set_max_width(248.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("PRINT ESTIMATE")
@@ -334,13 +334,49 @@ fn metric_cell(ui: &mut Ui, p: &ThemePalette, label: &str, value: &str) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(RichText::new(label).size(10.0).color(p.text_muted));
-        ui.label(
-            RichText::new(value)
-                .size(12.0)
-                .strong()
-                .color(p.text_primary),
+        ui.add(
+            egui::Label::new(
+                RichText::new(value)
+                    .size(12.0)
+                    .strong()
+                    .color(p.text_primary),
+            )
+            .extend(),
         );
     });
+}
+
+fn scrubber_step_button(
+    ui: &mut Ui,
+    p: &ThemePalette,
+    label: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 20.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.is_pointer_button_down_on() {
+            p.bg_active
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            p.bg_card
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(4),
+            fill,
+            Stroke::new(1.0, p.border_subtle),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            p.text_primary,
+        );
+    }
+    resp.on_hover_text(tooltip)
 }
 
 fn draw_vertical_layer_scrubber(
@@ -377,7 +413,7 @@ fn draw_vertical_layer_scrubber(
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        if ui.small_button("+").on_hover_text("Next layer").clicked()
+                        if scrubber_step_button(ui, p, "+", "Next layer").clicked()
                             && app.max_layer + 1 < total
                         {
                             app.max_layer += 1;
@@ -428,10 +464,7 @@ fn draw_vertical_layer_scrubber(
                         ui.painter()
                             .circle(knob, 7.0, p.text_primary, Stroke::new(2.0, p.accent));
 
-                        if ui
-                            .small_button("–")
-                            .on_hover_text("Previous layer")
-                            .clicked()
+                        if scrubber_step_button(ui, p, "–", "Previous layer").clicked()
                             && app.max_layer > 0
                         {
                             app.max_layer -= 1;

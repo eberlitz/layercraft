@@ -8,7 +8,8 @@ use layercraft_viewport::ColorMode;
 use crate::icons::{Icon, paint_icon};
 use crate::theme::{ThemeMode, ThemePalette};
 use crate::ui_kit::{
-    badge, icon_button, primary_button, ribbon_button, secondary_button, v_divider,
+    badge, icon_button, primary_button, ribbon_button, ribbon_dropdown_button, secondary_button,
+    v_divider,
 };
 use crate::{LayerCraftApp, ViewMode};
 
@@ -253,7 +254,7 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
         }
     }
 
-    let sample_resp = ribbon_button(ui, p, Icon::SampleCube, "Samples ▾", false)
+    let sample_resp = ribbon_dropdown_button(ui, p, Icon::SampleCube, "Samples")
         .on_hover_text("Load or add built-in calibration meshes");
     Popup::menu(&sample_resp).show(|ui| {
         ui.set_min_width(185.0);

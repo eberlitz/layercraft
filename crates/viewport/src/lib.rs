@@ -2,17 +2,26 @@
 
 mod render;
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use glam::{Mat4, Vec3, Vec4};
 use layercraft_config::PrintConfig;
-use layercraft_geom::{Aabb3, TriangleMesh};
+use layercraft_geom::{Aabb3, Point3, TriangleMesh};
 use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use render::{RenderMode, RenderRequest, render_png};
+
+/// Viewport lighting & bed-plate palette theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportTheme {
+    #[default]
+    Dark,
+    Light,
+}
 
 /// Errors returned by viewport geometry builders or software PNG rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -126,6 +135,11 @@ impl OrbitCamera {
         let cy = self.yaw_rad.cos();
         let sy = self.yaw_rad.sin();
         t + Vec3::new(cp * cy, cp * sy, sp) * self.distance
+    }
+
+    /// World-space eye position as `[f32; 3]`.
+    pub fn eye_pos_array(&self) -> [f32; 3] {
+        self.eye_pos().to_array()
     }
 
     /// Right-handed Z-up view matrix.
@@ -284,26 +298,43 @@ fn path_color_with_height_range(
     }
 }
 
-/// Build 10 mm grid lines, build-plate border, and origin XYZ axis lines.
+/// Build 10 mm grid lines, build-plate border, and origin XYZ axis lines using the Dark theme.
 pub fn build_bed_grid(config: &PrintConfig) -> Vec<LineVertex> {
+    build_bed_grid_themed(config, ViewportTheme::Dark)
+}
+
+/// Build theme-matched 10 mm grid lines, build-plate border, front accent, and origin XYZ triad.
+pub fn build_bed_grid_themed(config: &PrintConfig, theme: ViewportTheme) -> Vec<LineVertex> {
     let w = config.machine.bed_width_mm as f32;
     let d = config.machine.bed_depth_mm as f32;
     let mut lines = Vec::new();
+    let z = 0.04_f32;
 
-    let minor = [0.22, 0.24, 0.29, 1.0];
-    let major = [0.34, 0.37, 0.44, 1.0];
-    let border = [0.58, 0.63, 0.74, 1.0];
+    let (minor, major, border, front_col) = match theme {
+        ViewportTheme::Dark => (
+            [0.22, 0.25, 0.31, 0.70],
+            [0.34, 0.40, 0.49, 0.92],
+            [0.46, 0.54, 0.66, 1.0],
+            [0.08, 0.72, 0.65, 1.0],
+        ),
+        ViewportTheme::Light => (
+            [0.73, 0.77, 0.83, 0.80],
+            [0.55, 0.61, 0.69, 0.95],
+            [0.38, 0.44, 0.53, 1.0],
+            [0.05, 0.58, 0.53, 1.0],
+        ),
+    };
 
     let steps_x = (w / 10.0).floor() as i32;
     for ix in 1..steps_x {
         let x = (ix as f32) * 10.0;
         let col = if ix % 5 == 0 { major } else { minor };
         lines.push(LineVertex {
-            pos: [x, 0.0, 0.0],
+            pos: [x, 0.0, z],
             color: col,
         });
         lines.push(LineVertex {
-            pos: [x, d, 0.0],
+            pos: [x, d, z],
             color: col,
         });
     }
@@ -313,71 +344,181 @@ pub fn build_bed_grid(config: &PrintConfig) -> Vec<LineVertex> {
         let y = (iy as f32) * 10.0;
         let col = if iy % 5 == 0 { major } else { minor };
         lines.push(LineVertex {
-            pos: [0.0, y, 0.0],
+            pos: [0.0, y, z],
             color: col,
         });
         lines.push(LineVertex {
-            pos: [w, y, 0.0],
+            pos: [w, y, z],
             color: col,
         });
     }
 
-    for (a, b) in [
-        ([0.0, 0.0, 0.0], [w, 0.0, 0.0]),
-        ([w, 0.0, 0.0], [w, d, 0.0]),
-        ([w, d, 0.0], [0.0, d, 0.0]),
-        ([0.0, d, 0.0], [0.0, 0.0, 0.0]),
+    for (a, b, col) in [
+        ([0.0, 0.0, z], [w, 0.0, z], front_col),
+        ([w, 0.0, z], [w, d, z], border),
+        ([w, d, z], [0.0, d, z], border),
+        ([0.0, d, z], [0.0, 0.0, z], border),
+    ] {
+        lines.push(LineVertex { pos: a, color: col });
+        lines.push(LineVertex { pos: b, color: col });
+    }
+
+    // Origin triad (X=red, Y=green, Z=blue) raised slightly above grid lines to prevent Z fighting.
+    let ax = 26.0_f32;
+    let z_ax = 0.08_f32;
+    for (end, col) in [
+        ([ax, 0.0, z_ax], [0.95, 0.25, 0.25, 1.0]),
+        ([0.0, ax, z_ax], [0.25, 0.90, 0.35, 1.0]),
+        ([0.0, 0.0, ax], [0.28, 0.55, 0.98, 1.0]),
     ] {
         lines.push(LineVertex {
-            pos: a,
-            color: border,
+            pos: [0.0, 0.0, z_ax],
+            color: col,
         });
         lines.push(LineVertex {
-            pos: b,
-            color: border,
+            pos: end,
+            color: col,
         });
     }
-
-    // Origin triad (X=red, Y=green, Z=blue) slightly raised to prevent Z fighting.
-    let ax = 22.0_f32;
-    lines.push(LineVertex {
-        pos: [0.0, 0.0, 0.05],
-        color: [0.95, 0.25, 0.25, 1.0],
-    });
-    lines.push(LineVertex {
-        pos: [ax, 0.0, 0.05],
-        color: [0.95, 0.25, 0.25, 1.0],
-    });
-    lines.push(LineVertex {
-        pos: [0.0, 0.0, 0.05],
-        color: [0.25, 0.90, 0.35, 1.0],
-    });
-    lines.push(LineVertex {
-        pos: [0.0, ax, 0.05],
-        color: [0.25, 0.90, 0.35, 1.0],
-    });
-    lines.push(LineVertex {
-        pos: [0.0, 0.0, 0.05],
-        color: [0.28, 0.55, 0.98, 1.0],
-    });
-    lines.push(LineVertex {
-        pos: [0.0, 0.0, ax],
-        color: [0.28, 0.55, 0.98, 1.0],
-    });
 
     lines
 }
 
-/// Convert a prepared `TriangleMesh` into lit triangles for 3D rendering.
+/// Build a 3.2 mm thick matte build-plate slab with a teal front-edge indicator.
+pub fn build_bed_plate_mesh(config: &PrintConfig, theme: ViewportTheme) -> Vec<SceneVertex> {
+    let w = config.machine.bed_width_mm as f32;
+    let d = config.machine.bed_depth_mm as f32;
+    let z_top = -0.02_f32;
+    let z_bot = -3.2_f32;
+
+    let (top_col, bevel_col, front_accent) = match theme {
+        ViewportTheme::Dark => (
+            [0.145, 0.165, 0.200, 1.0],
+            [0.10, 0.115, 0.14, 1.0],
+            [0.08, 0.72, 0.65, 1.0],
+        ),
+        ViewportTheme::Light => (
+            [0.875, 0.895, 0.925, 1.0],
+            [0.75, 0.78, 0.83, 1.0],
+            [0.05, 0.58, 0.53, 1.0],
+        ),
+    };
+
+    let mut verts = Vec::with_capacity(42);
+    // Top face
+    push_quad(
+        &mut verts,
+        [0.0, 0.0, z_top],
+        [w, 0.0, z_top],
+        [w, d, z_top],
+        [0.0, d, z_top],
+        [0.0, 0.0, 1.0],
+        top_col,
+    );
+    // Bottom face
+    push_quad(
+        &mut verts,
+        [0.0, d, z_bot],
+        [w, d, z_bot],
+        [w, 0.0, z_bot],
+        [0.0, 0.0, z_bot],
+        [0.0, 0.0, -1.0],
+        bevel_col,
+    );
+    // 4 vertical perimeter bevel walls
+    push_quad(
+        &mut verts,
+        [0.0, 0.0, z_bot],
+        [w, 0.0, z_bot],
+        [w, 0.0, z_top],
+        [0.0, 0.0, z_top],
+        [0.0, -1.0, 0.0],
+        bevel_col,
+    );
+    push_quad(
+        &mut verts,
+        [w, d, z_bot],
+        [0.0, d, z_bot],
+        [0.0, d, z_top],
+        [w, d, z_top],
+        [0.0, 1.0, 0.0],
+        bevel_col,
+    );
+    push_quad(
+        &mut verts,
+        [0.0, d, z_bot],
+        [0.0, 0.0, z_bot],
+        [0.0, 0.0, z_top],
+        [0.0, d, z_top],
+        [-1.0, 0.0, 0.0],
+        bevel_col,
+    );
+    push_quad(
+        &mut verts,
+        [w, 0.0, z_bot],
+        [w, d, z_bot],
+        [w, d, z_top],
+        [w, 0.0, z_top],
+        [1.0, 0.0, 0.0],
+        bevel_col,
+    );
+    // Front-edge accent bar
+    push_quad(
+        &mut verts,
+        [w * 0.20, -0.05, -2.0],
+        [w * 0.80, -0.05, -2.0],
+        [w * 0.80, -0.05, -0.35],
+        [w * 0.20, -0.05, -0.35],
+        [0.0, -1.0, 0.0],
+        front_accent,
+    );
+
+    verts
+}
+
+fn quantize_pos(p: Point3) -> [i64; 3] {
+    [
+        (p.x * 10_000.0).round() as i64,
+        (p.y * 10_000.0).round() as i64,
+        (p.z * 10_000.0).round() as i64,
+    ]
+}
+
+/// Convert a prepared `TriangleMesh` into lit triangles with crease-angle (`38°`) smooth vertex normals.
 pub fn build_mesh_vertices(mesh: &TriangleMesh, color: [f32; 4]) -> Vec<SceneVertex> {
-    let mut verts = Vec::with_capacity(mesh.triangles.len() * 3);
+    const CREASE_COS_THRESHOLD: f32 = 0.788; // ~cos(38 deg)
+
+    let mut incident: HashMap<[i64; 3], Vec<Vec3>> = HashMap::new();
+    let mut face_normals = Vec::with_capacity(mesh.triangles.len());
+
     for tri in &mesh.triangles {
-        let n = tri.double_area_vec().normalize_or_zero();
-        let normal = [n.x as f32, n.y as f32, n.z as f32];
+        let n_d = tri.double_area_vec().normalize_or_zero();
+        let fn_vec = Vec3::new(n_d.x as f32, n_d.y as f32, n_d.z as f32).normalize_or_zero();
+        face_normals.push(fn_vec);
         for p in [tri.a, tri.b, tri.c] {
+            incident.entry(quantize_pos(p)).or_default().push(fn_vec);
+        }
+    }
+
+    let mut verts = Vec::with_capacity(mesh.triangles.len() * 3);
+    for (tri, face_n) in mesh.triangles.iter().zip(face_normals.iter().copied()) {
+        for p in [tri.a, tri.b, tri.c] {
+            let mut sum = Vec3::ZERO;
+            if let Some(list) = incident.get(&quantize_pos(p)) {
+                for &cand in list {
+                    if cand.dot(face_n) >= CREASE_COS_THRESHOLD {
+                        sum += cand;
+                    }
+                }
+            }
+            let smooth = if sum.length_squared() > 1e-8 {
+                sum.normalize()
+            } else {
+                face_n
+            };
             verts.push(SceneVertex {
                 pos: [p.x as f32, p.y as f32, p.z as f32],
-                normal,
+                normal: smooth.to_array(),
                 color,
             });
         }
@@ -518,6 +659,19 @@ fn push_tri(
     });
 }
 
+fn push_quad(
+    out: &mut Vec<SceneVertex>,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    d: [f32; 3],
+    normal: [f32; 3],
+    color: [f32; 4],
+) {
+    push_tri(out, a, b, c, normal, color);
+    push_tri(out, a, c, d, normal, color);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +736,29 @@ mod tests {
             .unwrap();
             assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
             assert!(png.len() > 1200, "unexpectedly tiny png for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn bed_plate_and_themed_grid_build_for_dark_and_light() {
+        let cfg = PrintConfig::default();
+        for theme in [ViewportTheme::Dark, ViewportTheme::Light] {
+            let plate = build_bed_plate_mesh(&cfg, theme);
+            let grid = build_bed_grid_themed(&cfg, theme);
+            assert_eq!(plate.len(), 42);
+            assert!(grid.len() > 40);
+        }
+        let cube = sample_cube();
+        let verts = build_mesh_vertices(&cube, [0.5, 0.6, 0.7, 1.0]);
+        assert_eq!(verts.len(), 36);
+        // 90-degree cube corners stay sharp (unit axis-aligned normals).
+        for v in &verts {
+            let max_comp = v.normal.iter().map(|c| c.abs()).fold(0.0_f32, f32::max);
+            assert!(
+                (max_comp - 1.0).abs() < 1e-4,
+                "unexpected bevel {:?}",
+                v.normal
+            );
         }
     }
 }

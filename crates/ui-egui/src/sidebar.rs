@@ -367,6 +367,7 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     {
                         app.selected_object_id = Some(*id);
                         app.selected_modifier_id = None;
+                        app.rebuild_scene();
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if small_icon_button(ui, p, Icon::Trash, "Remove object").clicked() {
@@ -434,6 +435,7 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     {
                         app.selected_modifier_id = Some(*id);
                         app.selected_object_id = None;
+                        app.rebuild_scene();
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if small_icon_button(ui, p, Icon::Trash, "Remove modifier").clicked() {

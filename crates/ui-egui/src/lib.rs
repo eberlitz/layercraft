@@ -16,7 +16,8 @@ use layercraft_config::{
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
-    CameraPreset, ColorMode, OrbitCamera, build_bed_grid, build_mesh_vertices, build_toolpath_mesh,
+    CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
+    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh,
 };
 use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
@@ -60,6 +61,7 @@ pub struct LayerCraftApp {
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) ribbon_collapsed: bool,
     pub(crate) show_legend_hud: bool,
+    pub(crate) last_scene_dark: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
     #[cfg(target_arch = "wasm32")]
@@ -103,6 +105,7 @@ impl LayerCraftApp {
             sidebar_tab: SidebarTab::Plate,
             ribbon_collapsed: false,
             show_legend_hud: true,
+            last_scene_dark: true,
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(target_arch = "wasm32")]
@@ -486,30 +489,72 @@ impl LayerCraftApp {
 
     pub(crate) fn rebuild_scene(&mut self) {
         self.scene_revision = self.scene_revision.wrapping_add(1);
-        let bed = if self.show_bed_grid {
-            build_bed_grid(&self.session.config)
+        let vp_theme = if self.last_scene_dark {
+            ViewportTheme::Dark
+        } else {
+            ViewportTheme::Light
+        };
+        let bed_plate = if self.show_bed_grid {
+            build_bed_plate_mesh(&self.session.config, vp_theme)
         } else {
             Vec::new()
         };
-        let mut mesh = self
-            .session
-            .prepared_mesh
-            .as_ref()
-            .map(|m| build_mesh_vertices(m, [0.34, 0.65, 0.94, 1.0]))
-            .unwrap_or_default();
-        for m in &self.session.modifiers {
-            let col = match m.role {
-                ModifierRole::Modifier => [0.95, 0.72, 0.18, 0.35],
-                ModifierRole::SupportBlocker => [0.92, 0.26, 0.26, 0.35],
-                ModifierRole::SupportEnforcer => [0.20, 0.85, 0.45, 0.35],
-            };
-            mesh.extend(build_mesh_vertices(&m.prepared_mesh, col));
+        let bed = if self.show_bed_grid {
+            build_bed_grid_themed(&self.session.config, vp_theme)
+        } else {
+            Vec::new()
+        };
+
+        let (selected_col, unselected_col, ghost_col) = if self.last_scene_dark {
+            (
+                [0.18_f32, 0.72, 0.68, 1.0],
+                [0.46_f32, 0.57, 0.70, 1.0],
+                [0.65_f32, 0.74, 0.84, 0.22],
+            )
+        } else {
+            (
+                [0.10_f32, 0.58, 0.55, 1.0],
+                [0.38_f32, 0.49, 0.62, 1.0],
+                [0.25_f32, 0.34, 0.44, 0.18],
+            )
+        };
+
+        let mut mesh = Vec::new();
+        if self.session.objects.is_empty() {
+            if let Some(m) = &self.session.prepared_mesh {
+                mesh.extend(build_mesh_vertices(m, selected_col));
+            }
+        } else {
+            for obj in &self.session.objects {
+                let col = if self.selected_object_id == Some(obj.id) {
+                    selected_col
+                } else {
+                    unselected_col
+                };
+                mesh.extend(build_mesh_vertices(&obj.prepared_mesh, col));
+            }
         }
+
+        let mut modifiers = Vec::new();
+        for m in &self.session.modifiers {
+            let alpha = if self.selected_modifier_id == Some(m.id) {
+                0.44_f32
+            } else {
+                0.28_f32
+            };
+            let col = match m.role {
+                ModifierRole::Modifier => [0.95, 0.72, 0.18, alpha],
+                ModifierRole::SupportBlocker => [0.92, 0.26, 0.26, alpha],
+                ModifierRole::SupportEnforcer => [0.20, 0.85, 0.45, alpha],
+            };
+            modifiers.extend(build_mesh_vertices(&m.prepared_mesh, col));
+        }
+
         let ghost = self
             .session
             .prepared_mesh
             .as_ref()
-            .map(|m| build_mesh_vertices(m, [0.65, 0.72, 0.82, 0.24]))
+            .map(|m| build_mesh_vertices(m, ghost_col))
             .unwrap_or_default();
 
         let tp = self
@@ -521,11 +566,12 @@ impl LayerCraftApp {
 
         self.scene = Arc::new(GpuSceneSnapshot::from_geometry(
             self.scene_revision,
+            &bed_plate,
             &bed,
             &mesh,
+            &modifiers,
             &ghost,
-            &tp.vertices,
-            tp.layer_ranges,
+            &tp,
         ));
     }
 
@@ -810,6 +856,8 @@ impl LayerCraftApp {
                     ViewportCallback {
                         scene: Arc::clone(&self.scene),
                         view_proj: self.camera.view_proj(self.viewport_aspect),
+                        eye_pos: self.camera.eye_pos_array(),
+                        dark_mode: p.dark,
                         viewport_size_px,
                         draw_mesh,
                         draw_ghost,
@@ -832,6 +880,10 @@ impl LayerCraftApp {
         }
         ui.ctx().set_theme(self.theme_mode.to_preference());
         let palette = theme::active_palette(ui.ctx());
+        if palette.dark != self.last_scene_dark {
+            self.last_scene_dark = palette.dark;
+            self.rebuild_scene();
+        }
 
         self.handle_dropped_files(ui.ctx());
 

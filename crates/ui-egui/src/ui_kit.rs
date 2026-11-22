@@ -198,6 +198,59 @@ pub fn ribbon_button(
     resp
 }
 
+/// Ribbon button with leading icon, text label, and painted vector dropdown chevron.
+pub fn ribbon_dropdown_button(ui: &mut Ui, p: &ThemePalette, icon: Icon, label: &str) -> Response {
+    let font_id = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font_id, p.text_primary);
+    let icon_sz = 14.0;
+    let chev_sz = 10.0;
+    let gap = 5.0;
+    let pad_x = 8.0;
+    let width = pad_x * 2.0 + icon_sz + gap + galley.size().x + gap * 0.8 + chev_sz;
+    let height = 25.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.is_pointer_button_down_on() {
+            p.bg_active
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        let stroke = if resp.hovered() {
+            Stroke::new(1.0, p.border_subtle)
+        } else {
+            Stroke::NONE
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(5),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        let icon_rect = Rect::from_center_size(
+            pos2(rect.left() + pad_x + icon_sz * 0.5, rect.center().y),
+            vec2(icon_sz, icon_sz),
+        );
+        paint_icon(ui.painter(), icon_rect, icon, p.text_secondary);
+        let text_pos = pos2(
+            icon_rect.right() + gap,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        ui.painter().galley(text_pos, galley, p.text_primary);
+        let chev_rect = Rect::from_center_size(
+            pos2(rect.right() - pad_x - chev_sz * 0.5, rect.center().y),
+            vec2(chev_sz, chev_sz),
+        );
+        paint_icon(ui.painter(), chev_rect, Icon::ChevronDown, p.text_muted);
+    }
+    resp
+}
+
 /// Compact 26×26 icon-only button with hover tooltip.
 pub fn icon_button(
     ui: &mut Ui,
