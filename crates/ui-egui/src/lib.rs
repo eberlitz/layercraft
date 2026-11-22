@@ -22,7 +22,8 @@ use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
 
 use crate::sidebar::SidebarTab;
-use crate::theme::{ThemeMode, ThemePalette};
+use crate::theme::ThemePalette;
+pub use theme::ThemeMode;
 
 /// Active workspace view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,11 @@ impl LayerCraftApp {
             app.rebuild_scene();
         }
         app
+    }
+
+    /// Set the active color theme mode (`Dark`, `Light`, or `System`).
+    pub fn set_theme_mode(&mut self, mode: ThemeMode) {
+        self.theme_mode = mode;
     }
 
     /// Load a mesh from raw STL or 3MF bytes via `layercraft-engine` commands.
@@ -817,10 +823,9 @@ impl LayerCraftApp {
 
         viewport_hud::draw_viewport_hud(self, ui.ctx(), rect, p);
     }
-}
 
-impl eframe::App for LayerCraftApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Run one frame of the LayerCraft UI inside `ui` (shared between live `eframe` and headless captures).
+    pub fn render_ui(&mut self, ui: &mut egui::Ui) {
         if !self.styles_installed {
             theme::install_styles(ui.ctx());
             self.styles_installed = true;
@@ -839,6 +844,12 @@ impl eframe::App for LayerCraftApp {
         self.draw_status_bar(ui, &palette);
         sidebar::draw_sidebar(self, ui, &palette);
         self.viewport_panel(ui, &palette);
+    }
+}
+
+impl eframe::App for LayerCraftApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render_ui(ui);
     }
 }
 

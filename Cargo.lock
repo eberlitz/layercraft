@@ -1337,9 +1337,13 @@ dependencies = [
  "clap",
  "eframe",
  "egui",
+ "egui-wgpu",
  "layercraft-mesh",
  "layercraft-ui-egui",
  "layercraft-viewport-gpu",
+ "png",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

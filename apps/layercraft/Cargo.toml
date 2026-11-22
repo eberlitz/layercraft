@@ -12,6 +12,10 @@ workspace = true
 clap.workspace = true
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui.workspace = true
+egui-wgpu.workspace = true
 layercraft-mesh.workspace = true
 layercraft-ui-egui.workspace = true
 layercraft-viewport-gpu.workspace = true
+png.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
