@@ -1,0 +1,14 @@
+{
+  "layer_count": 31,
+  "max_z_mm": 3.12,
+  "require_outer_wall": true,
+  "require_support": true,
+  "require_support_interface": true,
+  "require_accel_commands": true,
+  "require_pressure_advance": true,
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "M900 K0.0600",
+    "M204 P"
+  ]
+}

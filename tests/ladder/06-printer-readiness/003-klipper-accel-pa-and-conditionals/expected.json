@@ -1,0 +1,18 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_accel_commands": true,
+  "require_pressure_advance": true,
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "SET_PRESSURE_ADVANCE ADVANCE=0.0350",
+    "SET_VELOCITY_LIMIT ACCEL=",
+    "M117 PLA_OK",
+    ";SPAN="
+  ],
+  "forbid_gcode_contains": [
+    "M117 PETG",
+    "M117 OTHER"
+  ]
+}

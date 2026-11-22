@@ -1,0 +1,16 @@
+{
+  "name": "002-core-one-hf-02mm-abs-chamber",
+  "description": "Prusa CORE One+ 0.2mm HF nozzle with ABS chamber heating (M141 S50) and 0.08mm Ultra-Fine profile",
+  "shape": {
+    "kind": "box",
+    "width_mm": 10.0,
+    "depth_mm": 10.0,
+    "height_mm": 1.70
+  },
+  "profile_bundle": {
+    "use_builtins": true,
+    "machine": "LayerCraft CORE One+ HF 0.2mm",
+    "filament": "LayerCraft Generic ABS",
+    "process": "LayerCraft 0.08mm Ultra-Fine (0.2mm Nozzle)"
+  }
+}

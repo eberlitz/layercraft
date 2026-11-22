@@ -78,6 +78,10 @@ struct LadderExpected {
     #[serde(default)]
     require_wipes: bool,
     #[serde(default)]
+    require_accel_commands: bool,
+    #[serde(default)]
+    require_pressure_advance: bool,
+    #[serde(default)]
     require_bridge: bool,
     #[serde(default)]
     require_overhang_wall: bool,
@@ -333,6 +337,15 @@ pub fn run(root: &Path) -> Result<(), String> {
             }
             if exp.require_wipes && rep.wipe_moves_count == 0 {
                 errs.push("missing wipe-on-retract moves".to_owned());
+            }
+            if exp.require_accel_commands && rep.accel_commands_count == 0 {
+                errs.push("missing acceleration commands (M204 / SET_VELOCITY_LIMIT)".to_owned());
+            }
+            if exp.require_pressure_advance && rep.pressure_advance_commands_count == 0 {
+                errs.push(
+                    "missing pressure advance command (M572 / M900 / SET_PRESSURE_ADVANCE)"
+                        .to_owned(),
+                );
             }
             for (required, feat) in [
                 (exp.require_bridge, "Bridge"),

@@ -917,6 +917,40 @@ fn parse_density_fraction(key: &str, val: &Value) -> Result<f64, ProfileError> {
     parse_f64_val(key, scalar)
 }
 
+fn parse_accel_opt(
+    key: &str,
+    val: &Value,
+    default_accel: Option<f64>,
+) -> Result<Option<f64>, ProfileError> {
+    if is_nil_value(val) {
+        return Ok(None);
+    }
+    let Some(scalar) = unwrap_scalar(val) else {
+        return Ok(None);
+    };
+    let v = if let Value::String(s) = scalar
+        && let Some(pct_str) = s.trim().strip_suffix('%')
+    {
+        let pct = pct_str
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| ProfileError::InvalidValue {
+                key: key.to_owned(),
+                reason: format!("invalid acceleration percentage `{s}`"),
+            })?;
+        if !pct.is_finite() || pct < 0.0 {
+            return Err(ProfileError::InvalidValue {
+                key: key.to_owned(),
+                reason: format!("invalid acceleration percentage `{s}`"),
+            });
+        }
+        default_accel.unwrap_or(3000.0) * (pct / 100.0)
+    } else {
+        parse_f64_val(key, scalar)?
+    };
+    if v == 0.0 { Ok(None) } else { Ok(Some(v)) }
+}
+
 fn parse_line_width_opt(
     key: &str,
     val: &Value,
@@ -1093,6 +1127,9 @@ fn apply_machine_settings(
         let raw = parse_string_val(k, v)?;
         match raw.trim().to_ascii_lowercase().as_str() {
             "klipper" => cfg.machine.flavor = GcodeFlavor::Klipper,
+            "marlin_buddy" | "buddy" | "prusa_buddy" => {
+                cfg.machine.flavor = GcodeFlavor::MarlinBuddy;
+            }
             "marlin" | "marlin2" | "marlinlegacy" => cfg.machine.flavor = GcodeFlavor::Marlin,
             "reprapfirmware" | "reprap" | "smoothie" | "sprinter" | "repetier" => {
                 cfg.machine.flavor = GcodeFlavor::Marlin;
@@ -1116,6 +1153,33 @@ fn apply_machine_settings(
         && !is_nil_value(v)
     {
         cfg.machine.nozzle_diameter_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["nozzle_high_flow", "high_flow_nozzle"])
+        && !is_nil_value(v)
+    {
+        cfg.machine.nozzle_high_flow = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["printer_model"])
+        && !is_nil_value(v)
+    {
+        let model = parse_string_val(k, v)?;
+        let trimmed = model.trim();
+        cfg.machine.printer_model = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["remaining_times"])
+        && !is_nil_value(v)
+    {
+        cfg.machine.emit_progress_m73 = parse_bool_val(k, v)?;
         ctx.mark_applied(k);
     }
 
@@ -1280,6 +1344,53 @@ fn apply_filament_settings(
     ctx: &mut MapperCtx,
 ) -> Result<(), ProfileError> {
     let s = &filament.settings;
+
+    if let Some((k, v)) = ctx.get_primary(s, &["filament_type"])
+        && !is_nil_value(v)
+    {
+        let ft = parse_string_val(k, v)?;
+        let trimmed = ft.trim();
+        cfg.filament.filament_type = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
+        ctx.mark_applied(k);
+    }
+
+    let pa_enabled = if let Some((k, v)) = ctx.get_primary(s, &["enable_pressure_advance"])
+        && !is_nil_value(v)
+    {
+        let b = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+        Some(b)
+    } else {
+        None
+    };
+
+    if pa_enabled == Some(false) {
+        ctx.mark_recognized_if_present(s, &["pressure_advance"]);
+        cfg.filament.pressure_advance = None;
+    } else if let Some((k, v)) = ctx.get_primary(s, &["pressure_advance"])
+        && !is_nil_value(v)
+    {
+        cfg.filament.pressure_advance = Some(parse_f64_val(k, v)?);
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["chamber_temperature", "chamber_temperatures"])
+        && !is_nil_value(v)
+    {
+        cfg.filament.chamber_temp_c = Some(parse_u16_val(k, v)?);
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["wait_for_chamber_temp"])
+        && !is_nil_value(v)
+    {
+        cfg.filament.wait_for_chamber_temp = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
 
     if let Some((k, v)) = ctx.get_primary(s, &["filament_diameter"])
         && !is_nil_value(v)
@@ -1839,6 +1950,41 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["default_acceleration"])
+        && !is_nil_value(v)
+    {
+        cfg.process.default_acceleration_mm_s2 = parse_accel_opt(k, v, None)?;
+        ctx.mark_applied(k);
+    }
+
+    let ref_accel = cfg.process.default_acceleration_mm_s2;
+    if let Some((k, v)) = ctx.get_primary(s, &["outer_wall_acceleration"])
+        && !is_nil_value(v)
+    {
+        cfg.process.outer_wall_acceleration_mm_s2 = parse_accel_opt(k, v, ref_accel)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["inner_wall_acceleration"])
+        && !is_nil_value(v)
+    {
+        cfg.process.inner_wall_acceleration_mm_s2 = parse_accel_opt(k, v, ref_accel)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &["initial_layer_acceleration", "first_layer_acceleration"],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.first_layer_acceleration_mm_s2 = parse_accel_opt(k, v, ref_accel)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["travel_acceleration"])
+        && !is_nil_value(v)
+    {
+        cfg.process.travel_acceleration_mm_s2 = parse_accel_opt(k, v, ref_accel)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["support_speed"])
         && !is_nil_value(v)
     {
@@ -2004,6 +2150,58 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "z_hop": ["0.0"]
             }),
         ),
+        doc_from_parts(
+            "LayerCraft CORE One+ HF 0.2mm",
+            ProfileKind::Machine,
+            true,
+            vec!["lc_machine_base".to_owned()],
+            json!({
+                "gcode_flavor": "marlin_buddy",
+                "printer_model": "COREONE",
+                "nozzle_diameter": ["0.2"],
+                "nozzle_high_flow": "1",
+                "printable_area": ["0x0", "250x0", "250x220", "0x220"],
+                "printable_height": "270",
+                "use_relative_e_distances": "1",
+                "retraction_length": ["0.7"],
+                "retraction_speed": ["35"],
+                "z_hop": ["0.2"],
+                "wipe": ["1"],
+                "wipe_distance": ["1.5"],
+                "travel_speed": "250",
+                "remaining_times": "1",
+                "machine_start_gcode": concat!(
+                    "M862.3 P \"[printer_model]\"\n",
+                    "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M555 X[first_layer_print_min_x] Y[first_layer_print_min_y] W[first_layer_print_size_x] H[first_layer_print_size_y]\n",
+                    "G90\n",
+                    "M83\n",
+                    "M104 S170\n",
+                    "M140 S[first_layer_bed_temperature]\n",
+                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{else}M141 S0{endif}\n",
+                    "M190 S[first_layer_bed_temperature]\n",
+                    "M109 S170\n",
+                    "G28\n",
+                    "G29\n",
+                    "G1 X5 Y5 Z10 F6000\n",
+                    "M109 S[first_layer_temperature]\n",
+                    "G1 Z0.2 F1200\n",
+                    "G1 X65 E1.8 F600\n",
+                    "G1 X75 E0.2 F600\n",
+                    "G92 E0"
+                ),
+                "machine_end_gcode": concat!(
+                    "G1 E-1.0 F2100\n",
+                    "M104 S0\n",
+                    "M140 S0\n",
+                    "M141 S0\n",
+                    "M107\n",
+                    "G1 Z{min(max_z + 15, bed_height)} F900\n",
+                    "G1 X{bed_width - 10} Y{bed_depth - 10} F9000\n",
+                    "M84"
+                )
+            }),
+        ),
         // Abstract Filament Base -> PLA, PETG, ABS
         doc_from_parts(
             "lc_filament_base",
@@ -2029,12 +2227,26 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "nozzle_temperature_initial_layer": ["215"],
                 "hot_plate_temp": ["60"],
                 "hot_plate_temp_initial_layer": ["60"],
+                "chamber_temperature": ["0"],
+                "pressure_advance": ["0.03"],
                 "filament_max_volumetric_speed": ["15"],
                 "fan_min_speed": ["35"],
                 "fan_max_speed": ["100"],
                 "close_fan_the_first_x_layers": ["1"],
                 "full_fan_speed_layer": ["4"],
                 "overhang_fan_speed": ["100"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft PLA (0.2mm HF Nozzle)",
+            ProfileKind::Filament,
+            true,
+            vec!["LayerCraft Generic PLA".to_owned()],
+            json!({
+                "nozzle_temperature": ["215"],
+                "nozzle_temperature_initial_layer": ["220"],
+                "filament_max_volumetric_speed": ["4.5"],
+                "pressure_advance": ["0.05"]
             }),
         ),
         doc_from_parts(
@@ -2049,6 +2261,8 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "nozzle_temperature_initial_layer": ["245"],
                 "hot_plate_temp": ["80"],
                 "hot_plate_temp_initial_layer": ["80"],
+                "chamber_temperature": ["0"],
+                "pressure_advance": ["0.04"],
                 "filament_max_volumetric_speed": ["12"],
                 "fan_min_speed": ["20"],
                 "fan_max_speed": ["50"],
@@ -2070,6 +2284,8 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "nozzle_temperature_initial_layer": ["260"],
                 "hot_plate_temp": ["100"],
                 "hot_plate_temp_initial_layer": ["100"],
+                "chamber_temperature": ["50"],
+                "pressure_advance": ["0.03"],
                 "filament_max_volumetric_speed": ["16"],
                 "fan_min_speed": ["0"],
                 "fan_max_speed": ["20"],
@@ -2078,7 +2294,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "overhang_fan_speed": ["40"]
             }),
         ),
-        // Abstract Process Base -> Standard 0.20, Quality 0.16, Draft 0.28
+        // Abstract Process Base -> Standard 0.20, Quality 0.16, Draft 0.28, plus 0.2mm Nozzle Fine / Ultra-Fine
         doc_from_parts(
             "lc_process_base",
             ProfileKind::Process,
@@ -2151,6 +2367,65 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "sparse_infill_speed": "150"
             }),
         ),
+        doc_from_parts(
+            "lc_process_020_base",
+            ProfileKind::Process,
+            false,
+            vec!["lc_process_base".to_owned()],
+            json!({
+                "outer_wall_line_width": "0.22",
+                "inner_wall_line_width": "0.24",
+                "internal_solid_infill_line_width": "0.22",
+                "sparse_infill_line_width": "0.24",
+                "support_line_width": "0.22",
+                "wall_loops": "3",
+                "top_shell_layers": "6",
+                "bottom_shell_layers": "5",
+                "sparse_infill_density": "15%",
+                "initial_layer_speed": "25",
+                "bridge_speed": "25",
+                "overhang_3_4_speed": "20",
+                "default_acceleration": "4000",
+                "outer_wall_acceleration": "2000",
+                "inner_wall_acceleration": "3000",
+                "initial_layer_acceleration": "800",
+                "travel_acceleration": "6000",
+                "support_top_z_distance": "0.10",
+                "support_bottom_z_distance": "0.10",
+                "support_object_xy_distance": "0.25",
+                "support_base_pattern_spacing": "1.5",
+                "support_interface_top_layers": "3",
+                "support_interface_spacing": "0.15"
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft 0.10mm Fine (0.2mm Nozzle)",
+            ProfileKind::Process,
+            true,
+            vec!["lc_process_020_base".to_owned()],
+            json!({
+                "layer_height": "0.10",
+                "initial_layer_print_height": "0.12",
+                "outer_wall_speed": "60",
+                "inner_wall_speed": "90",
+                "sparse_infill_speed": "120"
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft 0.08mm Ultra-Fine (0.2mm Nozzle)",
+            ProfileKind::Process,
+            true,
+            vec!["lc_process_020_base".to_owned()],
+            json!({
+                "layer_height": "0.08",
+                "initial_layer_print_height": "0.10",
+                "top_shell_layers": "8",
+                "bottom_shell_layers": "6",
+                "outer_wall_speed": "45",
+                "inner_wall_speed": "75",
+                "sparse_infill_speed": "100"
+            }),
+        ),
     ]
 }
 
@@ -2165,17 +2440,37 @@ mod tests {
         let filaments = lib.list(Some(ProfileKind::Filament), false);
         let processes = lib.list(Some(ProfileKind::Process), false);
 
-        assert_eq!(machines.len(), 2);
-        assert_eq!(filaments.len(), 3);
-        assert_eq!(processes.len(), 3);
+        assert_eq!(machines.len(), 3);
+        assert_eq!(filaments.len(), 4);
+        assert_eq!(processes.len(), 5);
 
         // Abstract bases excluded when include_abstract=false, included when true.
-        assert_eq!(lib.list(Some(ProfileKind::Machine), true).len(), 3);
+        assert_eq!(lib.list(Some(ProfileKind::Machine), true).len(), 4);
 
         let base = PrintConfig::default();
         for m in &machines {
             for f in &filaments {
                 for p in &processes {
+                    let is_02_machine = m.name.contains("0.2mm");
+                    let is_02_process = p.name.contains("0.2mm Nozzle");
+                    if is_02_machine && !is_02_process && p.name == "LayerCraft 0.28mm Draft" {
+                        let err = lib
+                            .build_print_config(&base, Some(&m.name), Some(&f.name), Some(&p.name))
+                            .unwrap_err();
+                        assert!(matches!(
+                            err,
+                            ProfileError::Config(ConfigError::Invalid {
+                                field: "process.layer_height_mm",
+                                ..
+                            })
+                        ));
+                        continue;
+                    }
+                    // Verify all compatible presets (0.4mm machines with 0.4mm processes,
+                    // 0.2mm machine with 0.2mm processes) apply cleanly with 0 warnings/unmapped.
+                    if is_02_machine != is_02_process {
+                        continue;
+                    }
                     let res = lib
                         .build_print_config(&base, Some(&m.name), Some(&f.name), Some(&p.name))
                         .unwrap();
@@ -2194,8 +2489,8 @@ mod tests {
                         res.unmapped_keys
                     );
                     assert_eq!(res.machine_chain.len(), 2);
-                    assert_eq!(res.filament_chain.len(), 2);
-                    assert_eq!(res.process_chain.len(), 2);
+                    assert!(res.filament_chain.len() >= 2);
+                    assert!(res.process_chain.len() >= 2);
                 }
             }
         }

@@ -1,0 +1,38 @@
+[
+  {
+    "type": "machine",
+    "name": "marlin_020",
+    "gcode_flavor": "marlin",
+    "nozzle_diameter": ["0.2"],
+    "printable_area": ["0x0", "220x0", "220x220", "0x220"],
+    "use_relative_e_distances": "0"
+  },
+  {
+    "type": "filament",
+    "name": "marlin_pla_020",
+    "filament_type": ["PLA"],
+    "filament_diameter": ["1.75"],
+    "nozzle_temperature": ["215"],
+    "hot_plate_temp": ["60"],
+    "filament_max_volumetric_speed": ["4.5"],
+    "pressure_advance": ["0.06"]
+  },
+  {
+    "type": "process",
+    "name": "support_020",
+    "layer_height": "0.10",
+    "initial_layer_print_height": "0.12",
+    "outer_wall_line_width": "0.22",
+    "inner_wall_line_width": "0.24",
+    "internal_solid_infill_line_width": "0.22",
+    "sparse_infill_line_width": "0.24",
+    "support_line_width": "0.22",
+    "enable_support": "1",
+    "support_style": "snug",
+    "support_top_z_distance": "0.10",
+    "support_bottom_z_distance": "0.10",
+    "support_interface_top_layers": "2",
+    "default_acceleration": "2500",
+    "outer_wall_acceleration": "1500"
+  }
+]

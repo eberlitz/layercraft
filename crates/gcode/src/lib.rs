@@ -13,6 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod template;
+pub use template::{TemplateVars, expand_gcode_template};
+
 /// Errors produced during G-code emission or evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GcodeError {
@@ -22,128 +25,6 @@ pub enum GcodeError {
     /// Invalid config passed to emitter or evaluator.
     #[error("invalid G-code parameter: {0}")]
     InvalidParameter(&'static str),
-}
-
-/// Template variable context for start, layer-change, and end G-code macros.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TemplateVars {
-    pub nozzle_temperature: u16,
-    pub first_layer_temperature: u16,
-    pub bed_temperature: u16,
-    pub first_layer_bed_temperature: u16,
-    pub layer_num: usize,
-    pub layer_z: f64,
-    pub layer_height: f64,
-    #[serde(default)]
-    pub first_layer_height: f64,
-    pub total_layer_count: usize,
-    pub max_z: f64,
-    pub bed_width: f64,
-    pub bed_depth: f64,
-    pub bed_height: f64,
-    pub nozzle_diameter: f64,
-    pub filament_diameter: f64,
-}
-
-fn format_template_f64(val: f64) -> String {
-    let s = format!("{val:.3}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed == "-0" || trimmed.is_empty() {
-        "0".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-fn lookup_template_var(key: &str, vars: &TemplateVars) -> Option<String> {
-    match key {
-        "nozzle_temperature" => Some(vars.nozzle_temperature.to_string()),
-        "first_layer_temperature" | "nozzle_temperature_initial_layer" => {
-            Some(vars.first_layer_temperature.to_string())
-        }
-        "bed_temperature" | "hot_plate_temp" => Some(vars.bed_temperature.to_string()),
-        "first_layer_bed_temperature"
-        | "bed_temperature_initial_layer"
-        | "bed_temperature_initial_layer_single"
-        | "hot_plate_temp_initial_layer" => Some(vars.first_layer_bed_temperature.to_string()),
-        "layer_num" => Some(vars.layer_num.to_string()),
-        "layer_z" => Some(format_template_f64(vars.layer_z)),
-        "layer_height" => Some(format_template_f64(vars.layer_height)),
-        "initial_layer_print_height" => Some(format_template_f64(vars.first_layer_height)),
-        "total_layer_count" | "total_layer_number" => Some(vars.total_layer_count.to_string()),
-        "max_z" | "max_layer_z" => Some(format_template_f64(vars.max_z)),
-        "bed_width" => Some(format_template_f64(vars.bed_width)),
-        "bed_depth" => Some(format_template_f64(vars.bed_depth)),
-        "bed_height" => Some(format_template_f64(vars.bed_height)),
-        "nozzle_diameter" => Some(format_template_f64(vars.nozzle_diameter)),
-        "filament_diameter" => Some(format_template_f64(vars.filament_diameter)),
-        _ => None,
-    }
-}
-
-/// Single-pass expansion of LayerCraft `[placeholder]` macros in G-code templates.
-/// Supports Orca/Bambu single-extruder aliases and `[var[0]]` / `[var[initial_extruder]]`
-/// indexed syntax while preserving unknown `[...]` tokens verbatim.
-pub fn expand_gcode_template(template: &str, vars: &TemplateVars) -> String {
-    let normalized = template.replace("\r\n", "\n");
-    let mut out = String::with_capacity(normalized.len() + 32);
-    let mut cursor = 0usize;
-
-    while let Some(slice) = normalized.get(cursor..) {
-        let Some(rel_open) = slice.find('[') else {
-            out.push_str(slice);
-            break;
-        };
-        if let Some(prefix) = slice.get(..rel_open) {
-            out.push_str(prefix);
-        }
-        let open_idx = cursor + rel_open;
-        let after_open = open_idx + 1;
-        let rest = normalized.get(after_open..).unwrap_or("");
-        let close_pos = rest.find(']');
-        let newline_pos = rest.find('\n');
-        let nested_open = rest.find('[');
-
-        if let Some(no) = nested_open
-            && no > 0
-            && newline_pos.is_none_or(|nl| no < nl)
-            && let Some(tail) = rest.get(no..)
-        {
-            let suffix = if tail.starts_with("[0]]") {
-                Some("[0]]")
-            } else if tail.starts_with("[initial_extruder]]") {
-                Some("[initial_extruder]]")
-            } else {
-                None
-            };
-            if let Some(suf) = suffix
-                && let Some(key) = rest.get(..no)
-                && let Some(val) = lookup_template_var(key, vars)
-            {
-                out.push_str(&val);
-                cursor = after_open + no + suf.len();
-                continue;
-            }
-        }
-
-        let valid_close = close_pos.filter(|&c| {
-            newline_pos.is_none_or(|nl| c < nl) && nested_open.is_none_or(|no| c < no)
-        });
-
-        if let Some(rel_close) = valid_close {
-            let key = rest.get(..rel_close).unwrap_or("");
-            if let Some(val) = lookup_template_var(key, vars) {
-                out.push_str(&val);
-                cursor = after_open + rel_close + 1;
-                continue;
-            }
-        }
-
-        out.push('[');
-        cursor = after_open;
-    }
-
-    out
 }
 
 /// Filament cross-sectional area (`mm^2`) for a round filament of diameter `d`.
@@ -192,6 +73,64 @@ pub struct GcodeOutput {
     pub stats: PrintStatistics,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PrintBounds {
+    first_layer_min: [f64; 2],
+    first_layer_max: [f64; 2],
+    print_min: [f64; 2],
+    print_max: [f64; 2],
+}
+
+fn compute_print_bounds(plate: &SlicedPlate, config: &PrintConfig) -> PrintBounds {
+    let bw = config.machine.bed_width_mm;
+    let bd = config.machine.bed_depth_mm;
+    let mut fl_min_x = f64::INFINITY;
+    let mut fl_min_y = f64::INFINITY;
+    let mut fl_max_x = f64::NEG_INFINITY;
+    let mut fl_max_y = f64::NEG_INFINITY;
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    for layer in &plate.layers {
+        for path in &layer.paths {
+            for pt in &path.points {
+                let (x, y) = pt.to_mm();
+                let cx = x.clamp(0.0, bw);
+                let cy = y.clamp(0.0, bd);
+                min_x = min_x.min(cx);
+                min_y = min_y.min(cy);
+                max_x = max_x.max(cx);
+                max_y = max_y.max(cy);
+                if layer.index == 0 {
+                    fl_min_x = fl_min_x.min(cx);
+                    fl_min_y = fl_min_y.min(cy);
+                    fl_max_x = fl_max_x.max(cx);
+                    fl_max_y = fl_max_y.max(cy);
+                }
+            }
+        }
+    }
+
+    let (p_min, p_max) = if min_x <= max_x && min_y <= max_y {
+        ([min_x, min_y], [max_x, max_y])
+    } else {
+        ([0.5 * bw, 0.5 * bd], [0.5 * bw, 0.5 * bd])
+    };
+    let (fl_min, fl_max) = if fl_min_x <= fl_max_x && fl_min_y <= fl_max_y {
+        ([fl_min_x, fl_min_y], [fl_max_x, fl_max_y])
+    } else {
+        (p_min, p_max)
+    };
+    PrintBounds {
+        first_layer_min: fl_min,
+        first_layer_max: fl_max,
+        print_min: p_min,
+        print_max: p_max,
+    }
+}
+
 fn make_template_vars(
     config: &PrintConfig,
     layer_num: usize,
@@ -199,12 +138,14 @@ fn make_template_vars(
     layer_height: f64,
     total_layer_count: usize,
     max_z: f64,
+    bounds: &PrintBounds,
 ) -> TemplateVars {
     TemplateVars {
         nozzle_temperature: config.filament.nozzle_temp_c,
         first_layer_temperature: config.filament.effective_first_layer_nozzle_temp_c(),
         bed_temperature: config.filament.bed_temp_c,
         first_layer_bed_temperature: config.filament.effective_first_layer_bed_temp_c(),
+        chamber_temperature: config.filament.chamber_temp_c.unwrap_or(0),
         layer_num,
         layer_z,
         layer_height,
@@ -215,7 +156,14 @@ fn make_template_vars(
         bed_depth: config.machine.bed_depth_mm,
         bed_height: config.machine.bed_height_mm,
         nozzle_diameter: config.machine.nozzle_diameter_mm,
+        nozzle_high_flow: config.machine.nozzle_high_flow,
         filament_diameter: config.filament.diameter_mm,
+        filament_type: config.filament.filament_type.clone().unwrap_or_default(),
+        printer_model: config.machine.printer_model.clone().unwrap_or_default(),
+        first_layer_print_min: bounds.first_layer_min,
+        first_layer_print_max: bounds.first_layer_max,
+        print_min: bounds.print_min,
+        print_max: bounds.print_max,
     }
 }
 
@@ -252,6 +200,12 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
 
     let mut out = String::with_capacity(64 * 1024);
     let fil_area = filament_area_mm2(config.filament.diameter_mm);
+    let bounds = compute_print_bounds(plate, config);
+    let total_est_time_s: f64 = plate
+        .layers
+        .iter()
+        .map(|l| l.estimated_time_s.max(0.0))
+        .sum();
     let total_layers = plate.layers.len();
     let max_z = plate.layers.last().map(|l| l.z_top_mm).unwrap_or(0.0);
     let first_nozzle = config.filament.effective_first_layer_nozzle_temp_c();
@@ -274,6 +228,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         match config.machine.flavor {
             GcodeFlavor::Klipper => "klipper",
             GcodeFlavor::Marlin => "marlin",
+            GcodeFlavor::MarlinBuddy => "marlin_buddy",
         }
     )
     .map_err(|_| GcodeError::FormatError)?;
@@ -300,13 +255,21 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
 
     let mut current_fan_percent: Option<u8> = None;
     if let Some(tpl) = &config.machine.start_gcode {
-        let vars = make_template_vars(config, 0, first_z, first_h, total_layers, max_z);
+        let vars = make_template_vars(config, 0, first_z, first_h, total_layers, max_z, &bounds);
         let expanded = expand_gcode_template(tpl, &vars);
         push_template_block(&mut out, &expanded)?;
         writeln!(out, "G90 ; restore absolute XYZ").map_err(|_| GcodeError::FormatError)?;
         emit_e_mode(&mut out, config.machine.relative_extrusion)?;
         writeln!(out, "G92 E0").map_err(|_| GcodeError::FormatError)?;
     } else {
+        if let Some(chamber) = config.filament.chamber_temp_c
+            && chamber > 0
+        {
+            writeln!(out, "M141 S{chamber}").map_err(|_| GcodeError::FormatError)?;
+            if config.filament.wait_for_chamber_temp {
+                writeln!(out, "M191 S{chamber}").map_err(|_| GcodeError::FormatError)?;
+            }
+        }
         writeln!(out, "M140 S{first_bed}").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M104 S{first_nozzle}").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M190 S{first_bed}").map_err(|_| GcodeError::FormatError)?;
@@ -315,6 +278,21 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         if config.filament.disable_fan_first_layers > 0 {
             writeln!(out, "M107").map_err(|_| GcodeError::FormatError)?;
             current_fan_percent = Some(0);
+        }
+    }
+
+    if let Some(pa) = config.filament.pressure_advance {
+        match config.machine.flavor {
+            GcodeFlavor::Klipper => {
+                writeln!(out, "SET_PRESSURE_ADVANCE ADVANCE={pa:.4}")
+                    .map_err(|_| GcodeError::FormatError)?;
+            }
+            GcodeFlavor::MarlinBuddy => {
+                writeln!(out, "M572 S{pa:.4}").map_err(|_| GcodeError::FormatError)?;
+            }
+            GcodeFlavor::Marlin => {
+                writeln!(out, "M900 K{pa:.4}").map_err(|_| GcodeError::FormatError)?;
+            }
         }
     }
 
@@ -332,6 +310,8 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let mut total_e_mm = 0.0;
     let mut total_travel_mm = 0.0;
     let mut total_time_s = 0.0;
+    let mut elapsed_est_s = 0.0;
+    let mut current_accel_mm_s2: Option<f64> = None;
     let mut feature_stats: BTreeMap<String, FeatureStats> = BTreeMap::new();
     let mut current_role: Option<ExtrusionRole> = None;
     let mut prev_layer_seams: Vec<(f64, f64)> = Vec::new();
@@ -344,6 +324,17 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         writeln!(out, ";LAYER_CHANGE").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";Z:{:.3}", layer.z_top_mm).map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";HEIGHT:{:.3}", layer.height_mm).map_err(|_| GcodeError::FormatError)?;
+        if config.machine.emit_progress_m73 {
+            let pct = if total_est_time_s > 1e-6 {
+                ((elapsed_est_s / total_est_time_s) * 99.0)
+                    .floor()
+                    .clamp(0.0, 99.0) as u8
+            } else {
+                ((layer.index * 99) / total_layers.max(1)).min(99) as u8
+            };
+            let rem_min = ((total_est_time_s - elapsed_est_s).max(0.0) / 60.0).ceil() as u64;
+            writeln!(out, "M73 P{pct} R{rem_min}").map_err(|_| GcodeError::FormatError)?;
+        }
 
         if let Some(tpl) = &config.machine.layer_change_gcode
             && !tpl.trim().is_empty()
@@ -355,6 +346,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 layer.height_mm,
                 total_layers,
                 max_z,
+                &bounds,
             );
             let expanded = expand_gcode_template(tpl, &vars);
             push_template_block(&mut out, &expanded)?;
@@ -432,6 +424,45 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 writeln!(out, ";TYPE:{}", path.role.label())
                     .map_err(|_| GcodeError::FormatError)?;
                 current_role = Some(path.role);
+            }
+
+            let desired_accel = if layer.index == 0 {
+                config
+                    .process
+                    .first_layer_acceleration_mm_s2
+                    .or(config.process.default_acceleration_mm_s2)
+            } else {
+                match path.role {
+                    ExtrusionRole::OuterWall | ExtrusionRole::OverhangWall => config
+                        .process
+                        .outer_wall_acceleration_mm_s2
+                        .or(config.process.default_acceleration_mm_s2),
+                    ExtrusionRole::InnerWall => config
+                        .process
+                        .inner_wall_acceleration_mm_s2
+                        .or(config.process.default_acceleration_mm_s2),
+                    _ => config.process.default_acceleration_mm_s2,
+                }
+            };
+            if let Some(accel) = desired_accel
+                && current_accel_mm_s2.is_none_or(|prev| (prev - accel).abs() > 0.5)
+            {
+                match config.machine.flavor {
+                    GcodeFlavor::Klipper => {
+                        writeln!(out, "SET_VELOCITY_LIMIT ACCEL={accel:.0}")
+                            .map_err(|_| GcodeError::FormatError)?;
+                    }
+                    GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => {
+                        if let Some(ta) = config.process.travel_acceleration_mm_s2 {
+                            writeln!(out, "M204 P{accel:.0} T{ta:.0}")
+                                .map_err(|_| GcodeError::FormatError)?;
+                        } else {
+                            writeln!(out, "M204 P{accel:.0}")
+                                .map_err(|_| GcodeError::FormatError)?;
+                        }
+                    }
+                }
+                current_accel_mm_s2 = Some(accel);
             }
 
             let (sx, sy) = first_pt.to_mm();
@@ -561,6 +592,11 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             writeln!(out, "G92 E0").map_err(|_| GcodeError::FormatError)?;
             cur_e = 0.0;
         }
+        elapsed_est_s += layer.estimated_time_s.max(0.0);
+    }
+
+    if config.machine.emit_progress_m73 {
+        writeln!(out, "M73 P100 R0").map_err(|_| GcodeError::FormatError)?;
     }
 
     writeln!(out, ";TYPE:Custom").map_err(|_| GcodeError::FormatError)?;
@@ -577,13 +613,26 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             last_h,
             total_layers,
             max_z,
+            &bounds,
         );
         let expanded = expand_gcode_template(tpl, &vars);
         push_template_block(&mut out, &expanded)?;
     } else {
+        if !retracted && has_extruded && retract_len > 0.0 {
+            emit_e_move(
+                &mut out,
+                config.machine.relative_extrusion,
+                &mut cur_e,
+                -retract_len,
+                retract_f,
+            )?;
+        }
         writeln!(out, "M107").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M104 S0").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M140 S0").map_err(|_| GcodeError::FormatError)?;
+        if config.filament.chamber_temp_c.is_some_and(|c| c > 0) {
+            writeln!(out, "M141 S0").map_err(|_| GcodeError::FormatError)?;
+        }
         if max_z > 0.0 {
             let park_z = (max_z + 5.0).min(config.machine.bed_height_mm);
             if park_z > cur_z + 1e-4 {
@@ -1068,6 +1117,10 @@ pub struct GcodeReport {
     pub z_hop_count: usize,
     #[serde(default)]
     pub wipe_moves_count: usize,
+    #[serde(default)]
+    pub accel_commands_count: usize,
+    #[serde(default)]
+    pub pressure_advance_commands_count: usize,
 }
 
 /// Evaluate physical invariants from any Marlin/Klipper G-code file (LayerCraft or external oracle).
@@ -1110,6 +1163,8 @@ pub fn evaluate_gcode(
     let mut first_layer_max_fan_pwm = 0u8;
     let mut z_hop_count = 0usize;
     let mut wipe_moves_count = 0usize;
+    let mut accel_commands_count = 0usize;
+    let mut pressure_advance_commands_count = 0usize;
 
     let mut min_ex_x = f64::INFINITY;
     let mut min_ex_y = f64::INFINITY;
@@ -1178,6 +1233,17 @@ pub fn evaluate_gcode(
             }
             "M107" => {
                 fan_commands_count += 1;
+            }
+            "M204" => {
+                accel_commands_count += 1;
+            }
+            "SET_VELOCITY_LIMIT" => {
+                if tokens.any(|tok| tok.starts_with("ACCEL=")) {
+                    accel_commands_count += 1;
+                }
+            }
+            "M572" | "M900" | "SET_PRESSURE_ADVANCE" => {
+                pressure_advance_commands_count += 1;
             }
             "G92" => {
                 for tok in tokens {
@@ -1379,6 +1445,8 @@ pub fn evaluate_gcode(
         first_layer_max_fan_pwm,
         z_hop_count,
         wipe_moves_count,
+        accel_commands_count,
+        pressure_advance_commands_count,
     };
 
     Ok((report, segments))
@@ -1731,6 +1799,7 @@ mod tests {
             bed_height: 250.0,
             nozzle_diameter: 0.4,
             filament_diameter: 1.75,
+            ..TemplateVars::default()
         };
         let tpl = "M104 S[first_layer_temperature]\r\n;Z=[layer_z] [unknown_tok] [[nozzle_temperature]]\n;MAX=[max_z]/[total_layer_count] D=[nozzle_diameter]/[filament_diameter] BED=[bed_width]x[bed_depth]x[bed_height] NEXT=[nozzle_temperature]/[bed_temperature]/[first_layer_bed_temperature]/[layer_num]/[layer_height]";
         let expanded = expand_gcode_template(tpl, &vars);
@@ -1784,6 +1853,7 @@ mod tests {
             bed_height: 250.0,
             nozzle_diameter: 0.4,
             filament_diameter: 1.75,
+            ..TemplateVars::default()
         };
         let tpl = "M104 S[nozzle_temperature_initial_layer[0]] \
                    M109 S[first_layer_temperature[initial_extruder]] \
@@ -1822,5 +1892,91 @@ mod tests {
             "got {} mm3/s",
             rep.max_volumetric_flow_mm3_s
         );
+    }
+
+    #[test]
+    fn conditional_braces_and_expressions_evaluate_safely() {
+        let vars = TemplateVars {
+            nozzle_temperature: 220,
+            first_layer_temperature: 225,
+            bed_temperature: 70,
+            first_layer_bed_temperature: 75,
+            chamber_temperature: 50,
+            layer_num: 1,
+            layer_z: 0.4,
+            layer_height: 0.2,
+            first_layer_height: 0.2,
+            total_layer_count: 20,
+            max_z: 4.0,
+            bed_width: 250.0,
+            bed_depth: 220.0,
+            bed_height: 270.0,
+            nozzle_diameter: 0.2,
+            nozzle_high_flow: true,
+            filament_diameter: 1.75,
+            filament_type: "ABS".to_owned(),
+            printer_model: "COREONE".to_owned(),
+            first_layer_print_min: [110.0, 100.0],
+            first_layer_print_max: [140.0, 120.0],
+            print_min: [110.0, 100.0],
+            print_max: [140.0, 120.0],
+        };
+        let tpl = concat!(
+            "F{if nozzle_high_flow}1{else}0{endif}\n",
+            "{if filament_type[0] == \"PETG\"}M141 S0",
+            "{elsif chamber_temperature >= 45 && filament_type[0] == \"ABS\"}",
+            "{if nozzle_diameter < 0.3}M141 S[chamber_temperature] ;FINE_ABS{endif}",
+            "{else}M141 S20{endif}\n",
+            "M555 W{first_layer_print_max[0] - first_layer_print_min[0]} ",
+            "Z{min(max_z + 15, bed_height)} ",
+            "N{round(1.6)} I{int(3.9)} X{bed_width - 10}\n",
+            ";BAD {1/0} {if broken"
+        );
+        let expanded = expand_gcode_template(tpl, &vars);
+        assert!(expanded.contains("F1\n"));
+        assert!(expanded.contains("M141 S50 ;FINE_ABS\n"));
+        assert!(!expanded.contains("M141 S0"));
+        assert!(!expanded.contains("M141 S20"));
+        assert!(expanded.contains("M555 W30 Z19 N2 I3 X240\n"));
+        assert!(expanded.contains(";BAD {1/0} {if broken"));
+    }
+
+    #[test]
+    fn real_printer_pa_accel_chamber_and_m73_roundtrip() {
+        let mesh = make_box(16.0, 16.0, 2.0);
+        for (flavor, pa_prefix, accel_prefix) in [
+            (GcodeFlavor::MarlinBuddy, "M572 S0.0450", "M204 P1500 T5000"),
+            (GcodeFlavor::Marlin, "M900 K0.0450", "M204 P1500 T5000"),
+            (
+                GcodeFlavor::Klipper,
+                "SET_PRESSURE_ADVANCE ADVANCE=0.0450",
+                "SET_VELOCITY_LIMIT ACCEL=1500",
+            ),
+        ] {
+            let mut cfg = PrintConfig::default();
+            cfg.machine.flavor = flavor;
+            cfg.machine.emit_progress_m73 = true;
+            cfg.filament.pressure_advance = Some(0.045);
+            cfg.filament.chamber_temp_c = Some(48);
+            cfg.filament.wait_for_chamber_temp = true;
+            cfg.process.default_acceleration_mm_s2 = Some(3000.0);
+            cfg.process.outer_wall_acceleration_mm_s2 = Some(1500.0);
+            cfg.process.travel_acceleration_mm_s2 = Some(5000.0);
+
+            let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+            let out = emit_gcode(&plate, &cfg).unwrap();
+            assert!(out.gcode.contains(pa_prefix), "missing {pa_prefix}");
+            assert!(out.gcode.contains(accel_prefix), "missing {accel_prefix}");
+            assert!(out.gcode.contains("M141 S48"));
+            assert!(out.gcode.contains("M191 S48"));
+            assert!(out.gcode.contains("M141 S0"));
+            assert!(out.gcode.contains("M73 P0 R"));
+            assert!(out.gcode.contains("M73 P100 R0"));
+
+            let (rep, _) = evaluate_gcode(&out.gcode, 1.75, 250.0, 250.0).unwrap();
+            assert!(rep.safety.is_clean());
+            assert_eq!(rep.pressure_advance_commands_count, 1);
+            assert!(rep.accel_commands_count >= 1);
+        }
     }
 }

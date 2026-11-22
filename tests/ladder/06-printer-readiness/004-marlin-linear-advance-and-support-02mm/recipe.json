@@ -1,0 +1,19 @@
+{
+  "name": "004-marlin-linear-advance-and-support-02mm",
+  "description": "Marlin M900 K Linear Advance, M204 P acceleration, and 0.2mm nozzle Snug supports with interface layers on a miniature bridge arch",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 4.0,
+    "span_mm": 10.0,
+    "depth_mm": 6.0,
+    "pillar_height_mm": 2.12,
+    "deck_height_mm": 1.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "machine": "marlin_020",
+    "filament": "marlin_pla_020",
+    "process": "support_020"
+  }
+}

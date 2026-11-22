@@ -1,0 +1,16 @@
+{
+  "layer_count": 21,
+  "max_z_mm": 1.70,
+  "require_outer_wall": true,
+  "require_accel_commands": true,
+  "require_pressure_advance": true,
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "M141 S50",
+    "M109 S260",
+    "M104 S255",
+    "M190 S100",
+    "M572 S0.0300",
+    "M204 P"
+  ]
+}

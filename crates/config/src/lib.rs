@@ -25,6 +25,22 @@ pub enum GcodeFlavor {
     #[default]
     Klipper,
     Marlin,
+    #[serde(alias = "buddy", alias = "prusa_buddy")]
+    MarlinBuddy,
+}
+
+impl GcodeFlavor {
+    /// All supported G-code firmware dialects.
+    pub const ALL: [Self; 3] = [Self::Klipper, Self::Marlin, Self::MarlinBuddy];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Klipper => "Klipper",
+            Self::Marlin => "Marlin",
+            Self::MarlinBuddy => "Marlin / Prusa Buddy",
+        }
+    }
 }
 
 /// Supported sparse infill patterns.
@@ -85,10 +101,13 @@ impl SeamPosition {
 pub struct MachineConfig {
     pub flavor: GcodeFlavor,
     pub nozzle_diameter_mm: f64,
+    pub nozzle_high_flow: bool,
+    pub printer_model: Option<String>,
     pub bed_width_mm: f64,
     pub bed_depth_mm: f64,
     pub bed_height_mm: f64,
     pub relative_extrusion: bool,
+    pub emit_progress_m73: bool,
     pub retraction_length_mm: f64,
     pub retraction_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
@@ -107,10 +126,13 @@ impl Default for MachineConfig {
         Self {
             flavor: GcodeFlavor::Klipper,
             nozzle_diameter_mm: 0.4,
+            nozzle_high_flow: false,
+            printer_model: None,
             bed_width_mm: 250.0,
             bed_depth_mm: 250.0,
             bed_height_mm: 250.0,
             relative_extrusion: false,
+            emit_progress_m73: false,
             retraction_length_mm: 0.8,
             retraction_speed_mm_s: 35.0,
             travel_speed_mm_s: 150.0,
@@ -130,12 +152,16 @@ impl Default for MachineConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct FilamentConfig {
+    pub filament_type: Option<String>,
     pub diameter_mm: f64,
     pub density_g_cm3: f64,
     pub nozzle_temp_c: u16,
     pub bed_temp_c: u16,
     pub first_layer_nozzle_temp_c: Option<u16>,
     pub first_layer_bed_temp_c: Option<u16>,
+    pub chamber_temp_c: Option<u16>,
+    pub wait_for_chamber_temp: bool,
+    pub pressure_advance: Option<f64>,
     pub max_volumetric_speed_mm3_s: f64,
     pub fan_min_percent: u8,
     pub fan_max_percent: u8,
@@ -149,12 +175,16 @@ pub struct FilamentConfig {
 impl Default for FilamentConfig {
     fn default() -> Self {
         Self {
+            filament_type: None,
             diameter_mm: 1.75,
             density_g_cm3: 1.24,
             nozzle_temp_c: 200,
             bed_temp_c: 60,
             first_layer_nozzle_temp_c: None,
             first_layer_bed_temp_c: None,
+            chamber_temp_c: None,
+            wait_for_chamber_temp: false,
+            pressure_advance: None,
             max_volumetric_speed_mm3_s: 15.0,
             fan_min_percent: 35,
             fan_max_percent: 100,
@@ -210,6 +240,11 @@ pub struct ProcessConfig {
     pub overhang_threshold_deg: f64,
     pub overhang_speed_mm_s: f64,
     pub monotonic_solid_infill: bool,
+    pub default_acceleration_mm_s2: Option<f64>,
+    pub outer_wall_acceleration_mm_s2: Option<f64>,
+    pub inner_wall_acceleration_mm_s2: Option<f64>,
+    pub first_layer_acceleration_mm_s2: Option<f64>,
+    pub travel_acceleration_mm_s2: Option<f64>,
     pub support: SupportConfig,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
@@ -305,6 +340,11 @@ impl Default for ProcessConfig {
             overhang_threshold_deg: 45.0,
             overhang_speed_mm_s: 25.0,
             monotonic_solid_infill: true,
+            default_acceleration_mm_s2: None,
+            outer_wall_acceleration_mm_s2: None,
+            inner_wall_acceleration_mm_s2: None,
+            first_layer_acceleration_mm_s2: None,
+            travel_acceleration_mm_s2: None,
             support: SupportConfig::default(),
             skirt_loops: 0,
             brim_width_mm: 0.0,
@@ -402,6 +442,22 @@ impl PrintConfig {
 
         check_pos("filament.diameter_mm", self.filament.diameter_mm)?;
         check_pos("filament.density_g_cm3", self.filament.density_g_cm3)?;
+        if let Some(pa) = self.filament.pressure_advance
+            && (!pa.is_finite() || !(0.0..=2.0).contains(&pa))
+        {
+            return Err(ConfigError::Invalid {
+                field: "filament.pressure_advance",
+                reason: "must be within 0.0..=2.0",
+            });
+        }
+        if let Some(ct) = self.filament.chamber_temp_c
+            && ct > 100
+        {
+            return Err(ConfigError::Invalid {
+                field: "filament.chamber_temp_c",
+                reason: "must be <= 100",
+            });
+        }
         check_pos(
             "filament.max_volumetric_speed_mm3_s",
             self.filament.max_volumetric_speed_mm3_s,
@@ -574,6 +630,38 @@ impl PrintConfig {
         )?;
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
+        for (field, opt_accel) in [
+            (
+                "process.default_acceleration_mm_s2",
+                self.process.default_acceleration_mm_s2,
+            ),
+            (
+                "process.outer_wall_acceleration_mm_s2",
+                self.process.outer_wall_acceleration_mm_s2,
+            ),
+            (
+                "process.inner_wall_acceleration_mm_s2",
+                self.process.inner_wall_acceleration_mm_s2,
+            ),
+            (
+                "process.first_layer_acceleration_mm_s2",
+                self.process.first_layer_acceleration_mm_s2,
+            ),
+            (
+                "process.travel_acceleration_mm_s2",
+                self.process.travel_acceleration_mm_s2,
+            ),
+        ] {
+            if let Some(a) = opt_accel
+                && (!a.is_finite() || !(10.0..=100_000.0).contains(&a))
+            {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "must be within 10.0..=100000.0",
+                });
+            }
+        }
+
         if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
             return Err(ConfigError::Invalid {
                 field: "process.layer_height_mm",
@@ -706,5 +794,19 @@ mod tests {
         cfg14.process.support.line_width_mm = 0.42;
         cfg14.process.support.interface_speed_mm_s = f64::NAN;
         assert!(cfg14.validate().is_err());
+
+        for bad_pa in [-0.1, 3.0, f64::NAN] {
+            let mut c = PrintConfig::default();
+            c.filament.pressure_advance = Some(bad_pa);
+            assert!(c.validate().is_err());
+        }
+        let mut bad_ct = PrintConfig::default();
+        bad_ct.filament.chamber_temp_c = Some(120);
+        assert!(bad_ct.validate().is_err());
+        for bad_acc in [0.0, -100.0, 200_000.0, f64::INFINITY] {
+            let mut c = PrintConfig::default();
+            c.process.default_acceleration_mm_s2 = Some(bad_acc);
+            assert!(c.validate().is_err());
+        }
     }
 }

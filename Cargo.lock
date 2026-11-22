@@ -1441,6 +1441,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui-wgpu",
+ "js-sys",
  "layercraft-config",
  "layercraft-engine",
  "layercraft-gcode",
@@ -1450,7 +1451,9 @@ dependencies = [
  "layercraft-viewport",
  "layercraft-viewport-gpu",
  "serde_json",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
 ]
 

@@ -559,6 +559,23 @@ impl LayerCraftApp {
                         }
                     }
                 }
+
+                #[cfg(target_arch = "wasm32")]
+                if let Some(g) = &self.session.last_gcode {
+                    ui.separator();
+                    if ui.button("Download G-code").clicked() {
+                        match trigger_browser_download("layercraft_out.gcode", &g.gcode) {
+                            Ok(()) => {
+                                self.last_error = None;
+                                self.status_message =
+                                    "Triggered browser download `layercraft_out.gcode`.".to_owned();
+                            }
+                            Err(e) => {
+                                self.last_error = Some(format!("Download failed: {e}"));
+                            }
+                        }
+                    }
+                }
             });
         });
     }
@@ -729,7 +746,7 @@ impl LayerCraftApp {
                             ui.add(
                                 egui::DragValue::new(&mut p.layer_height_mm)
                                     .speed(0.01)
-                                    .range(0.05..=0.45),
+                                    .range(0.04..=0.80),
                             );
                             ui.end_row();
 
@@ -737,7 +754,7 @@ impl LayerCraftApp {
                             ui.add(
                                 egui::DragValue::new(&mut p.first_layer_height_mm)
                                     .speed(0.01)
-                                    .range(0.08..=0.45),
+                                    .range(0.05..=0.80),
                             );
                             ui.end_row();
 
@@ -781,7 +798,7 @@ impl LayerCraftApp {
                             ui.add(
                                 egui::DragValue::new(&mut p.outer_wall_width_mm)
                                     .speed(0.01)
-                                    .range(0.2..=1.0),
+                                    .range(0.10..=1.20),
                             );
                             ui.end_row();
 
@@ -789,7 +806,7 @@ impl LayerCraftApp {
                             ui.add(
                                 egui::DragValue::new(&mut p.inner_wall_width_mm)
                                     .speed(0.01)
-                                    .range(0.2..=1.0),
+                                    .range(0.10..=1.20),
                             );
                             ui.end_row();
 
@@ -818,40 +835,109 @@ impl LayerCraftApp {
 
                     ui.add_space(6.0);
                     ui.heading("Machine & Filament");
+                    let mut bed_changed = false;
+                    {
+                        let m = &mut self.session.config.machine;
+                        let f = &mut self.session.config.filament;
+                        egui::Grid::new("machine_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Flavor");
+                                egui::ComboBox::from_id_salt("flavor_sel")
+                                    .selected_text(m.flavor.label())
+                                    .show_ui(ui, |ui| {
+                                        for fl in GcodeFlavor::ALL {
+                                            ui.selectable_value(&mut m.flavor, fl, fl.label());
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Nozzle (mm)");
+                                ui.add(
+                                    egui::DragValue::new(&mut m.nozzle_diameter_mm)
+                                        .speed(0.05)
+                                        .range(0.15..=1.20),
+                                );
+                                ui.end_row();
+
+                                ui.label("High-flow nozzle");
+                                ui.checkbox(&mut m.nozzle_high_flow, "");
+                                ui.end_row();
+
+                                ui.label("Bed X (mm)");
+                                bed_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut m.bed_width_mm)
+                                            .speed(1.0)
+                                            .range(50.0..=600.0),
+                                    )
+                                    .changed();
+                                ui.end_row();
+
+                                ui.label("Bed Y (mm)");
+                                bed_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut m.bed_depth_mm)
+                                            .speed(1.0)
+                                            .range(50.0..=600.0),
+                                    )
+                                    .changed();
+                                ui.end_row();
+
+                                ui.label("Bed Z (mm)");
+                                ui.add(
+                                    egui::DragValue::new(&mut m.bed_height_mm)
+                                        .speed(1.0)
+                                        .range(50.0..=600.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Relative E");
+                                ui.checkbox(&mut m.relative_extrusion, "");
+                                ui.end_row();
+
+                                ui.label("Nozzle temp (C)");
+                                ui.add(egui::DragValue::new(&mut f.nozzle_temp_c).range(150..=340));
+                                ui.end_row();
+
+                                ui.label("Bed temp (C)");
+                                ui.add(egui::DragValue::new(&mut f.bed_temp_c).range(0..=130));
+                                ui.end_row();
+
+                                let mut ch_val = f.chamber_temp_c.unwrap_or(0);
+                                ui.label("Chamber C (0=off)");
+                                if ui
+                                    .add(egui::DragValue::new(&mut ch_val).range(0..=100))
+                                    .changed()
+                                {
+                                    f.chamber_temp_c =
+                                        if ch_val == 0 { None } else { Some(ch_val) };
+                                }
+                                ui.end_row();
+
+                                let mut pa_val = f.pressure_advance.unwrap_or(0.0);
+                                ui.label("PA (0=off)");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut pa_val)
+                                            .speed(0.002)
+                                            .range(0.0..=1.0),
+                                    )
+                                    .changed()
+                                {
+                                    f.pressure_advance =
+                                        if pa_val <= 0.0 { None } else { Some(pa_val) };
+                                }
+                                ui.end_row();
+                            });
+                    }
+                    if bed_changed {
+                        self.rebuild_scene();
+                    }
+
                     let m = &mut self.session.config.machine;
                     let f = &mut self.session.config.filament;
-                    egui::Grid::new("machine_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("Flavor");
-                            egui::ComboBox::from_id_salt("flavor_sel")
-                                .selected_text(match m.flavor {
-                                    GcodeFlavor::Klipper => "Klipper",
-                                    GcodeFlavor::Marlin => "Marlin",
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut m.flavor,
-                                        GcodeFlavor::Klipper,
-                                        "Klipper",
-                                    );
-                                    ui.selectable_value(
-                                        &mut m.flavor,
-                                        GcodeFlavor::Marlin,
-                                        "Marlin",
-                                    );
-                                });
-                            ui.end_row();
-
-                            ui.label("Nozzle temp (C)");
-                            ui.add(egui::DragValue::new(&mut f.nozzle_temp_c).range(150..=320));
-                            ui.end_row();
-
-                            ui.label("Bed temp (C)");
-                            ui.add(egui::DragValue::new(&mut f.bed_temp_c).range(0..=120));
-                            ui.end_row();
-                        });
 
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new("Cooling & Flow")
@@ -955,6 +1041,92 @@ impl LayerCraftApp {
                                     );
                                     ui.end_row();
                                 });
+                        });
+
+                    egui::CollapsingHeader::new("Acceleration & Firmware")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let proc_cfg = &mut self.session.config.process;
+                            let mach_cfg = &mut self.session.config.machine;
+                            egui::Grid::new("accel_fw_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (label, opt_val) in [
+                                        (
+                                            "Default accel (0=fw)",
+                                            &mut proc_cfg.default_acceleration_mm_s2,
+                                        ),
+                                        (
+                                            "Outer wall accel",
+                                            &mut proc_cfg.outer_wall_acceleration_mm_s2,
+                                        ),
+                                        (
+                                            "First layer accel",
+                                            &mut proc_cfg.first_layer_acceleration_mm_s2,
+                                        ),
+                                        ("Travel accel", &mut proc_cfg.travel_acceleration_mm_s2),
+                                    ] {
+                                        let mut v = opt_val.unwrap_or(0.0);
+                                        ui.label(label);
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut v)
+                                                    .speed(50.0)
+                                                    .range(0.0..=50_000.0),
+                                            )
+                                            .changed()
+                                        {
+                                            *opt_val =
+                                                if v <= 0.0 { None } else { Some(v.max(10.0)) };
+                                        }
+                                        ui.end_row();
+                                    }
+
+                                    ui.label("Emit M73 progress");
+                                    ui.checkbox(&mut mach_cfg.emit_progress_m73, "");
+                                    ui.end_row();
+                                });
+                        });
+
+                    egui::CollapsingHeader::new("Start / End G-code")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mach_cfg = &mut self.session.config.machine;
+                            ui.label("Start G-code (empty = built-in):");
+                            let mut start_buf = mach_cfg.start_gcode.clone().unwrap_or_default();
+                            if ui
+                                .add(
+                                    egui::TextEdit::multiline(&mut start_buf)
+                                        .desired_rows(4)
+                                        .code_editor(),
+                                )
+                                .changed()
+                            {
+                                mach_cfg.start_gcode = if start_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(start_buf)
+                                };
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label("End G-code (empty = built-in):");
+                            let mut end_buf = mach_cfg.end_gcode.clone().unwrap_or_default();
+                            if ui
+                                .add(
+                                    egui::TextEdit::multiline(&mut end_buf)
+                                        .desired_rows(4)
+                                        .code_editor(),
+                                )
+                                .changed()
+                            {
+                                mach_cfg.end_gcode = if end_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(end_buf)
+                                };
+                            }
                         });
 
                     egui::CollapsingHeader::new("Bridges & Overhangs")
@@ -1458,4 +1630,40 @@ impl eframe::App for LayerCraftApp {
         self.right_panel(ui);
         self.viewport_panel(ui);
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trigger_browser_download(filename: &str, contents: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast as _;
+
+    let win = web_sys::window().ok_or_else(|| "missing browser window".to_owned())?;
+    let doc = win
+        .document()
+        .ok_or_else(|| "missing browser document".to_owned())?;
+    let body = doc
+        .body()
+        .ok_or_else(|| "missing document body".to_owned())?;
+
+    let bag = web_sys::BlobPropertyBag::new();
+    bag.set_type("text/plain;charset=utf-8");
+    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(contents));
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &bag)
+        .map_err(|e| format!("failed creating Blob: {e:?}"))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| format!("failed creating object URL: {e:?}"))?;
+
+    let elem = doc
+        .create_element("a")
+        .map_err(|e| format!("failed creating anchor element: {e:?}"))?;
+    let anchor = elem
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "element is not HtmlAnchorElement".to_owned())?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    let _ = anchor.style().set_property("display", "none");
+    let _ = body.append_child(&anchor);
+    anchor.click();
+    let _ = body.remove_child(&anchor);
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
 }

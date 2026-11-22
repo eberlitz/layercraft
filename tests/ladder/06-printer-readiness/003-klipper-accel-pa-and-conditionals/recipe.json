@@ -1,0 +1,17 @@
+{
+  "name": "003-klipper-accel-pa-and-conditionals",
+  "description": "Klipper SET_PRESSURE_ADVANCE, SET_VELOCITY_LIMIT ACCEL=, {if}/{elsif}/{else} conditionals, and print-bounds arithmetic",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 20.0,
+    "height_mm": 4.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "machine": "klipper_cond",
+    "filament": "pla_pa",
+    "process": "fast_accel_020"
+  }
+}
