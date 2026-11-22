@@ -1,0 +1,18 @@
+[package]
+name = "layercraft-slice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+layercraft-clip.workspace = true
+layercraft-config.workspace = true
+layercraft-geom.workspace = true
+layercraft-mesh.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true

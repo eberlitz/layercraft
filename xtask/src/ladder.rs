@@ -1,0 +1,212 @@
+//! `cargo xtask ladder`: runs tiered complexity ladder cases and regenerates `docs/ladder.md`.
+
+use std::path::Path;
+use std::time::Instant;
+
+use layercraft_config::PrintConfig;
+use layercraft_gcode::{emit_gcode, evaluate_gcode};
+use layercraft_slice::slice_single_mesh;
+use layercraft_testkit::{ShapeSpec, build_shape};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct LadderRecipe {
+    name: String,
+    description: String,
+    shape: ShapeSpec,
+    config: PrintConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct LadderExpected {
+    layer_count: usize,
+    max_z_mm: f64,
+    #[serde(default)]
+    require_outer_wall: bool,
+    #[serde(default)]
+    require_top_surface: bool,
+    #[serde(default)]
+    require_bottom_surface: bool,
+    #[serde(default)]
+    require_sparse_infill: bool,
+    #[serde(default)]
+    forbid_center_extrusion_mm: Option<[f64; 2]>,
+}
+
+pub fn run(root: &Path) -> Result<(), String> {
+    let ladder_dir = root.join("tests").join("ladder");
+    let mut tiers: Vec<_> = std::fs::read_dir(&ladder_dir)
+        .map_err(|e| format!("{}: {e}", ladder_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    tiers.sort();
+
+    if tiers.is_empty() {
+        return Err("no ladder tiers found under tests/ladder/".to_owned());
+    }
+
+    let mut tier_summaries = Vec::new();
+    let mut detail_rows = Vec::new();
+    let mut failures = Vec::new();
+
+    for tier_path in &tiers {
+        let tier_name = tier_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let mut cases: Vec<_> = std::fs::read_dir(tier_path)
+            .map_err(|e| format!("{}: {e}", tier_path.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("recipe.json").exists())
+            .collect();
+        cases.sort();
+
+        let mut pass_count = 0usize;
+        let mut frontier: Option<String> = None;
+
+        for cdir in &cases {
+            let recipe_txt = std::fs::read_to_string(cdir.join("recipe.json"))
+                .map_err(|e| format!("reading recipe.json: {e}"))?;
+            let recipe: LadderRecipe = serde_json::from_str(&recipe_txt)
+                .map_err(|e| format!("parsing recipe.json: {e}"))?;
+            let exp_txt = std::fs::read_to_string(cdir.join("expected.json"))
+                .map_err(|e| format!("reading expected.json: {e}"))?;
+            let exp: LadderExpected = serde_json::from_str(&exp_txt)
+                .map_err(|e| format!("parsing expected.json: {e}"))?;
+
+            let start = Instant::now();
+            let mesh = build_shape(&recipe.shape).map_err(|e| e.to_string())?;
+            let plate = slice_single_mesh(&mesh, &recipe.config).map_err(|e| e.to_string())?;
+            let out = emit_gcode(&plate, &recipe.config).map_err(|e| e.to_string())?;
+            let (rep, segs) = evaluate_gcode(
+                &out.gcode,
+                recipe.config.filament.diameter_mm,
+                recipe.config.machine.bed_width_mm,
+                recipe.config.machine.bed_depth_mm,
+            )
+            .map_err(|e| e.to_string())?;
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let mut errs = Vec::new();
+            if !rep.safety.is_clean() {
+                errs.push(format!("safety violation: {:?}", rep.safety));
+            }
+            if rep.active_layer_count != exp.layer_count {
+                errs.push(format!(
+                    "layers {} != {}",
+                    rep.active_layer_count, exp.layer_count
+                ));
+            }
+            if (rep.max_z_mm - exp.max_z_mm).abs() > 0.005 {
+                errs.push(format!("max_z {:.3} != {:.3}", rep.max_z_mm, exp.max_z_mm));
+            }
+            if exp.require_outer_wall
+                && rep
+                    .feature_volumes_mm3
+                    .get("Outer wall")
+                    .copied()
+                    .unwrap_or(0.0)
+                    <= 0.0
+            {
+                errs.push("missing Outer wall extrusions".to_owned());
+            }
+            if exp.require_top_surface
+                && rep
+                    .feature_volumes_mm3
+                    .get("Top surface")
+                    .copied()
+                    .unwrap_or(0.0)
+                    <= 0.0
+            {
+                errs.push("missing Top surface extrusions".to_owned());
+            }
+            if exp.require_bottom_surface
+                && rep
+                    .feature_volumes_mm3
+                    .get("Bottom surface")
+                    .copied()
+                    .unwrap_or(0.0)
+                    <= 0.0
+            {
+                errs.push("missing Bottom surface extrusions".to_owned());
+            }
+            if exp.require_sparse_infill
+                && rep
+                    .feature_volumes_mm3
+                    .get("Sparse infill")
+                    .copied()
+                    .unwrap_or(0.0)
+                    <= 0.0
+            {
+                errs.push("missing Sparse infill extrusions".to_owned());
+            }
+            if let Some([cx, cy]) = exp.forbid_center_extrusion_mm {
+                // Ensure no extrusion passes within 3 mm of center hole (cx, cy).
+                let bad = segs.iter().any(|s| {
+                    let mx = 0.5 * (s.x0_mm + s.x1_mm);
+                    let my = 0.5 * (s.y0_mm + s.y1_mm);
+                    (mx - cx).hypot(my - cy) < 3.0
+                });
+                if bad {
+                    errs.push(format!(
+                        "extrusion intruded into clear hole near ({cx}, {cy})"
+                    ));
+                }
+            }
+
+            let status = if errs.is_empty() {
+                pass_count += 1;
+                "pass"
+            } else {
+                if frontier.is_none() {
+                    frontier = Some(recipe.name.clone());
+                }
+                failures.push(format!("{tier_name}/{}: {}", recipe.name, errs.join("; ")));
+                "FAIL"
+            };
+
+            detail_rows.push(format!(
+                "| {tier_name}/{} | {} | {} | {:.1} ms | {:.1} mm3 |",
+                recipe.name, recipe.description, status, elapsed_ms, rep.total_filament_volume_mm3
+            ));
+        }
+
+        tier_summaries.push(format!(
+            "| {} | {} | {} pass | {} |",
+            tier_name,
+            cases.len(),
+            pass_count,
+            frontier.unwrap_or_else(|| "–".to_owned())
+        ));
+    }
+
+    let doc = format!(
+        "# Slicer Complexity Ladder\n\n\
+         Generated by `cargo xtask ladder`.\n\n\
+         ## Tiers\n\n\
+         | Tier | Cases | Results | Frontier |\n\
+         |---|---|---|---|\n\
+         {}\n\n\
+         ## Cases\n\n\
+         | Case | Description | Result | Time | Filament Vol |\n\
+         |---|---|---|---|---|\n\
+         {}\n",
+        tier_summaries.join("\n"),
+        detail_rows.join("\n")
+    );
+    let doc_path = root.join("docs").join("ladder.md");
+    std::fs::write(&doc_path, doc).map_err(|e| format!("{}: {e}", doc_path.display()))?;
+
+    if !failures.is_empty() {
+        return Err(format!("ladder failures:\n  {}", failures.join("\n  ")));
+    }
+    println!(
+        "ladder: OK ({} cases passed across {} tiers)",
+        detail_rows.len(),
+        tiers.len()
+    );
+    Ok(())
+}

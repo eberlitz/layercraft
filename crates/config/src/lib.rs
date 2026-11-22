@@ -1,0 +1,271 @@
+//! Typed and validated machine, filament, and print-process configuration.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Errors returned when validating a [`PrintConfig`].
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum ConfigError {
+    /// A numeric parameter was invalid (`NaN`, infinite, or out of bounds).
+    #[error("invalid configuration parameter `{field}`: {reason}")]
+    Invalid {
+        field: &'static str,
+        reason: &'static str,
+    },
+}
+
+/// Supported G-code firmware dialects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GcodeFlavor {
+    #[default]
+    Klipper,
+    Marlin,
+}
+
+/// Supported sparse infill patterns for Tier 01 MVP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InfillPattern {
+    Rectilinear,
+    #[default]
+    Grid,
+}
+
+/// Machine hardware parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct MachineConfig {
+    pub flavor: GcodeFlavor,
+    pub nozzle_diameter_mm: f64,
+    pub bed_width_mm: f64,
+    pub bed_depth_mm: f64,
+    pub bed_height_mm: f64,
+    pub relative_extrusion: bool,
+    pub retraction_length_mm: f64,
+    pub retraction_speed_mm_s: f64,
+    pub travel_speed_mm_s: f64,
+}
+
+impl Default for MachineConfig {
+    fn default() -> Self {
+        Self {
+            flavor: GcodeFlavor::Klipper,
+            nozzle_diameter_mm: 0.4,
+            bed_width_mm: 250.0,
+            bed_depth_mm: 250.0,
+            bed_height_mm: 250.0,
+            relative_extrusion: false,
+            retraction_length_mm: 0.8,
+            retraction_speed_mm_s: 35.0,
+            travel_speed_mm_s: 150.0,
+        }
+    }
+}
+
+/// Filament material parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct FilamentConfig {
+    pub diameter_mm: f64,
+    pub density_g_cm3: f64,
+    pub nozzle_temp_c: u16,
+    pub bed_temp_c: u16,
+}
+
+impl Default for FilamentConfig {
+    fn default() -> Self {
+        Self {
+            diameter_mm: 1.75,
+            density_g_cm3: 1.24,
+            nozzle_temp_c: 200,
+            bed_temp_c: 60,
+        }
+    }
+}
+
+/// Slicing process parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ProcessConfig {
+    pub layer_height_mm: f64,
+    pub first_layer_height_mm: f64,
+    pub wall_loops: u16,
+    pub top_shell_layers: u16,
+    pub bottom_shell_layers: u16,
+    /// Fraction in `0.0..=1.0` (e.g. `0.20` for 20%).
+    pub sparse_infill_density: f64,
+    pub sparse_infill_pattern: InfillPattern,
+    pub outer_wall_width_mm: f64,
+    pub inner_wall_width_mm: f64,
+    pub solid_infill_width_mm: f64,
+    pub sparse_infill_width_mm: f64,
+    pub outer_wall_speed_mm_s: f64,
+    pub inner_wall_speed_mm_s: f64,
+    pub infill_speed_mm_s: f64,
+    pub first_layer_speed_mm_s: f64,
+    pub skirt_loops: u16,
+    pub brim_width_mm: f64,
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            layer_height_mm: 0.2,
+            first_layer_height_mm: 0.2,
+            wall_loops: 2,
+            top_shell_layers: 3,
+            bottom_shell_layers: 3,
+            sparse_infill_density: 0.20,
+            sparse_infill_pattern: InfillPattern::Grid,
+            outer_wall_width_mm: 0.42,
+            inner_wall_width_mm: 0.45,
+            solid_infill_width_mm: 0.42,
+            sparse_infill_width_mm: 0.45,
+            outer_wall_speed_mm_s: 60.0,
+            inner_wall_speed_mm_s: 100.0,
+            infill_speed_mm_s: 120.0,
+            first_layer_speed_mm_s: 30.0,
+            skirt_loops: 0,
+            brim_width_mm: 0.0,
+        }
+    }
+}
+
+/// Complete print configuration combining machine, filament, and process settings.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct PrintConfig {
+    pub machine: MachineConfig,
+    pub filament: FilamentConfig,
+    pub process: ProcessConfig,
+}
+
+fn check_pos(field: &'static str, v: f64) -> Result<(), ConfigError> {
+    if !v.is_finite() || v <= 0.0 {
+        return Err(ConfigError::Invalid {
+            field,
+            reason: "must be finite and > 0",
+        });
+    }
+    Ok(())
+}
+
+fn check_non_neg(field: &'static str, v: f64) -> Result<(), ConfigError> {
+    if !v.is_finite() || v < 0.0 {
+        return Err(ConfigError::Invalid {
+            field,
+            reason: "must be finite and >= 0",
+        });
+    }
+    Ok(())
+}
+
+impl PrintConfig {
+    /// Validate all physical bounds on the print configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check_pos(
+            "machine.nozzle_diameter_mm",
+            self.machine.nozzle_diameter_mm,
+        )?;
+        check_pos("machine.bed_width_mm", self.machine.bed_width_mm)?;
+        check_pos("machine.bed_depth_mm", self.machine.bed_depth_mm)?;
+        check_pos("machine.bed_height_mm", self.machine.bed_height_mm)?;
+        check_non_neg(
+            "machine.retraction_length_mm",
+            self.machine.retraction_length_mm,
+        )?;
+        check_pos(
+            "machine.retraction_speed_mm_s",
+            self.machine.retraction_speed_mm_s,
+        )?;
+        check_pos("machine.travel_speed_mm_s", self.machine.travel_speed_mm_s)?;
+
+        check_pos("filament.diameter_mm", self.filament.diameter_mm)?;
+        check_pos("filament.density_g_cm3", self.filament.density_g_cm3)?;
+
+        check_pos("process.layer_height_mm", self.process.layer_height_mm)?;
+        check_pos(
+            "process.first_layer_height_mm",
+            self.process.first_layer_height_mm,
+        )?;
+        if !self.process.sparse_infill_density.is_finite()
+            || !(0.0..=1.0).contains(&self.process.sparse_infill_density)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.sparse_infill_density",
+                reason: "must be within 0.0..=1.0",
+            });
+        }
+        check_pos(
+            "process.outer_wall_width_mm",
+            self.process.outer_wall_width_mm,
+        )?;
+        check_pos(
+            "process.inner_wall_width_mm",
+            self.process.inner_wall_width_mm,
+        )?;
+        check_pos(
+            "process.solid_infill_width_mm",
+            self.process.solid_infill_width_mm,
+        )?;
+        check_pos(
+            "process.sparse_infill_width_mm",
+            self.process.sparse_infill_width_mm,
+        )?;
+        check_pos(
+            "process.outer_wall_speed_mm_s",
+            self.process.outer_wall_speed_mm_s,
+        )?;
+        check_pos(
+            "process.inner_wall_speed_mm_s",
+            self.process.inner_wall_speed_mm_s,
+        )?;
+        check_pos("process.infill_speed_mm_s", self.process.infill_speed_mm_s)?;
+        check_pos(
+            "process.first_layer_speed_mm_s",
+            self.process.first_layer_speed_mm_s,
+        )?;
+        check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
+
+        if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
+            return Err(ConfigError::Invalid {
+                field: "process.layer_height_mm",
+                reason: "exceeds 1.25x nozzle diameter",
+            });
+        }
+        if self.process.first_layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
+            return Err(ConfigError::Invalid {
+                field: "process.first_layer_height_mm",
+                reason: "exceeds 1.25x nozzle diameter",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(PrintConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn hostile_configs_fail_cleanly() {
+        let mut cfg = PrintConfig::default();
+        cfg.process.layer_height_mm = 0.0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg2 = PrintConfig::default();
+        cfg2.process.sparse_infill_density = 1.5;
+        assert!(cfg2.validate().is_err());
+
+        let mut cfg3 = PrintConfig::default();
+        cfg3.machine.bed_width_mm = f64::NAN;
+        assert!(cfg3.validate().is_err());
+    }
+}

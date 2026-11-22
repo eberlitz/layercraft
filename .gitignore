@@ -1,0 +1,6 @@
+/target
+tools/orca-oracle/tmp/
+__pycache__/
+*.pyc
+*.swp
+.DS_Store

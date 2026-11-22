@@ -1,0 +1,8 @@
+{
+  "layer_count": 50,
+  "max_z_mm": 10.0,
+  "require_outer_wall": true,
+  "require_top_surface": false,
+  "require_bottom_surface": false,
+  "require_sparse_infill": false
+}
