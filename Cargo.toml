@@ -26,6 +26,10 @@ layercraft-slice = { path = "crates/slice" }
 layercraft-gcode = { path = "crates/gcode" }
 layercraft-io = { path = "crates/io" }
 layercraft-engine = { path = "crates/engine" }
+layercraft-viewport = { path = "crates/viewport" }
+layercraft-viewport-gpu = { path = "crates/viewport-gpu" }
+layercraft-ui-egui = { path = "crates/ui-egui" }
+layercraft-mcp = { path = "crates/mcp" }
 layercraft-testkit = { path = "crates/testkit" }
 
 glam = "0.34"
@@ -39,3 +43,15 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"
 clap = { version = "4", features = ["derive"] }
 cargo_metadata = "0.23"
+
+png = "0.18"
+base64 = "0.23"
+bytemuck = "1"
+web-time = "1"
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+eframe = { version = "0.37", default-features = false }
+egui-wgpu = "0.37"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"

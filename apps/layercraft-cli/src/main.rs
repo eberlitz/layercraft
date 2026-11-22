@@ -1,14 +1,17 @@
-//! Headless CLI for LayerCraft slicing, script execution, G-code evaluation, and oracle checks.
+//! Headless CLI for LayerCraft slicing, rendering, MCP server, G-code evaluation, and oracle checks.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use layercraft_config::PrintConfig;
 use layercraft_engine::{Session, command_registry, execute};
 use layercraft_gcode::{compare_layer_iou, emit_gcode, evaluate_gcode};
 use layercraft_io::read_mesh_file;
+use layercraft_mcp::McpServer;
+use layercraft_mesh::prepare_for_plate;
 use layercraft_slice::slice_single_mesh;
+use layercraft_viewport::{CameraPreset, ColorMode, RenderMode, RenderRequest, render_png};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,6 +28,21 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliRenderMode {
+    Plate,
+    Preview,
+    LayerTopdown,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliCamera {
+    Isometric,
+    Top,
+    Front,
+    Right,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Slice an STL or 3MF mesh to G-code.
@@ -37,6 +55,26 @@ enum Cmd {
         #[arg(long)]
         stats: Option<PathBuf>,
     },
+    /// Render a build plate, 3D toolpath preview, or single top-down layer PNG.
+    Render {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = CliRenderMode::Preview)]
+        mode: CliRenderMode,
+        #[arg(long, value_enum, default_value_t = CliCamera::Isometric)]
+        camera: CliCamera,
+        #[arg(long)]
+        layer: Option<usize>,
+        #[arg(long)]
+        single_layer: bool,
+        #[arg(long, default_value_t = 800)]
+        width: u32,
+        #[arg(long, default_value_t = 600)]
+        height: u32,
+    },
+    /// Run the LayerCraft MCP JSON-RPC 2.0 server over stdio.
+    Mcp,
     /// Print the JSON command registry with input/output schemas.
     Commands,
     /// Execute a JSON command script `[{"command": "...", "params": ...}, ...]`.
@@ -129,6 +167,66 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             Ok(())
         }
+        Cmd::Render {
+            input,
+            output,
+            mode,
+            camera,
+            layer,
+            single_layer,
+            width,
+            height,
+        } => {
+            let cfg = PrintConfig::default();
+            let raw_mesh =
+                read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let prepared = prepare_for_plate(
+                &raw_mesh,
+                cfg.machine.bed_width_mm,
+                cfg.machine.bed_depth_mm,
+            )
+            .map_err(|e| e.to_string())?;
+            let render_mode = match mode {
+                CliRenderMode::Plate => RenderMode::Plate,
+                CliRenderMode::Preview => RenderMode::Preview,
+                CliRenderMode::LayerTopdown => RenderMode::LayerTopDown,
+            };
+            let sliced = if render_mode == RenderMode::Plate {
+                None
+            } else {
+                Some(slice_single_mesh(&prepared, &cfg).map_err(|e| e.to_string())?)
+            };
+            let camera_preset = match camera {
+                CliCamera::Isometric => CameraPreset::Isometric,
+                CliCamera::Top => CameraPreset::Top,
+                CliCamera::Front => CameraPreset::Front,
+                CliCamera::Right => CameraPreset::Right,
+            };
+            let png = render_png(
+                Some(&prepared),
+                sliced.as_ref(),
+                &cfg,
+                &RenderRequest {
+                    width,
+                    height,
+                    mode: render_mode,
+                    camera_preset,
+                    max_layer: layer,
+                    single_layer_only: single_layer,
+                    color_mode: ColorMode::Feature,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::write(&output, &png).map_err(|e| format!("{}: {e}", output.display()))?;
+            println!(
+                "rendered {} -> {} ({} bytes)",
+                input.display(),
+                output.display(),
+                png.len()
+            );
+            Ok(())
+        }
+        Cmd::Mcp => McpServer::default().serve_stdio(),
         Cmd::Commands => {
             let reg = command_registry();
             let json = serde_json::to_string_pretty(&reg).map_err(|e| e.to_string())?;

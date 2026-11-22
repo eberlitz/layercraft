@@ -1,6 +1,7 @@
 //! Triangle mesh inspection, bed placement, and exact Z-plane slicing.
 
 use std::collections::HashMap;
+use std::f64::consts::TAU;
 
 use layercraft_clip::{ClipError, union_polygons};
 use layercraft_geom::{
@@ -361,6 +362,123 @@ fn stitch_segments_into_loops(segments: &[(Point2, Point2)]) -> Vec<Polygon> {
     }
 
     loops
+}
+
+/// Built-in watertight sample geometries available in headless CLI, desktop UI, web, and MCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleShape {
+    #[default]
+    Cube20,
+    Cylinder,
+    HollowTube,
+    SteppedBlock,
+    ThinRib,
+}
+
+impl SampleShape {
+    /// Human-friendly display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cube20 => "Cube 20 mm",
+            Self::Cylinder => "Cylinder R10 H20",
+            Self::HollowTube => "Hollow Tube R15/R8",
+            Self::SteppedBlock => "Stepped Block",
+            Self::ThinRib => "Thin Rib 30x1.6",
+        }
+    }
+
+    /// All built-in sample variants.
+    pub const ALL: [Self; 5] = [
+        Self::Cube20,
+        Self::Cylinder,
+        Self::HollowTube,
+        Self::SteppedBlock,
+        Self::ThinRib,
+    ];
+}
+
+fn push_sample_quad(tris: &mut Vec<Triangle>, a: Point3, b: Point3, c: Point3, d: Point3) {
+    tris.push(Triangle::new(a, b, c));
+    tris.push(Triangle::new(a, c, d));
+}
+
+fn sample_box(w: f64, d: f64, h: f64, ox: f64, oy: f64, oz: f64) -> Vec<Triangle> {
+    let p000 = Point3::new(ox, oy, oz);
+    let p100 = Point3::new(ox + w, oy, oz);
+    let p110 = Point3::new(ox + w, oy + d, oz);
+    let p010 = Point3::new(ox, oy + d, oz);
+    let p001 = Point3::new(ox, oy, oz + h);
+    let p101 = Point3::new(ox + w, oy, oz + h);
+    let p111 = Point3::new(ox + w, oy + d, oz + h);
+    let p011 = Point3::new(ox, oy + d, oz + h);
+
+    let mut tris = Vec::with_capacity(12);
+    push_sample_quad(&mut tris, p000, p010, p110, p100);
+    push_sample_quad(&mut tris, p001, p101, p111, p011);
+    push_sample_quad(&mut tris, p000, p100, p101, p001);
+    push_sample_quad(&mut tris, p010, p011, p111, p110);
+    push_sample_quad(&mut tris, p000, p001, p011, p010);
+    push_sample_quad(&mut tris, p100, p110, p111, p101);
+    tris
+}
+
+/// Build one of LayerCraft's built-in sample primitives.
+pub fn build_sample_shape(shape: SampleShape) -> Result<TriangleMesh, MeshError> {
+    let tris = match shape {
+        SampleShape::Cube20 => sample_box(20.0, 20.0, 20.0, 0.0, 0.0, 0.0),
+        SampleShape::ThinRib => sample_box(30.0, 1.6, 10.0, 0.0, 0.0, 0.0),
+        SampleShape::SteppedBlock => {
+            let mut t = sample_box(20.0, 20.0, 10.0, 0.0, 0.0, 0.0);
+            t.extend(sample_box(10.0, 10.0, 10.0, 5.0, 5.0, 10.0));
+            t
+        }
+        SampleShape::Cylinder => {
+            let n = 48usize;
+            let r = 10.0;
+            let h = 20.0;
+            let mut t = Vec::with_capacity(n * 4);
+            let cb = Point3::new(0.0, 0.0, 0.0);
+            let ct = Point3::new(0.0, 0.0, h);
+            for i in 0..n {
+                let a0 = TAU * (i as f64) / (n as f64);
+                let a1 = TAU * (((i + 1) % n) as f64) / (n as f64);
+                let b0 = Point3::new(r * a0.cos(), r * a0.sin(), 0.0);
+                let b1 = Point3::new(r * a1.cos(), r * a1.sin(), 0.0);
+                let t0 = Point3::new(r * a0.cos(), r * a0.sin(), h);
+                let t1 = Point3::new(r * a1.cos(), r * a1.sin(), h);
+                t.push(Triangle::new(cb, b1, b0));
+                t.push(Triangle::new(ct, t0, t1));
+                push_sample_quad(&mut t, b0, b1, t1, t0);
+            }
+            t
+        }
+        SampleShape::HollowTube => {
+            let n = 48usize;
+            let orad = 15.0;
+            let irad = 8.0;
+            let h = 10.0;
+            let mut t = Vec::with_capacity(n * 8);
+            for i in 0..n {
+                let a0 = TAU * (i as f64) / (n as f64);
+                let a1 = TAU * (((i + 1) % n) as f64) / (n as f64);
+                let ob0 = Point3::new(orad * a0.cos(), orad * a0.sin(), 0.0);
+                let ob1 = Point3::new(orad * a1.cos(), orad * a1.sin(), 0.0);
+                let ot0 = Point3::new(orad * a0.cos(), orad * a0.sin(), h);
+                let ot1 = Point3::new(orad * a1.cos(), orad * a1.sin(), h);
+                let ib0 = Point3::new(irad * a0.cos(), irad * a0.sin(), 0.0);
+                let ib1 = Point3::new(irad * a1.cos(), irad * a1.sin(), 0.0);
+                let it0 = Point3::new(irad * a0.cos(), irad * a0.sin(), h);
+                let it1 = Point3::new(irad * a1.cos(), irad * a1.sin(), h);
+                push_sample_quad(&mut t, ob0, ob1, ot1, ot0);
+                push_sample_quad(&mut t, ib1, ib0, it0, it1);
+                push_sample_quad(&mut t, ib0, ib1, ob1, ob0);
+                push_sample_quad(&mut t, ot0, ot1, it1, it0);
+            }
+            t
+        }
+    };
+    Ok(TriangleMesh::new(tris)?)
 }
 
 #[cfg(test)]

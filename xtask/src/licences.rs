@@ -22,10 +22,14 @@ const ALLOWED_SPDX: &[&str] = &[
     "Unlicense",
     "0BSD",
     "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ];
 
 const SHIPPED_ROOTS: &[&str] = &[
+    "layercraft",
     "layercraft-cli",
+    "layercraft-web",
     "layercraft-geom",
     "layercraft-clip",
     "layercraft-mesh",
@@ -34,6 +38,10 @@ const SHIPPED_ROOTS: &[&str] = &[
     "layercraft-gcode",
     "layercraft-io",
     "layercraft-engine",
+    "layercraft-viewport",
+    "layercraft-viewport-gpu",
+    "layercraft-ui-egui",
+    "layercraft-mcp",
 ];
 
 pub fn run(root: &Path, check: bool) -> Result<(), String> {

@@ -1,10 +1,14 @@
 //! Stateful slicing session and schema-typed command registry (`everything is a command`).
 
+use std::collections::BTreeMap;
+
 use layercraft_config::{ConfigError, PrintConfig};
 use layercraft_gcode::{GcodeError, GcodeOutput, GcodeReport, emit_gcode, evaluate_gcode};
 use layercraft_geom::{GeomError, TriangleMesh};
-use layercraft_io::{IoError, read_stl_bytes};
-use layercraft_mesh::{MeshInspection, inspect_mesh};
+use layercraft_io::{IoError, read_3mf_bytes, read_stl_bytes};
+use layercraft_mesh::{
+    MeshError, MeshInspection, SampleShape, build_sample_shape, inspect_mesh, prepare_for_plate,
+};
 use layercraft_slice::{SliceError, SlicedPlate, slice_single_mesh};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,8 +26,12 @@ pub enum EngineError {
     NoMeshLoaded,
     #[error("plate has not been sliced yet")]
     NotSliced,
+    #[error("layer index {index} out of range (plate has {count} layers)")]
+    LayerOutOfRange { index: usize, count: usize },
     #[error(transparent)]
     Geom(#[from] GeomError),
+    #[error(transparent)]
+    Mesh(#[from] MeshError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -34,11 +42,12 @@ pub enum EngineError {
     Io(#[from] IoError),
 }
 
-/// Stateful slicing session driving CLI, WASM, and future GUI/MCP frontends.
+/// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
 #[derive(Debug, Default)]
 pub struct Session {
     pub config: PrintConfig,
     pub mesh: Option<TriangleMesh>,
+    pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
 }
@@ -60,6 +69,16 @@ pub struct AddStlBytesParams {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Add3mfBytesParams {
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AddSampleShapeParams {
+    pub shape: SampleShape,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AddMeshFileParams {
@@ -69,6 +88,11 @@ pub struct AddMeshFileParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SetConfigParams {
     pub config: PrintConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InspectLayerParams {
+    pub index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -90,6 +114,17 @@ pub struct SliceSummaryResult {
     pub total_paths: usize,
 }
 
+/// Per-layer inspection metrics returned by `layer.inspect`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LayerInspection {
+    pub index: usize,
+    pub z_top_mm: f64,
+    pub height_mm: f64,
+    pub region_count: usize,
+    pub path_count: usize,
+    pub role_lengths_mm: BTreeMap<String, f64>,
+}
+
 /// Return descriptors and JSON schemas for all supported commands.
 pub fn command_registry() -> Vec<CommandDescriptor> {
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
@@ -104,6 +139,18 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             name: "plate.add_stl_bytes",
             summary: "Load a binary or ASCII STL mesh from a raw byte array.",
             params_schema: schema_val::<AddStlBytesParams>(),
+            result_schema: schema_val::<MeshInspection>(),
+        },
+        CommandDescriptor {
+            name: "plate.add_3mf_bytes",
+            summary: "Load a 3MF mesh archive from a raw byte array.",
+            params_schema: schema_val::<Add3mfBytesParams>(),
+            result_schema: schema_val::<MeshInspection>(),
+        },
+        CommandDescriptor {
+            name: "plate.add_sample_shape",
+            summary: "Load one of LayerCraft's built-in sample primitives onto the plate.",
+            params_schema: schema_val::<AddSampleShapeParams>(),
             result_schema: schema_val::<MeshInspection>(),
         },
         CommandDescriptor {
@@ -129,6 +176,12 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             summary: "Slice the loaded mesh using the active print configuration.",
             params_schema: schema_val::<EmptyParams>(),
             result_schema: schema_val::<SliceSummaryResult>(),
+        },
+        CommandDescriptor {
+            name: "layer.inspect",
+            summary: "Inspect a single sliced layer (Z height, region count, feature lengths).",
+            params_schema: schema_val::<InspectLayerParams>(),
+            result_schema: schema_val::<LayerInspection>(),
         },
         CommandDescriptor {
             name: "gcode.export",
@@ -157,6 +210,23 @@ fn schema_val<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null)
 }
 
+fn set_loaded_mesh(
+    session: &mut Session,
+    mesh: TriangleMesh,
+) -> Result<MeshInspection, EngineError> {
+    let prepared = prepare_for_plate(
+        &mesh,
+        session.config.machine.bed_width_mm,
+        session.config.machine.bed_depth_mm,
+    )?;
+    let insp = inspect_mesh(&prepared);
+    session.mesh = Some(mesh);
+    session.prepared_mesh = Some(prepared);
+    session.sliced = None;
+    session.last_gcode = None;
+    Ok(insp)
+}
+
 /// Execute a named command with JSON parameters against `session`.
 pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value, EngineError> {
     match name {
@@ -167,6 +237,7 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
                 serde_json::from_value(params)?
             };
             session.mesh = None;
+            session.prepared_mesh = None;
             session.sliced = None;
             session.last_gcode = None;
             Ok(serde_json::to_value(OkResult { ok: true })?)
@@ -174,24 +245,34 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         "plate.add_stl_bytes" => {
             let p: AddStlBytesParams = serde_json::from_value(params)?;
             let mesh = read_stl_bytes(&p.bytes)?;
-            let insp = inspect_mesh(&mesh);
-            session.mesh = Some(mesh);
-            session.sliced = None;
-            session.last_gcode = None;
+            let insp = set_loaded_mesh(session, mesh)?;
+            Ok(serde_json::to_value(insp)?)
+        }
+        "plate.add_3mf_bytes" => {
+            let p: Add3mfBytesParams = serde_json::from_value(params)?;
+            let mesh = read_3mf_bytes(&p.bytes)?;
+            let insp = set_loaded_mesh(session, mesh)?;
+            Ok(serde_json::to_value(insp)?)
+        }
+        "plate.add_sample_shape" => {
+            let p: AddSampleShapeParams = serde_json::from_value(params)?;
+            let mesh = build_sample_shape(p.shape)?;
+            let insp = set_loaded_mesh(session, mesh)?;
             Ok(serde_json::to_value(insp)?)
         }
         #[cfg(not(target_arch = "wasm32"))]
         "plate.add_mesh_file" => {
             let p: AddMeshFileParams = serde_json::from_value(params)?;
             let mesh = layercraft_io::read_mesh_file(std::path::Path::new(&p.path))?;
-            let insp = inspect_mesh(&mesh);
-            session.mesh = Some(mesh);
-            session.sliced = None;
-            session.last_gcode = None;
+            let insp = set_loaded_mesh(session, mesh)?;
             Ok(serde_json::to_value(insp)?)
         }
         "plate.inspect" => {
-            let mesh = session.mesh.as_ref().ok_or(EngineError::NoMeshLoaded)?;
+            let mesh = session
+                .prepared_mesh
+                .as_ref()
+                .or(session.mesh.as_ref())
+                .ok_or(EngineError::NoMeshLoaded)?;
             Ok(serde_json::to_value(inspect_mesh(mesh))?)
         }
         "config.get" => Ok(serde_json::to_value(&session.config)?),
@@ -199,12 +280,23 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             let p: SetConfigParams = serde_json::from_value(params)?;
             p.config.validate()?;
             session.config = p.config;
+            if let Some(raw) = session.mesh.as_ref() {
+                session.prepared_mesh = Some(prepare_for_plate(
+                    raw,
+                    session.config.machine.bed_width_mm,
+                    session.config.machine.bed_depth_mm,
+                )?);
+            }
             session.sliced = None;
             session.last_gcode = None;
             Ok(serde_json::to_value(&session.config)?)
         }
         "slice.run" => {
-            let mesh = session.mesh.as_ref().ok_or(EngineError::NoMeshLoaded)?;
+            let mesh = session
+                .prepared_mesh
+                .as_ref()
+                .or(session.mesh.as_ref())
+                .ok_or(EngineError::NoMeshLoaded)?;
             let plate = slice_single_mesh(mesh, &session.config)?;
             let total_paths = plate.layers.iter().map(|l| l.paths.len()).sum();
             let res = SliceSummaryResult {
@@ -214,6 +306,43 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             session.sliced = Some(plate);
             session.last_gcode = None;
             Ok(serde_json::to_value(res)?)
+        }
+        "layer.inspect" => {
+            let p: InspectLayerParams = serde_json::from_value(params)?;
+            let plate = session.sliced.as_ref().ok_or(EngineError::NotSliced)?;
+            let layer = plate
+                .layers
+                .get(p.index)
+                .ok_or(EngineError::LayerOutOfRange {
+                    index: p.index,
+                    count: plate.layers.len(),
+                })?;
+            let mut role_lengths_mm: BTreeMap<String, f64> = BTreeMap::new();
+            for path in &layer.paths {
+                let mut len = 0.0;
+                for pair in path.points.windows(2) {
+                    if let (Some(&a), Some(&b)) = (pair.first(), pair.get(1)) {
+                        len += a.distance_mm(b);
+                    }
+                }
+                if path.closed
+                    && let (Some(&first), Some(&last)) = (path.points.first(), path.points.last())
+                {
+                    len += last.distance_mm(first);
+                }
+                *role_lengths_mm
+                    .entry(path.role.label().to_owned())
+                    .or_insert(0.0) += len;
+            }
+            let info = LayerInspection {
+                index: layer.index,
+                z_top_mm: layer.z_top_mm,
+                height_mm: layer.height_mm,
+                region_count: layer.slice_regions.len(),
+                path_count: layer.paths.len(),
+                role_lengths_mm,
+            };
+            Ok(serde_json::to_value(info)?)
         }
         "gcode.export" => {
             let plate = session.sliced.as_ref().ok_or(EngineError::NotSliced)?;
@@ -301,6 +430,21 @@ mod tests {
         .unwrap();
         let summary = execute(&mut sess, "slice.run", Value::Null).unwrap();
         assert_eq!(summary["layer_count"], 100);
+        let layer0 = execute(
+            &mut sess,
+            "layer.inspect",
+            serde_json::json!({ "index": 0 }),
+        )
+        .unwrap();
+        assert_eq!(layer0["index"], 0);
+        assert!(
+            execute(
+                &mut sess,
+                "layer.inspect",
+                serde_json::json!({ "index": 999 })
+            )
+            .is_err()
+        );
         let gcode_val = execute(&mut sess, "gcode.export", Value::Null).unwrap();
         let gcode_str = gcode_val["gcode"].as_str().unwrap().to_owned();
         let report = execute(
@@ -310,6 +454,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report["active_layer_count"], 100);
+    }
+
+    #[test]
+    fn sample_shape_command_loads_and_slices() {
+        let mut sess = Session::default();
+        let insp = execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "hollow_tube" }),
+        )
+        .unwrap();
+        assert!(insp["triangle_count"].as_u64().unwrap() > 100);
+        let summary = execute(&mut sess, "slice.run", Value::Null).unwrap();
+        assert_eq!(summary["layer_count"], 50);
     }
 
     #[test]
@@ -335,7 +493,6 @@ mod tests {
                 .is_err()
             );
         }
-        // Hollow cylinder & stepped block slice cleanly through engine commands.
         for mesh in [
             layercraft_testkit::make_hollow_cylinder(15.0, 8.0, 10.0, 48).unwrap(),
             layercraft_testkit::make_stepped_block(20.0, 20.0, 10.0, 10.0, 10.0, 10.0).unwrap(),

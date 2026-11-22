@@ -1,0 +1,27 @@
+[package]
+name = "layercraft-ui-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+layercraft-config.workspace = true
+layercraft-engine.workspace = true
+layercraft-gcode.workspace = true
+layercraft-geom.workspace = true
+layercraft-mesh.workspace = true
+layercraft-slice.workspace = true
+layercraft-viewport.workspace = true
+layercraft-viewport-gpu.workspace = true
+serde_json.workspace = true
+web-time.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures.workspace = true

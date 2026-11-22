@@ -21,8 +21,14 @@ pub const TABLE: &[(&str, Class)] = &[
     ("layercraft-gcode", Class::Layer(2)),
     ("layercraft-io", Class::Layer(3)),
     ("layercraft-engine", Class::Layer(4)),
+    ("layercraft-viewport", Class::Layer(5)),
+    ("layercraft-viewport-gpu", Class::Layer(5)),
+    ("layercraft-ui-egui", Class::Layer(5)),
+    ("layercraft-mcp", Class::Layer(5)),
     ("layercraft-testkit", Class::Testkit),
+    ("layercraft", Class::Exempt),
     ("layercraft-cli", Class::Exempt),
+    ("layercraft-web", Class::Exempt),
     ("xtask", Class::Exempt),
 ];
 
@@ -32,6 +38,10 @@ const INTRA_LAYER_ORDER: &[(&str, &str)] = &[
     ("layercraft-slice", "layercraft-config"),
     ("layercraft-gcode", "layercraft-config"),
     ("layercraft-gcode", "layercraft-slice"),
+    ("layercraft-viewport-gpu", "layercraft-viewport"),
+    ("layercraft-ui-egui", "layercraft-viewport"),
+    ("layercraft-ui-egui", "layercraft-viewport-gpu"),
+    ("layercraft-mcp", "layercraft-viewport"),
 ];
 
 const FORBIDDEN_UI_BELOW_L5: &[&str] = &["egui", "eframe", "wgpu", "winit", "egui-wgpu"];

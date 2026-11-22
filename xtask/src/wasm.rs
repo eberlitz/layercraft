@@ -1,4 +1,4 @@
-//! `cargo xtask wasm`: verifies L0-L4 library crates compile for `wasm32-unknown-unknown`.
+//! `cargo xtask wasm`: verifies L0-L5 library crates and `layercraft-web` compile for `wasm32-unknown-unknown`.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +12,10 @@ const WASM_CRATES: &[&str] = &[
     "layercraft-gcode",
     "layercraft-io",
     "layercraft-engine",
+    "layercraft-viewport",
+    "layercraft-viewport-gpu",
+    "layercraft-ui-egui",
+    "layercraft-web",
 ];
 
 pub fn run(root: &Path) -> Result<(), String> {
@@ -30,7 +34,7 @@ pub fn run(root: &Path) -> Result<(), String> {
         return Err("wasm32-unknown-unknown check failed".to_owned());
     }
     println!(
-        "wasm: OK ({} L0-L4 crates built for wasm32-unknown-unknown)",
+        "wasm: OK ({} crates built for wasm32-unknown-unknown)",
         WASM_CRATES.len()
     );
     Ok(())
