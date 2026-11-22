@@ -1,0 +1,16 @@
+{
+  "name": "004-arc-fitting-hollow-tube-profile",
+  "description": "Hollow tube sliced via JSON profile enabling G2/G3 arc fitting, topmost ironing, and contour scarf seams",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 15.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 4.0,
+    "segments": 64
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "process": "finish_tube_020"
+  }
+}

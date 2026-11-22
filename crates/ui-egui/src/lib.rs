@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use layercraft_config::{
-    GcodeFlavor, InfillPattern, ProfileApplyResult, ProfileKind, ProfileSummary, SeamPosition,
-    SupportStyle,
+    GcodeFlavor, InfillPattern, IroningType, ProfileApplyResult, ProfileKind, ProfileSummary,
+    SeamPosition, SupportStyle,
 };
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{SampleShape, inspect_mesh};
@@ -1257,6 +1257,116 @@ impl LayerCraftApp {
                                 });
                         });
 
+                    egui::CollapsingHeader::new("Surface & Motion Finish")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let proc_cfg = &mut self.session.config.process;
+                            egui::Grid::new("surface_motion_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Ironing");
+                                    egui::ComboBox::from_id_salt("ironing_mode")
+                                        .selected_text(proc_cfg.ironing.mode.label())
+                                        .show_ui(ui, |ui| {
+                                            for mode in IroningType::ALL {
+                                                ui.selectable_value(
+                                                    &mut proc_cfg.ironing.mode,
+                                                    mode,
+                                                    mode.label(),
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    let mut iron_flow_pct = proc_cfg.ironing.flow_ratio * 100.0;
+                                    ui.label("Iron flow (%)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut iron_flow_pct)
+                                                .speed(0.5)
+                                                .range(1.0..=50.0),
+                                        )
+                                        .changed()
+                                    {
+                                        proc_cfg.ironing.flow_ratio =
+                                            (iron_flow_pct / 100.0).clamp(0.01, 0.5);
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Iron spacing (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.ironing.line_spacing_mm)
+                                            .speed(0.01)
+                                            .range(0.04..=1.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Iron inset (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.ironing.inset_mm)
+                                            .speed(0.02)
+                                            .range(0.0..=5.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Iron speed (mm/s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.ironing.speed_mm_s)
+                                            .speed(1.0)
+                                            .range(5.0..=200.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Scarf seams");
+                                    ui.checkbox(&mut proc_cfg.scarf_seam.enabled, "");
+                                    ui.end_row();
+
+                                    ui.label("Scarf len (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.scarf_seam.length_mm)
+                                            .speed(0.5)
+                                            .range(1.0..=200.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Scarf steps");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.scarf_seam.steps)
+                                            .range(2..=64),
+                                    );
+                                    ui.end_row();
+
+                                    let mut start_pct =
+                                        proc_cfg.scarf_seam.start_height_ratio * 100.0;
+                                    ui.label("Scarf start (%)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut start_pct)
+                                                .speed(1.0)
+                                                .range(2.0..=50.0),
+                                        )
+                                        .changed()
+                                    {
+                                        proc_cfg.scarf_seam.start_height_ratio =
+                                            (start_pct / 100.0).clamp(0.02, 0.50);
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Arc fitting (G2/G3)");
+                                    ui.checkbox(&mut proc_cfg.arc_fitting, "");
+                                    ui.end_row();
+
+                                    ui.label("Arc tol (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.arc_tolerance_mm)
+                                            .speed(0.005)
+                                            .range(0.002..=0.5),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+
                     enum ObjAction {
                         Remove(u64),
                         Transform {
@@ -1506,6 +1616,7 @@ impl LayerCraftApp {
                         ExtrusionRole::InnerWall,
                         ExtrusionRole::OverhangWall,
                         ExtrusionRole::TopSurface,
+                        ExtrusionRole::Ironing,
                         ExtrusionRole::BottomSurface,
                         ExtrusionRole::InternalSolidInfill,
                         ExtrusionRole::Bridge,

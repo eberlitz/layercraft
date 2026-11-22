@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{ConfigError, GcodeFlavor, InfillPattern, PrintConfig, SeamPosition, SupportStyle};
+use crate::{
+    ConfigError, GcodeFlavor, InfillPattern, IroningType, PrintConfig, SeamPosition, SupportStyle,
+};
 
 /// Maximum inheritance chain length allowed when resolving profiles.
 pub const MAX_INHERITANCE_DEPTH: usize = 32;
@@ -1985,6 +1987,131 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
+    // Ironing settings
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_type"])
+        && !is_nil_value(v)
+    {
+        let raw = parse_string_val(k, v)?;
+        let norm = raw.trim().to_ascii_lowercase();
+        cfg.process.ironing.mode = match norm.as_str() {
+            "no ironing" | "no_ironing" | "none" | "off" => IroningType::Off,
+            "top" | "topmost" | "topmost_surface" | "topmost_surface_only" => {
+                IroningType::TopmostSurface
+            }
+            "all top" | "all_top" | "all_top_surfaces" | "top_surfaces" => {
+                IroningType::AllTopSurfaces
+            }
+            _ => {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    format!("ironing_type `{raw}` approximated using `all_top_surfaces`"),
+                );
+                IroningType::AllTopSurfaces
+            }
+        };
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_flow"])
+        && !is_nil_value(v)
+    {
+        cfg.process.ironing.flow_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_spacing"])
+        && !is_nil_value(v)
+    {
+        cfg.process.ironing.line_spacing_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_inset"])
+        && !is_nil_value(v)
+    {
+        cfg.process.ironing.inset_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_speed"])
+        && !is_nil_value(v)
+    {
+        cfg.process.ironing.speed_mm_s = parse_speed_val(k, v, cfg.process.outer_wall_speed_mm_s)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["ironing_angle"])
+        && !is_nil_value(v)
+    {
+        let angle = parse_f64_val(k, v)?;
+        if (angle - (-1.0)).abs() > 1e-6 {
+            cfg.process.ironing.angle_offset_deg = angle;
+        }
+        ctx.mark_applied(k);
+    }
+
+    // Scarf seam settings
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_type"])
+        && !is_nil_value(v)
+    {
+        let raw = parse_string_val(k, v)?;
+        let norm = raw.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "none" | "off" => cfg.process.scarf_seam.enabled = false,
+            "contour" | "contour_and_hole" | "all" => cfg.process.scarf_seam.enabled = true,
+            _ => {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    format!("seam_slope_type `{raw}` approximated as enabled scarf seam"),
+                );
+                cfg.process.scarf_seam.enabled = true;
+            }
+        }
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_start_height"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.start_height_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_min_length"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.min_length_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_length", "scarf_seam_length"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.length_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_steps"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.steps = parse_u16_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_entire_loop"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.entire_loop = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    ctx.mark_recognized_if_present(s, &["scarf_angle_threshold", "seam_slope_conditional"]);
+
+    // Arc fitting settings
+    if let Some((k, v)) = ctx.get_primary(s, &["enable_arc_fitting"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arc_fitting = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["arc_fitting_tolerance"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arc_tolerance_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["support_speed"])
         && !is_nil_value(v)
     {
@@ -2765,5 +2892,55 @@ mod tests {
         assert_eq!(res.process_chain, vec!["base_proc", "Child 020"]);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ironing_scarf_and_arc_profile_keys_map_without_warnings() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"{
+                "type": "process",
+                "name": "finish_020",
+                "layer_height": "0.2",
+                "ironing_type": "all_top_surfaces",
+                "ironing_flow": "12%",
+                "ironing_spacing": "0.12",
+                "ironing_inset": "0.20",
+                "ironing_speed": "35",
+                "ironing_angle": "-1",
+                "seam_slope_type": "contour",
+                "seam_slope_start_height": "15%",
+                "seam_slope_min_length": "8",
+                "seam_slope_length": "18",
+                "seam_slope_steps": "12",
+                "seam_slope_entire_loop": "0",
+                "scarf_angle_threshold": "155",
+                "seam_slope_conditional": "1",
+                "enable_arc_fitting": "1",
+                "arc_fitting_tolerance": "0.03"
+            }"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(&PrintConfig::default(), None, None, Some("finish_020"))
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert_eq!(res.config.process.ironing.mode, IroningType::AllTopSurfaces);
+        assert!((res.config.process.ironing.flow_ratio - 0.12).abs() < 1e-9);
+        assert!((res.config.process.ironing.line_spacing_mm - 0.12).abs() < 1e-9);
+        assert!((res.config.process.ironing.inset_mm - 0.20).abs() < 1e-9);
+        assert!((res.config.process.ironing.speed_mm_s - 35.0).abs() < 1e-9);
+        assert!((res.config.process.ironing.angle_offset_deg - 45.0).abs() < 1e-9);
+        assert!(res.config.process.scarf_seam.enabled);
+        assert!((res.config.process.scarf_seam.start_height_ratio - 0.15).abs() < 1e-9);
+        assert!((res.config.process.scarf_seam.min_length_mm - 8.0).abs() < 1e-9);
+        assert!((res.config.process.scarf_seam.length_mm - 18.0).abs() < 1e-9);
+        assert_eq!(res.config.process.scarf_seam.steps, 12);
+        assert!(!res.config.process.scarf_seam.entire_loop);
+        assert!(res.config.process.arc_fitting);
+        assert!((res.config.process.arc_tolerance_mm - 0.03).abs() < 1e-9);
     }
 }

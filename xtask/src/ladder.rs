@@ -90,6 +90,12 @@ struct LadderExpected {
     #[serde(default)]
     require_support_interface: bool,
     #[serde(default)]
+    require_ironing: bool,
+    #[serde(default)]
+    require_arcs: bool,
+    #[serde(default)]
+    require_scarf_seams: bool,
+    #[serde(default)]
     forbid_support: bool,
     #[serde(default)]
     min_bbox_width_mm: Option<f64>,
@@ -352,10 +358,17 @@ pub fn run(root: &Path) -> Result<(), String> {
                 (exp.require_overhang_wall, "Overhang wall"),
                 (exp.require_support, "Support"),
                 (exp.require_support_interface, "Support interface"),
+                (exp.require_ironing, "Ironing"),
             ] {
                 if required && rep.feature_volumes_mm3.get(feat).copied().unwrap_or(0.0) <= 0.0 {
                     errs.push(format!("missing {feat} extrusions"));
                 }
+            }
+            if exp.require_arcs && rep.arc_moves_count == 0 {
+                errs.push("missing G2/G3 arc moves".to_owned());
+            }
+            if exp.require_scarf_seams && rep.scarf_ramp_moves_count == 0 {
+                errs.push("missing scarf seam Z-ramp moves".to_owned());
             }
             if exp.forbid_support {
                 for feat in ["Support", "Support interface"] {

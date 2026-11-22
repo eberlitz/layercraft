@@ -1,0 +1,24 @@
+{
+  "name": "001-ironing-stepped-all-top",
+  "description": "Stepped block with AllTopSurfaces low-flow monotonic ironing on both ledge and top face",
+  "shape": {
+    "kind": "stepped_block",
+    "base_width_mm": 20.0,
+    "base_depth_mm": 20.0,
+    "base_height_mm": 4.0,
+    "top_width_mm": 10.0,
+    "top_depth_mm": 10.0,
+    "top_height_mm": 4.0
+  },
+  "config": {
+    "process": {
+      "ironing": {
+        "mode": "all_top_surfaces",
+        "flow_ratio": 0.10,
+        "line_spacing_mm": 0.12,
+        "inset_mm": 0.21,
+        "speed_mm_s": 30.0
+      }
+    }
+  }
+}

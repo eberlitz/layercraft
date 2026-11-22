@@ -2,7 +2,7 @@
 //! and physical invariant evaluation + 2D raster IoU comparison.
 
 use std::collections::BTreeMap;
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 use std::fmt::Write as _;
 
 use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition};
@@ -13,7 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod arc;
 pub mod template;
+pub use arc::MotionCmd;
 pub use template::{TemplateVars, expand_gcode_template};
 
 /// Errors produced during G-code emission or evaluation.
@@ -530,7 +532,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 total_time_s += retract_len / config.machine.retraction_speed_mm_s;
             }
 
-            let eff_flow = path.flow_ratio.max(0.01);
+            let eff_flow = path.flow_ratio.max(0.001);
             let bead_area = bead_area_mm2(path.width_mm, path.height_mm) * eff_flow;
             let eff_speed = if bead_area > 1e-9 {
                 path.speed_mm_s
@@ -546,39 +548,123 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 .entry(path.role.label().to_owned())
                 .or_default();
 
-            let mut seg_prev = (cur_x, cur_y);
-            let mut path_trail = Vec::with_capacity(iter_pts.len() + 1);
-            path_trail.push(seg_prev);
+            let mut path_trail = Vec::with_capacity(iter_pts.len() + 2);
+            path_trail.push((cur_x, cur_y));
 
+            let mut pts_mm = Vec::with_capacity(iter_pts.len() + 1);
+            pts_mm.push((cur_x, cur_y));
             for pt in iter_pts {
-                let (nx, ny) = pt.to_mm();
-                let seg_len = (nx - seg_prev.0).hypot(ny - seg_prev.1);
-                if seg_len <= 1e-6 {
-                    continue;
+                pts_mm.push(pt.to_mm());
+            }
+
+            let total_loop_len: f64 = pts_mm
+                .windows(2)
+                .filter_map(|w| Some((w.first()?, w.get(1)?)))
+                .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
+                .sum();
+            let scarf = &config.process.scarf_seam;
+            let use_scarf = scarf.enabled
+                && layer.index > 0
+                && path.closed
+                && path.role == ExtrusionRole::OuterWall
+                && total_loop_len >= scarf.min_length_mm;
+
+            let mut emit_ctx = PathEmitCtx {
+                out: &mut out,
+                cur_x: &mut cur_x,
+                cur_y: &mut cur_y,
+                cur_e: &mut cur_e,
+                total_e_mm: &mut total_e_mm,
+                total_time_s: &mut total_time_s,
+                has_extruded: &mut has_extruded,
+                f_entry,
+                path_trail: &mut path_trail,
+                relative_e: config.machine.relative_extrusion,
+                fil_area,
+                fil_diam: config.filament.diameter_mm,
+                density: config.filament.density_g_cm3,
+                width_mm: path.width_mm,
+                height_mm: path.height_mm,
+                base_flow: eff_flow,
+                feed,
+                actual_speed,
+            };
+
+            let mut scarf_done = false;
+            if use_scarf {
+                let target_len = if scarf.entire_loop {
+                    total_loop_len
+                } else {
+                    scarf.length_mm.min(0.45 * total_loop_len)
+                };
+                if target_len >= 1.0
+                    && let Some(sub) =
+                        subdivide_loop_for_scarf(&pts_mm, target_len, scarf.steps as usize)
+                {
+                    let z_base = layer.z_top_mm - path.height_mm;
+                    let z_start = z_base + scarf.start_height_ratio * path.height_mm;
+                    writeln!(emit_ctx.out, ";SCARF_START").map_err(|_| GcodeError::FormatError)?;
+                    writeln!(emit_ctx.out, "G0 Z{z_start:.3} F{zhop_f:.0}")
+                        .map_err(|_| GcodeError::FormatError)?;
+                    *emit_ctx.total_time_s +=
+                        (cur_z - z_start).abs() / config.machine.z_hop_speed_mm_s;
+
+                    // Phase A: ascending Z & flow ramp over [0..L].
+                    let mut ramp_z = z_start;
+                    for pair in sub.ramp_pts.windows(2) {
+                        let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) =
+                            (pair.first(), pair.get(1))
+                        else {
+                            continue;
+                        };
+                        let seg_len = (x1 - x0).hypot(y1 - y0);
+                        if seg_len <= 1e-6 {
+                            continue;
+                        }
+                        let t_end = (s1 / target_len).clamp(0.0, 1.0);
+                        let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+                        let z1 = z_start + t_end * (layer.z_top_mm - z_start);
+                        let frac_a = (scarf.start_height_ratio
+                            + t_mid * (1.0 - scarf.start_height_ratio))
+                            * scarf.flow_ratio;
+                        emit_ctx.emit_linear((x1, y1), seg_len, Some(z1), frac_a)?;
+                        ramp_z = z1;
+                    }
+                    if (ramp_z - layer.z_top_mm).abs() > 1e-4 {
+                        writeln!(emit_ctx.out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
+                            .map_err(|_| GcodeError::FormatError)?;
+                    }
+                    cur_z = layer.z_top_mm;
+
+                    // Phase B: constant-Z body over [L..P].
+                    if sub.body_pts.len() >= 2 {
+                        emit_ctx.emit_xy_sequence(&sub.body_pts, config)?;
+                    }
+
+                    // Phase C: complementary flow overlap at constant Z = layer.z_top_mm over [0..L].
+                    for pair in sub.ramp_pts.windows(2) {
+                        let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) =
+                            (pair.first(), pair.get(1))
+                        else {
+                            continue;
+                        };
+                        let seg_len = (x1 - x0).hypot(y1 - y0);
+                        if seg_len <= 1e-6 {
+                            continue;
+                        }
+                        let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+                        let height_frac =
+                            scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
+                        let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
+                        emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
+                    }
+                    writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
+                    scarf_done = true;
                 }
-                let de = extrusion_delta_mm(
-                    seg_len,
-                    path.width_mm,
-                    path.height_mm,
-                    config.filament.diameter_mm,
-                ) * eff_flow;
-                let e_val = next_e_val(config.machine.relative_extrusion, &mut cur_e, de);
-                writeln!(out, "G1 X{nx:.3} Y{ny:.3} E{e_val:.5} F{feed:.0}")
-                    .map_err(|_| GcodeError::FormatError)?;
+            }
 
-                let vol = de * fil_area;
-                let dt = seg_len / actual_speed;
-                total_e_mm += de;
-                total_time_s += dt;
-                f_entry.volume_mm3 += vol;
-                f_entry.weight_g += vol * 0.001 * config.filament.density_g_cm3;
-                f_entry.estimated_time_s += dt;
-
-                seg_prev = (nx, ny);
-                cur_x = nx;
-                cur_y = ny;
-                path_trail.push((nx, ny));
-                has_extruded = true;
+            if !scarf_done {
+                emit_ctx.emit_xy_sequence(&pts_mm, config)?;
             }
 
             last_path_trail = path_trail;
@@ -667,6 +753,251 @@ fn emit_e_mode(out: &mut String, relative: bool) -> Result<(), GcodeError> {
     } else {
         writeln!(out, "M82 ; absolute extrusion").map_err(|_| GcodeError::FormatError)
     }
+}
+
+struct PathEmitCtx<'a> {
+    out: &'a mut String,
+    cur_x: &'a mut f64,
+    cur_y: &'a mut f64,
+    cur_e: &'a mut f64,
+    total_e_mm: &'a mut f64,
+    total_time_s: &'a mut f64,
+    has_extruded: &'a mut bool,
+    f_entry: &'a mut FeatureStats,
+    path_trail: &'a mut Vec<(f64, f64)>,
+    relative_e: bool,
+    fil_area: f64,
+    fil_diam: f64,
+    density: f64,
+    width_mm: f64,
+    height_mm: f64,
+    base_flow: f64,
+    feed: f64,
+    actual_speed: f64,
+}
+
+impl PathEmitCtx<'_> {
+    fn account_segment(&mut self, len_mm: f64, flow_mult: f64) -> f64 {
+        let de = extrusion_delta_mm(len_mm, self.width_mm, self.height_mm, self.fil_diam)
+            * self.base_flow
+            * flow_mult;
+        let vol = de * self.fil_area;
+        let dt = len_mm / self.actual_speed;
+        *self.total_e_mm += de;
+        *self.total_time_s += dt;
+        self.f_entry.volume_mm3 += vol;
+        self.f_entry.weight_g += vol * 0.001 * self.density;
+        self.f_entry.estimated_time_s += dt;
+        *self.has_extruded = true;
+        de
+    }
+
+    fn emit_linear(
+        &mut self,
+        to: (f64, f64),
+        len_mm: f64,
+        z_override: Option<f64>,
+        flow_mult: f64,
+    ) -> Result<(), GcodeError> {
+        let de = self.account_segment(len_mm, flow_mult);
+        let e_val = next_e_val(self.relative_e, self.cur_e, de);
+        if let Some(z) = z_override {
+            writeln!(
+                self.out,
+                "G1 X{:.3} Y{:.3} Z{z:.3} E{e_val:.5} F{:.0}",
+                to.0, to.1, self.feed
+            )
+            .map_err(|_| GcodeError::FormatError)?;
+        } else {
+            writeln!(
+                self.out,
+                "G1 X{:.3} Y{:.3} E{e_val:.5} F{:.0}",
+                to.0, to.1, self.feed
+            )
+            .map_err(|_| GcodeError::FormatError)?;
+        }
+        *self.cur_x = to.0;
+        *self.cur_y = to.1;
+        self.path_trail.push(to);
+        Ok(())
+    }
+
+    fn emit_arc(
+        &mut self,
+        cw: bool,
+        to: (f64, f64),
+        center: (f64, f64),
+        radius: f64,
+        sweep_rad: f64,
+        len_mm: f64,
+    ) -> Result<(), GcodeError> {
+        let from = (*self.cur_x, *self.cur_y);
+        let i_off = center.0 - from.0;
+        let j_off = center.1 - from.1;
+        let de = self.account_segment(len_mm, 1.0);
+        let e_val = next_e_val(self.relative_e, self.cur_e, de);
+        let cmd = if cw { "G2" } else { "G3" };
+        writeln!(
+            self.out,
+            "{cmd} X{:.3} Y{:.3} I{i_off:.4} J{j_off:.4} E{e_val:.5} F{:.0}",
+            to.0, to.1, self.feed
+        )
+        .map_err(|_| GcodeError::FormatError)?;
+        let samples = arc::sample_arc_points(from, center, radius, cw, sweep_rad, 0.25);
+        self.path_trail.extend(samples);
+        *self.cur_x = to.0;
+        *self.cur_y = to.1;
+        Ok(())
+    }
+
+    fn emit_xy_sequence(
+        &mut self,
+        pts_mm: &[(f64, f64)],
+        config: &PrintConfig,
+    ) -> Result<(), GcodeError> {
+        if config.process.arc_fitting {
+            let cmds = arc::fit_polyline_arcs(pts_mm, config.process.arc_tolerance_mm);
+            for cmd in cmds {
+                match cmd {
+                    MotionCmd::Line { to, len_mm } => {
+                        self.emit_linear(to, len_mm, None, 1.0)?;
+                    }
+                    MotionCmd::Arc {
+                        cw,
+                        to,
+                        center,
+                        radius,
+                        sweep_rad,
+                        len_mm,
+                    } => {
+                        self.emit_arc(cw, to, center, radius, sweep_rad, len_mm)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for pair in pts_mm.windows(2) {
+            let (Some(&a), Some(&b)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let seg_len = (b.0 - a.0).hypot(b.1 - a.1);
+            if seg_len <= 1e-6 {
+                continue;
+            }
+            self.emit_linear(b, seg_len, None, 1.0)?;
+        }
+        Ok(())
+    }
+}
+
+fn sample_polyline_at_dist(pts: &[(f64, f64)], cum: &[f64], target_d: f64) -> Option<(f64, f64)> {
+    let total = *cum.last()?;
+    if target_d <= 0.0 {
+        return pts.first().copied();
+    }
+    if target_d >= total {
+        return pts.last().copied();
+    }
+    for k in 0..cum.len().saturating_sub(1) {
+        let (Some(&d0), Some(&d1), Some(&p0), Some(&p1)) =
+            (cum.get(k), cum.get(k + 1), pts.get(k), pts.get(k + 1))
+        else {
+            continue;
+        };
+        if target_d <= d1 + 1e-9 && d1 > d0 + 1e-9 {
+            let t = ((target_d - d0) / (d1 - d0)).clamp(0.0, 1.0);
+            return Some((p0.0 + t * (p1.0 - p0.0), p0.1 + t * (p1.1 - p0.1)));
+        }
+    }
+    pts.last().copied()
+}
+
+struct ScarfSubdivision {
+    ramp_pts: Vec<(f64, f64, f64)>,
+    body_pts: Vec<(f64, f64)>,
+}
+
+fn subdivide_loop_for_scarf(
+    points_mm: &[(f64, f64)],
+    scarf_len_mm: f64,
+    steps: usize,
+) -> Option<ScarfSubdivision> {
+    if points_mm.len() < 4 || steps == 0 || scarf_len_mm <= 0.0 {
+        return None;
+    }
+    let mut cum = Vec::with_capacity(points_mm.len());
+    cum.push(0.0);
+    let mut acc = 0.0;
+    for pair in points_mm.windows(2) {
+        let (Some(&a), Some(&b)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        acc += (b.0 - a.0).hypot(b.1 - a.1);
+        cum.push(acc);
+    }
+    let total_p = *cum.last()?;
+    if total_p <= 1e-4 {
+        return None;
+    }
+    let eff_len = scarf_len_mm.min(total_p);
+
+    let mut dists = Vec::with_capacity(steps + cum.len() + 2);
+    dists.push(0.0);
+    for s in 1..steps {
+        dists.push((s as f64 / steps as f64) * eff_len);
+    }
+    for &cd in &cum {
+        if cd > 1e-4 && cd < eff_len - 1e-4 {
+            dists.push(cd);
+        }
+    }
+    dists.push(eff_len);
+    dists.sort_by(f64::total_cmp);
+
+    let mut clean_dists: Vec<f64> = Vec::with_capacity(dists.len());
+    for d in dists {
+        if let Some(&prev) = clean_dists.last()
+            && (d - prev).abs() < 1e-4
+        {
+            continue;
+        }
+        clean_dists.push(d);
+    }
+    if let Some(last) = clean_dists.last_mut()
+        && (*last - eff_len).abs() >= 1e-6
+    {
+        if eff_len - *last < 1e-4 {
+            *last = eff_len;
+        } else {
+            clean_dists.push(eff_len);
+        }
+    }
+
+    let mut ramp_pts = Vec::with_capacity(clean_dists.len());
+    for s in clean_dists {
+        let pt = sample_polyline_at_dist(points_mm, &cum, s)?;
+        ramp_pts.push((pt.0, pt.1, s));
+    }
+
+    let mut body_pts = Vec::new();
+    if eff_len < total_p - 1e-4 {
+        let split_pt = sample_polyline_at_dist(points_mm, &cum, eff_len)?;
+        body_pts.push(split_pt);
+        for (&pt, &cd) in points_mm.iter().zip(cum.iter()) {
+            if cd > eff_len + 1e-4 {
+                body_pts.push(pt);
+            }
+        }
+        if let Some(&end_pt) = points_mm.last()
+            && body_pts
+                .last()
+                .is_some_and(|p| (p.0 - end_pt.0).hypot(p.1 - end_pt.1) > 1e-4)
+        {
+            body_pts.push(end_pt);
+        }
+    }
+
+    Some(ScarfSubdivision { ramp_pts, body_pts })
 }
 
 #[inline]
@@ -1121,6 +1452,10 @@ pub struct GcodeReport {
     pub accel_commands_count: usize,
     #[serde(default)]
     pub pressure_advance_commands_count: usize,
+    #[serde(default)]
+    pub arc_moves_count: usize,
+    #[serde(default)]
+    pub scarf_ramp_moves_count: usize,
 }
 
 /// Evaluate physical invariants from any Marlin/Klipper G-code file (LayerCraft or external oracle).
@@ -1155,6 +1490,8 @@ pub fn evaluate_gcode(
     let mut layer_z_mm: Vec<f64> = Vec::new();
     let mut max_active_z = 0.0f64;
     let mut last_extrusion_z: Option<f64> = None;
+    let mut current_declared_layer_z: Option<f64> = None;
+    let mut prev_layer_max_z = 0.0f64;
 
     let mut max_speed_mm_s = 0.0f64;
     let mut max_volumetric_flow_mm3_s = 0.0f64;
@@ -1165,6 +1502,8 @@ pub fn evaluate_gcode(
     let mut wipe_moves_count = 0usize;
     let mut accel_commands_count = 0usize;
     let mut pressure_advance_commands_count = 0usize;
+    let mut arc_moves_count = 0usize;
+    let mut scarf_ramp_moves_count = 0usize;
 
     let mut min_ex_x = f64::INFINITY;
     let mut min_ex_y = f64::INFINITY;
@@ -1182,6 +1521,17 @@ pub fn evaluate_gcode(
         }
         if trimmed == ";LAYER_CHANGE" {
             layer_change_count += 1;
+            prev_layer_max_z = prev_layer_max_z.max(max_active_z);
+            current_declared_layer_z = None;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(";Z:") {
+            if let Ok(zval) = rest.trim().parse::<f64>()
+                && zval.is_finite()
+                && zval > 0.0
+            {
+                current_declared_layer_z = Some(zval);
+            }
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix(";TYPE:") {
@@ -1346,12 +1696,20 @@ pub fn evaluate_gcode(
                     };
 
                     if net_de > 1e-7 && xy_dist > 1e-5 && !is_custom {
-                        if let Some(prev_z) = last_extrusion_z
+                        if current_declared_layer_z.is_some() {
+                            if tz + 1e-4 < prev_layer_max_z {
+                                safety.z_regressions += 1;
+                            }
+                        } else if let Some(prev_z) = last_extrusion_z
                             && tz + 1e-4 < prev_z
                         {
                             safety.z_regressions += 1;
                         }
                         last_extrusion_z = Some(tz);
+
+                        if current_feature == "Outer wall" && (tz - cur_z).abs() > 1e-4 {
+                            scarf_ramp_moves_count += 1;
+                        }
 
                         let vol = net_de * fil_area;
                         total_e_mm += net_de;
@@ -1368,12 +1726,14 @@ pub fn evaluate_gcode(
                             }
                         }
 
-                        if tz > 0.0 {
-                            max_active_z = max_active_z.max(tz);
-                            let already =
-                                layer_z_mm.last().is_some_and(|&lz| (lz - tz).abs() < 1e-3);
+                        let record_z = current_declared_layer_z.unwrap_or(tz);
+                        if record_z > 0.0 {
+                            max_active_z = max_active_z.max(tz).max(record_z);
+                            let already = layer_z_mm
+                                .last()
+                                .is_some_and(|&lz| (lz - record_z).abs() < 1e-3);
                             if !already {
-                                layer_z_mm.push(tz);
+                                layer_z_mm.push(record_z);
                             }
                         }
 
@@ -1397,7 +1757,7 @@ pub fn evaluate_gcode(
                             }
 
                             segments.push(GcodeExtrusionSegment {
-                                z_mm: tz,
+                                z_mm: record_z,
                                 x0_mm: cur_x,
                                 y0_mm: cur_y,
                                 x1_mm: tx,
@@ -1409,6 +1769,178 @@ pub fn evaluate_gcode(
                     }
                 } else if xy_dist > 1e-5 {
                     total_travel_mm += xy_dist;
+                }
+
+                if next_x.is_some() || next_y.is_some() {
+                    has_xy = true;
+                }
+                cur_x = tx;
+                cur_y = ty;
+                cur_z = tz;
+            }
+            "G2" | "G3" => {
+                let cw = cmd == "G2";
+                let mut next_x = None;
+                let mut next_y = None;
+                let mut next_z = None;
+                let mut off_i = 0.0;
+                let mut off_j = 0.0;
+                let mut next_e = None;
+
+                for tok in tokens {
+                    let Some(first) = tok.chars().next() else {
+                        continue;
+                    };
+                    let val_str = tok.get(first.len_utf8()..).unwrap_or("");
+                    let Ok(val) = val_str.parse::<f64>() else {
+                        continue;
+                    };
+                    if !val.is_finite() {
+                        safety.non_finite_values += 1;
+                        continue;
+                    }
+                    match first {
+                        'X' => next_x = Some(if abs_xyz { val } else { cur_x + val }),
+                        'Y' => next_y = Some(if abs_xyz { val } else { cur_y + val }),
+                        'Z' => next_z = Some(if abs_xyz { val } else { cur_z + val }),
+                        'I' => off_i = val,
+                        'J' => off_j = val,
+                        'E' => next_e = Some(val),
+                        'F' if val > 0.0 => cur_feed_mm_min = val,
+                        _ => {}
+                    }
+                }
+
+                let tx = next_x.unwrap_or(cur_x);
+                let ty = next_y.unwrap_or(cur_y);
+                let tz = next_z.unwrap_or(cur_z);
+                let cx = cur_x + off_i;
+                let cy = cur_y + off_j;
+                let r = off_i.hypot(off_j);
+                let is_custom = current_feature.eq_ignore_ascii_case("Custom");
+
+                let arc_sweep = if r > 1e-6 {
+                    let a0 = (cur_y - cy).atan2(cur_x - cx);
+                    let a1 = (ty - cy).atan2(tx - cx);
+                    let mut sw = if cw { a0 - a1 } else { a1 - a0 };
+                    while sw <= 1e-9 {
+                        sw += TAU;
+                    }
+                    if sw > TAU + 1e-9 {
+                        sw %= TAU;
+                    }
+                    sw
+                } else {
+                    0.0
+                };
+                let arc_len = r * arc_sweep;
+
+                let de_raw = match next_e {
+                    Some(e_val) => {
+                        if abs_e {
+                            let d = e_val - cur_e;
+                            cur_e = e_val;
+                            d
+                        } else {
+                            e_val
+                        }
+                    }
+                    None => 0.0,
+                };
+
+                if !is_custom && arc_len > 1e-5 {
+                    arc_moves_count += 1;
+                }
+
+                if de_raw > 1e-7 {
+                    let net_de = if retraction_debt_mm > 0.0 {
+                        let pay = retraction_debt_mm.min(de_raw);
+                        retraction_debt_mm -= pay;
+                        de_raw - pay
+                    } else {
+                        de_raw
+                    };
+
+                    if net_de > 1e-7 && arc_len > 1e-5 && !is_custom {
+                        if current_declared_layer_z.is_some() {
+                            if tz + 1e-4 < prev_layer_max_z {
+                                safety.z_regressions += 1;
+                            }
+                        } else if let Some(prev_z) = last_extrusion_z
+                            && tz + 1e-4 < prev_z
+                        {
+                            safety.z_regressions += 1;
+                        }
+                        last_extrusion_z = Some(tz);
+
+                        let vol = net_de * fil_area;
+                        total_e_mm += net_de;
+                        *feature_volumes_mm3
+                            .entry(current_feature.clone())
+                            .or_insert(0.0) += vol;
+
+                        if cur_feed_mm_min > 0.0 {
+                            let speed_mm_s = cur_feed_mm_min / 60.0;
+                            let dt = arc_len / speed_mm_s;
+                            if dt > 1e-9 {
+                                max_speed_mm_s = max_speed_mm_s.max(speed_mm_s);
+                                max_volumetric_flow_mm3_s = max_volumetric_flow_mm3_s.max(vol / dt);
+                            }
+                        }
+
+                        let record_z = current_declared_layer_z.unwrap_or(tz);
+                        if record_z > 0.0 {
+                            max_active_z = max_active_z.max(tz).max(record_z);
+                            let already = layer_z_mm
+                                .last()
+                                .is_some_and(|&lz| (lz - record_z).abs() < 1e-3);
+                            if !already {
+                                layer_z_mm.push(record_z);
+                            }
+                        }
+
+                        if has_xy {
+                            has_extrusion = true;
+                            let n_steps =
+                                (arc_sweep / 5.0_f64.to_radians()).ceil().clamp(4.0, 64.0) as usize;
+                            let a0 = (cur_y - cy).atan2(cur_x - cx);
+                            let dir = if cw { -1.0 } else { 1.0 };
+                            let seg_vol = vol / (n_steps as f64);
+                            let mut prev_p = (cur_x, cur_y);
+                            for step in 1..=n_steps {
+                                let p_next = if step == n_steps {
+                                    (tx, ty)
+                                } else {
+                                    let t = (step as f64) / (n_steps as f64);
+                                    let ang = a0 + dir * t * arc_sweep;
+                                    (cx + r * ang.cos(), cy + r * ang.sin())
+                                };
+                                min_ex_x = min_ex_x.min(prev_p.0).min(p_next.0);
+                                min_ex_y = min_ex_y.min(prev_p.1).min(p_next.1);
+                                max_ex_x = max_ex_x.max(prev_p.0).max(p_next.0);
+                                max_ex_y = max_ex_y.max(prev_p.1).max(p_next.1);
+                                if p_next.0 < -1.0
+                                    || p_next.1 < -1.0
+                                    || p_next.0 > bed_width_mm + 1.0
+                                    || p_next.1 > bed_depth_mm + 1.0
+                                {
+                                    safety.out_of_bounds_moves += 1;
+                                }
+                                segments.push(GcodeExtrusionSegment {
+                                    z_mm: record_z,
+                                    x0_mm: prev_p.0,
+                                    y0_mm: prev_p.1,
+                                    x1_mm: p_next.0,
+                                    y1_mm: p_next.1,
+                                    volume_mm3: seg_vol,
+                                    feature: current_feature.clone(),
+                                });
+                                prev_p = p_next;
+                            }
+                        }
+                    }
+                } else if arc_len > 1e-5 {
+                    total_travel_mm += arc_len;
                 }
 
                 if next_x.is_some() || next_y.is_some() {
@@ -1447,6 +1979,8 @@ pub fn evaluate_gcode(
         wipe_moves_count,
         accel_commands_count,
         pressure_advance_commands_count,
+        arc_moves_count,
+        scarf_ramp_moves_count,
     };
 
     Ok((report, segments))
@@ -1978,5 +2512,73 @@ mod tests {
             assert_eq!(rep.pressure_advance_commands_count, 1);
             assert!(rep.accel_commands_count >= 1);
         }
+    }
+
+    #[test]
+    fn arc_fitting_compresses_cylinder_and_preserves_iou() {
+        let cyl = make_cylinder(12.0, 2.0, 64);
+
+        let mut cfg_lin = PrintConfig::default();
+        cfg_lin.process.arc_fitting = false;
+        let plate = slice_single_mesh(&cyl, &cfg_lin).unwrap();
+        let out_lin = emit_gcode(&plate, &cfg_lin).unwrap();
+        let (rep_lin, segs_lin) = evaluate_gcode(&out_lin.gcode, 1.75, 250.0, 250.0).unwrap();
+
+        let mut cfg_arc = cfg_lin;
+        cfg_arc.process.arc_fitting = true;
+        cfg_arc.process.arc_tolerance_mm = 0.025;
+        let out_arc = emit_gcode(&plate, &cfg_arc).unwrap();
+        let (rep_arc, segs_arc) = evaluate_gcode(&out_arc.gcode, 1.75, 250.0, 250.0).unwrap();
+
+        assert!(rep_arc.safety.is_clean(), "{:?}", rep_arc.safety);
+        assert!(rep_arc.arc_moves_count > 10);
+        assert!(out_arc.gcode.lines().count() < out_lin.gcode.lines().count());
+
+        let rel_vol_diff = (rep_arc.total_filament_volume_mm3 - rep_lin.total_filament_volume_mm3)
+            .abs()
+            / rep_lin.total_filament_volume_mm3.max(1e-6);
+        assert!(
+            rel_vol_diff < 0.01,
+            "arc volume diff {rel_vol_diff:.4} too large"
+        );
+
+        let iou = compare_layer_iou(&segs_lin, &segs_arc, 0.25, 0.21);
+        assert!(
+            iou.mean_layer_iou > 0.95,
+            "arc IoU {:.4} <= 0.95",
+            iou.mean_layer_iou
+        );
+    }
+
+    #[test]
+    fn scarf_seam_ramps_z_conserves_volume_and_preserves_layer_count() {
+        let cyl = make_cylinder(10.0, 4.0, 48);
+
+        let mut cfg_base = PrintConfig::default();
+        cfg_base.process.scarf_seam.enabled = false;
+        let plate = slice_single_mesh(&cyl, &cfg_base).unwrap();
+        let out_base = emit_gcode(&plate, &cfg_base).unwrap();
+        let (rep_base, _) = evaluate_gcode(&out_base.gcode, 1.75, 250.0, 250.0).unwrap();
+
+        let mut cfg_scarf = cfg_base;
+        cfg_scarf.process.scarf_seam.enabled = true;
+        cfg_scarf.process.scarf_seam.length_mm = 12.0;
+        cfg_scarf.process.scarf_seam.steps = 10;
+        cfg_scarf.process.scarf_seam.start_height_ratio = 0.10;
+        let out_scarf = emit_gcode(&plate, &cfg_scarf).unwrap();
+        let (rep_scarf, _) = evaluate_gcode(&out_scarf.gcode, 1.75, 250.0, 250.0).unwrap();
+
+        assert!(rep_scarf.safety.is_clean(), "{:?}", rep_scarf.safety);
+        assert_eq!(rep_scarf.safety.z_regressions, 0);
+        assert_eq!(rep_scarf.active_layer_count, rep_base.active_layer_count);
+        assert!(rep_scarf.scarf_ramp_moves_count > 10);
+
+        let rel_vol_diff =
+            (rep_scarf.total_filament_volume_mm3 - rep_base.total_filament_volume_mm3).abs()
+                / rep_base.total_filament_volume_mm3.max(1e-6);
+        assert!(
+            rel_vol_diff < 0.02,
+            "scarf volume diff {rel_vol_diff:.4} too large"
+        );
     }
 }

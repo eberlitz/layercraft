@@ -1,0 +1,13 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_ironing": true,
+  "require_arcs": true,
+  "require_scarf_seams": true,
+  "forbid_center_extrusion_mm": [
+    125.0,
+    125.0
+  ],
+  "max_profile_warnings": 0
+}

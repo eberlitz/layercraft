@@ -245,9 +245,89 @@ pub struct ProcessConfig {
     pub inner_wall_acceleration_mm_s2: Option<f64>,
     pub first_layer_acceleration_mm_s2: Option<f64>,
     pub travel_acceleration_mm_s2: Option<f64>,
+    pub ironing: IroningConfig,
+    pub scarf_seam: ScarfSeamConfig,
+    pub arc_fitting: bool,
+    pub arc_tolerance_mm: f64,
     pub support: SupportConfig,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
+}
+
+/// Top-surface ironing scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IroningType {
+    #[default]
+    Off,
+    TopmostSurface,
+    AllTopSurfaces,
+}
+
+impl IroningType {
+    /// All supported ironing modes.
+    pub const ALL: [Self; 3] = [Self::Off, Self::TopmostSurface, Self::AllTopSurfaces];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::TopmostSurface => "Topmost surface",
+            Self::AllTopSurfaces => "All top surfaces",
+        }
+    }
+}
+
+/// Top-surface ironing pass parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct IroningConfig {
+    pub mode: IroningType,
+    pub flow_ratio: f64,
+    pub line_spacing_mm: f64,
+    pub inset_mm: f64,
+    pub speed_mm_s: f64,
+    pub angle_offset_deg: f64,
+}
+
+impl Default for IroningConfig {
+    fn default() -> Self {
+        Self {
+            mode: IroningType::Off,
+            flow_ratio: 0.10,
+            line_spacing_mm: 0.10,
+            inset_mm: 0.21,
+            speed_mm_s: 30.0,
+            angle_offset_deg: 45.0,
+        }
+    }
+}
+
+/// Ramped outer-wall scarf seam parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ScarfSeamConfig {
+    pub enabled: bool,
+    pub length_mm: f64,
+    pub min_length_mm: f64,
+    pub steps: u16,
+    pub start_height_ratio: f64,
+    pub flow_ratio: f64,
+    pub entire_loop: bool,
+}
+
+impl Default for ScarfSeamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            length_mm: 15.0,
+            min_length_mm: 5.0,
+            steps: 10,
+            start_height_ratio: 0.10,
+            flow_ratio: 1.0,
+            entire_loop: false,
+        }
+    }
 }
 
 /// Support structure style dialect.
@@ -345,6 +425,10 @@ impl Default for ProcessConfig {
             inner_wall_acceleration_mm_s2: None,
             first_layer_acceleration_mm_s2: None,
             travel_acceleration_mm_s2: None,
+            ironing: IroningConfig::default(),
+            scarf_seam: ScarfSeamConfig::default(),
+            arc_fitting: false,
+            arc_tolerance_mm: 0.025,
             support: SupportConfig::default(),
             skirt_loops: 0,
             brim_width_mm: 0.0,
@@ -630,6 +714,69 @@ impl PrintConfig {
         )?;
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
+        let ir = &self.process.ironing;
+        for (field, val, min, max) in [
+            ("process.ironing.flow_ratio", ir.flow_ratio, 0.01, 0.5),
+            (
+                "process.ironing.line_spacing_mm",
+                ir.line_spacing_mm,
+                0.04,
+                1.0,
+            ),
+            ("process.ironing.inset_mm", ir.inset_mm, 0.0, 5.0),
+            (
+                "process.ironing.angle_offset_deg",
+                ir.angle_offset_deg,
+                -180.0,
+                180.0,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+        check_pos("process.ironing.speed_mm_s", ir.speed_mm_s)?;
+
+        let sc = &self.process.scarf_seam;
+        for (field, val, min, max) in [
+            ("process.scarf_seam.length_mm", sc.length_mm, 1.0, 200.0),
+            (
+                "process.scarf_seam.min_length_mm",
+                sc.min_length_mm,
+                0.5,
+                200.0,
+            ),
+            (
+                "process.scarf_seam.start_height_ratio",
+                sc.start_height_ratio,
+                0.02,
+                0.50,
+            ),
+            ("process.scarf_seam.flow_ratio", sc.flow_ratio, 0.5, 1.5),
+            (
+                "process.arc_tolerance_mm",
+                self.process.arc_tolerance_mm,
+                0.002,
+                0.5,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+        if !(2..=64).contains(&sc.steps) {
+            return Err(ConfigError::Invalid {
+                field: "process.scarf_seam.steps",
+                reason: "must be within 2..=64",
+            });
+        }
+
         for (field, opt_accel) in [
             (
                 "process.default_acceleration_mm_s2",
@@ -808,5 +955,25 @@ mod tests {
             c.process.default_acceleration_mm_s2 = Some(bad_acc);
             assert!(c.validate().is_err());
         }
+
+        let mut bad_iron = PrintConfig::default();
+        bad_iron.process.ironing.flow_ratio = 0.8;
+        assert!(bad_iron.validate().is_err());
+        bad_iron.process.ironing.flow_ratio = 0.10;
+        bad_iron.process.ironing.line_spacing_mm = 0.01;
+        assert!(bad_iron.validate().is_err());
+        bad_iron.process.ironing.line_spacing_mm = 0.10;
+        bad_iron.process.ironing.speed_mm_s = 0.0;
+        assert!(bad_iron.validate().is_err());
+
+        let mut bad_scarf = PrintConfig::default();
+        bad_scarf.process.scarf_seam.steps = 1;
+        assert!(bad_scarf.validate().is_err());
+        bad_scarf.process.scarf_seam.steps = 10;
+        bad_scarf.process.scarf_seam.start_height_ratio = 0.9;
+        assert!(bad_scarf.validate().is_err());
+        bad_scarf.process.scarf_seam.start_height_ratio = 0.10;
+        bad_scarf.process.arc_tolerance_mm = 0.0001;
+        assert!(bad_scarf.validate().is_err());
     }
 }

@@ -1,0 +1,24 @@
+{
+  "name": "002-ironing-topmost-only",
+  "description": "Stepped block with TopmostSurface ironing restricting smoothing strictly to topmost layer",
+  "shape": {
+    "kind": "stepped_block",
+    "base_width_mm": 20.0,
+    "base_depth_mm": 20.0,
+    "base_height_mm": 4.0,
+    "top_width_mm": 10.0,
+    "top_depth_mm": 10.0,
+    "top_height_mm": 4.0
+  },
+  "config": {
+    "process": {
+      "ironing": {
+        "mode": "topmost_surface",
+        "flow_ratio": 0.10,
+        "line_spacing_mm": 0.10,
+        "inset_mm": 0.21,
+        "speed_mm_s": 30.0
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_scarf_seams": true,
+  "require_gcode_contains": [
+    ";SCARF_START",
+    ";SCARF_END"
+  ]
+}

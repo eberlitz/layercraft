@@ -6,7 +6,7 @@ use layercraft_clip::{
     ClipError, JoinType, clip_lines, clip_polylines, clip_polylines_difference, difference,
     intersection, offset, union,
 };
-use layercraft_config::{InfillPattern, PrintConfig, SupportStyle};
+use layercraft_config::{InfillPattern, IroningType, PrintConfig, SupportStyle};
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
 use layercraft_mesh::{MeshError, RawSliceLayer, prepare_for_plate, slice_mesh};
 use schemars::JsonSchema;
@@ -36,6 +36,7 @@ pub enum ExtrusionRole {
     OverhangWall,
     BottomSurface,
     TopSurface,
+    Ironing,
     InternalSolidInfill,
     Bridge,
     SparseInfill,
@@ -54,6 +55,7 @@ impl ExtrusionRole {
             Self::OverhangWall => "Overhang wall",
             Self::BottomSurface => "Bottom surface",
             Self::TopSurface => "Top surface",
+            Self::Ironing => "Ironing",
             Self::InternalSolidInfill => "Internal solid infill",
             Self::Bridge => "Bridge",
             Self::SparseInfill => "Sparse infill",
@@ -448,6 +450,49 @@ pub fn slice_from_raw_layers(
             }
         }
 
+        // Stage 6 (Optional): Top-surface ironing pass.
+        let iron = &config.process.ironing;
+        let iron_here = match iron.mode {
+            IroningType::Off => false,
+            IroningType::TopmostSurface => idx + 1 == n,
+            IroningType::AllTopSurfaces => true,
+        };
+        if iron_here && !raw.regions.is_empty() {
+            let above = raw_layers
+                .get(idx + 1)
+                .map(|l| l.regions.as_slice())
+                .unwrap_or(&[]);
+            let exposed_top = difference(&raw.regions, above)?;
+            if !exposed_top.is_empty() {
+                let iron_regions = if iron.inset_mm > 1e-4 {
+                    offset(
+                        &exposed_top,
+                        -mm_to_nm(iron.inset_mm)?,
+                        JoinType::Miter { limit: 2.0 },
+                    )?
+                } else {
+                    exposed_top
+                };
+                if !iron_regions.is_empty() {
+                    let iron_angle = solid_angle + iron.angle_offset_deg.to_radians();
+                    let scaled_flow = (iron.flow_ratio * iron.line_spacing_mm / solid_w).max(0.005);
+                    let iron_paths = generate_rectilinear_hatch(
+                        &iron_regions,
+                        iron_angle,
+                        iron.line_spacing_mm,
+                        0.0,
+                        true,
+                        ExtrusionRole::Ironing,
+                        solid_w,
+                        h,
+                        iron.speed_mm_s,
+                        scaled_flow,
+                    )?;
+                    paths.extend(iron_paths);
+                }
+            }
+        }
+
         let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
 
         layers.push(SlicedLayer {
@@ -500,7 +545,7 @@ fn apply_flow_and_cooling(
         ) {
             has_bridge_or_overhang = true;
         }
-        let eff_area = bead_area_mm2(path.width_mm, path.height_mm) * path.flow_ratio.max(0.01);
+        let eff_area = bead_area_mm2(path.width_mm, path.height_mm) * path.flow_ratio.max(0.001);
         if eff_area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
             path.speed_mm_s = path.speed_mm_s.min(max_vol_flow / eff_area);
         }
@@ -2096,5 +2141,51 @@ mod tests {
             sup_above_gap,
             "expected supports between lower and upper C-arms"
         );
+    }
+
+    #[test]
+    fn ironing_modes_differentiate_topmost_and_all_top_surfaces() {
+        let base = make_box_mesh(20.0, 20.0, 4.0);
+        let mut top = make_box_mesh(10.0, 10.0, 4.0);
+        top.translate(5.0, 5.0, 4.0).unwrap();
+        let mesh = TriangleMesh::merge(&[base, top]).unwrap();
+        let has_ironing =
+            |l: &SlicedLayer| l.paths.iter().any(|p| p.role == ExtrusionRole::Ironing);
+
+        // TopmostSurface: irons ONLY the last layer (layer 39), NOT step ledge at layer 19.
+        let mut cfg_topmost = PrintConfig::default();
+        cfg_topmost.process.ironing.mode = IroningType::TopmostSurface;
+        let plate_top = slice_single_mesh(&mesh, &cfg_topmost).unwrap();
+        let top_ironed_layers: Vec<usize> = plate_top
+            .layers
+            .iter()
+            .filter(|l| has_ironing(l))
+            .map(|l| l.index)
+            .collect();
+        assert_eq!(top_ironed_layers, vec![plate_top.layers.len() - 1]);
+
+        // AllTopSurfaces: irons BOTH step ledge (layer 19) AND topmost layer (layer 39).
+        let mut cfg_all = PrintConfig::default();
+        cfg_all.process.ironing.mode = IroningType::AllTopSurfaces;
+        let plate_all = slice_single_mesh(&mesh, &cfg_all).unwrap();
+        let all_ironed_layers: Vec<usize> = plate_all
+            .layers
+            .iter()
+            .filter(|l| has_ironing(l))
+            .map(|l| l.index)
+            .collect();
+        assert_eq!(all_ironed_layers, vec![19, plate_all.layers.len() - 1]);
+
+        // Verify scaled flow ratio stays low-flow on ironing paths.
+        let sample_flow = plate_all
+            .layers
+            .last()
+            .unwrap()
+            .paths
+            .iter()
+            .find(|p| p.role == ExtrusionRole::Ironing)
+            .unwrap()
+            .flow_ratio;
+        assert!(sample_flow > 0.005 && sample_flow < 0.05);
     }
 }
