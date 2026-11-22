@@ -31,6 +31,18 @@ struct LadderExpected {
     require_sparse_infill: bool,
     #[serde(default)]
     forbid_center_extrusion_mm: Option<[f64; 2]>,
+    #[serde(default)]
+    max_volumetric_flow_mm3_s: Option<f64>,
+    #[serde(default)]
+    require_first_layer_fan_off: bool,
+    #[serde(default)]
+    min_fan_pwm: Option<u8>,
+    #[serde(default)]
+    require_z_hops: bool,
+    #[serde(default)]
+    require_wipes: bool,
+    #[serde(default)]
+    require_gcode_contains: Vec<String>,
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
@@ -154,6 +166,39 @@ pub fn run(root: &Path) -> Result<(), String> {
                     errs.push(format!(
                         "extrusion intruded into clear hole near ({cx}, {cy})"
                     ));
+                }
+            }
+            if let Some(limit) = exp.max_volumetric_flow_mm3_s
+                && rep.max_volumetric_flow_mm3_s > limit + 0.05
+            {
+                errs.push(format!(
+                    "volumetric flow {:.2} mm3/s exceeded cap {:.2} mm3/s",
+                    rep.max_volumetric_flow_mm3_s, limit
+                ));
+            }
+            if exp.require_first_layer_fan_off && rep.first_layer_max_fan_pwm != 0 {
+                errs.push(format!(
+                    "first layer fan PWM {} != 0",
+                    rep.first_layer_max_fan_pwm
+                ));
+            }
+            if let Some(min_pwm) = exp.min_fan_pwm
+                && rep.max_fan_pwm < min_pwm
+            {
+                errs.push(format!(
+                    "max fan PWM {} below required {min_pwm}",
+                    rep.max_fan_pwm
+                ));
+            }
+            if exp.require_z_hops && rep.z_hop_count == 0 {
+                errs.push("missing Z-hop retraction lifts".to_owned());
+            }
+            if exp.require_wipes && rep.wipe_moves_count == 0 {
+                errs.push("missing wipe-on-retract moves".to_owned());
+            }
+            for needle in &exp.require_gcode_contains {
+                if !out.gcode.contains(needle) {
+                    errs.push(format!("missing expected G-code substring `{needle}`"));
                 }
             }
 

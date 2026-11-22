@@ -1,0 +1,23 @@
+{
+  "name": "004-custom-macros-temps",
+  "description": "20 x 20 x 6 mm block verifying start/layer/end G-code macro expansion and first-layer temp drop",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 20.0,
+    "height_mm": 6.0
+  },
+  "config": {
+    "machine": {
+      "start_gcode": ";LC_START hot=[first_layer_temperature] bed=[first_layer_bed_temperature] layers=[total_layer_count]\nG28\nM190 S[first_layer_bed_temperature]\nM109 S[first_layer_temperature]",
+      "layer_change_gcode": ";LC_LAYER n=[layer_num] z=[layer_z] h=[layer_height]",
+      "end_gcode": ";LC_END max_z=[max_z] nozzle=[nozzle_temperature]\nM104 S0\nM140 S0\nM84"
+    },
+    "filament": {
+      "nozzle_temp_c": 200,
+      "bed_temp_c": 60,
+      "first_layer_nozzle_temp_c": 215,
+      "first_layer_bed_temp_c": 65
+    }
+  }
+}

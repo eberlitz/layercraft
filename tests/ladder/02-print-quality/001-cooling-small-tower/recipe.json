@@ -1,0 +1,20 @@
+{
+  "name": "001-cooling-small-tower",
+  "description": "6 x 6 x 10 mm tower testing first-layer fan disable, cooling boost & layer-time slowdown",
+  "shape": {
+    "kind": "box",
+    "width_mm": 6.0,
+    "depth_mm": 6.0,
+    "height_mm": 10.0
+  },
+  "config": {
+    "filament": {
+      "fan_min_percent": 35,
+      "fan_max_percent": 100,
+      "disable_fan_first_layers": 1,
+      "full_fan_speed_layer": 4,
+      "slow_down_layer_time_s": 8.0,
+      "slow_down_min_speed_mm_s": 15.0
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "layer_count": 30,
+  "max_z_mm": 6.0,
+  "require_outer_wall": true,
+  "require_top_surface": true,
+  "require_bottom_surface": true,
+  "require_sparse_infill": true,
+  "require_gcode_contains": [
+    ";LC_START hot=215 bed=65 layers=30",
+    "M190 S65",
+    "M109 S215",
+    ";LC_LAYER n=0 z=0.2 h=0.2",
+    "M104 S200",
+    "M140 S60",
+    ";LC_LAYER n=29 z=6 h=0.2",
+    ";LC_END max_z=6 nozzle=200"
+  ]
+}

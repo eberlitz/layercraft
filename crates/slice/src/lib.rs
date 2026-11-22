@@ -1,6 +1,6 @@
 //! Deterministic FDM slicing pipeline: slice -> perimeters -> skins -> infill -> adhesion.
 
-use std::f64::consts::FRAC_PI_4;
+use std::f64::consts::{FRAC_PI_4, PI};
 
 use layercraft_clip::{ClipError, JoinType, clip_lines, difference, intersection, offset, union};
 use layercraft_config::{InfillPattern, PrintConfig};
@@ -73,12 +73,26 @@ pub struct SlicedLayer {
     pub height_mm: f64,
     pub slice_regions: Vec<ExPolygon>,
     pub paths: Vec<ExtrusionPath>,
+    #[serde(default)]
+    pub fan_percent: u8,
+    #[serde(default)]
+    pub estimated_time_s: f64,
 }
 
 /// Output of slicing a single plate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SlicedPlate {
     pub layers: Vec<SlicedLayer>,
+}
+
+/// Stadium cross-sectional area (`mm^2`) of an extrusion bead of width `w` and height `h`.
+#[inline]
+pub fn bead_area_mm2(width_mm: f64, height_mm: f64) -> f64 {
+    if width_mm >= height_mm {
+        (width_mm - height_mm) * height_mm + PI * (0.5 * height_mm) * (0.5 * height_mm)
+    } else {
+        PI * (0.5 * width_mm) * (0.5 * width_mm)
+    }
 }
 
 /// Stadium cross-section line spacing between adjacent beads of width `w` and height `h`.
@@ -214,19 +228,28 @@ pub fn slice_from_raw_layers(
         let sparse_region = difference(infill_here, &solid_union)?;
 
         let solid_speed = if is_first {
-            config.process.first_layer_speed_mm_s
+            config.process.effective_first_layer_infill_speed_mm_s()
         } else {
-            config.process.infill_speed_mm_s
+            config.process.effective_solid_infill_speed_mm_s()
+        };
+        let top_speed = if is_first {
+            config.process.effective_first_layer_infill_speed_mm_s()
+        } else {
+            config.process.effective_top_surface_speed_mm_s()
         };
         let solid_w = config.process.solid_infill_width_mm;
         let solid_spacing = stadium_spacing_mm(solid_w, h);
         let solid_angle = if idx % 2 == 0 { FRAC_PI_4 } else { -FRAC_PI_4 };
 
         // Emit solid infill categories.
-        for (region, role) in [
-            (&bottom_here, ExtrusionRole::BottomSurface),
-            (&top_here, ExtrusionRole::TopSurface),
-            (&internal_solid, ExtrusionRole::InternalSolidInfill),
+        for (region, role, speed) in [
+            (&bottom_here, ExtrusionRole::BottomSurface, solid_speed),
+            (&top_here, ExtrusionRole::TopSurface, top_speed),
+            (
+                &internal_solid,
+                ExtrusionRole::InternalSolidInfill,
+                solid_speed,
+            ),
         ] {
             if !region.is_empty() {
                 let hatched = generate_rectilinear_hatch(
@@ -236,7 +259,7 @@ pub fn slice_from_raw_layers(
                     role,
                     solid_w,
                     h,
-                    solid_speed,
+                    speed,
                 )?;
                 paths.extend(hatched);
             }
@@ -247,7 +270,7 @@ pub fn slice_from_raw_layers(
         if !sparse_region.is_empty() && density > 1e-6 {
             let sparse_w = config.process.sparse_infill_width_mm;
             let sparse_speed = if is_first {
-                config.process.first_layer_speed_mm_s
+                config.process.effective_first_layer_infill_speed_mm_s()
             } else {
                 config.process.infill_speed_mm_s
             };
@@ -286,16 +309,113 @@ pub fn slice_from_raw_layers(
             }
         }
 
+        let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
+
         layers.push(SlicedLayer {
             index: raw.plane.index,
             z_top_mm: raw.plane.z_top_mm,
             height_mm: h,
             slice_regions: raw.regions.clone(),
             paths,
+            fan_percent,
+            estimated_time_s,
         });
     }
 
     Ok(SlicedPlate { layers })
+}
+
+fn path_length_mm(path: &ExtrusionPath) -> f64 {
+    let mut len = 0.0;
+    for pair in path.points.windows(2) {
+        if let (Some(&a), Some(&b)) = (pair.first(), pair.get(1)) {
+            len += a.distance_mm(b);
+        }
+    }
+    if path.closed
+        && let (Some(&first), Some(&last)) = (path.points.first(), path.points.last())
+    {
+        len += last.distance_mm(first);
+    }
+    len
+}
+
+fn apply_flow_and_cooling(
+    layer_idx: usize,
+    paths: &mut [ExtrusionPath],
+    config: &PrintConfig,
+) -> (u8, f64) {
+    let max_vol_flow = config.filament.max_volumetric_speed_mm3_s;
+    let travel_speed = config.machine.travel_speed_mm_s.max(1e-6);
+
+    let mut path_lengths = Vec::with_capacity(paths.len());
+    let mut extrusion_time_s = 0.0;
+    let mut travel_time_s = 0.0;
+    let mut prev_end: Option<Point2> = None;
+
+    for path in paths.iter_mut() {
+        let area = bead_area_mm2(path.width_mm, path.height_mm);
+        if area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
+            path.speed_mm_s = path.speed_mm_s.min(max_vol_flow / area);
+        }
+        let len = path_length_mm(path);
+        path_lengths.push(len);
+        extrusion_time_s += len / path.speed_mm_s.max(1e-6);
+
+        if let Some(&start) = path.points.first() {
+            if let Some(prev) = prev_end {
+                travel_time_s += prev.distance_mm(start) / travel_speed;
+            }
+            prev_end = if path.closed {
+                Some(start)
+            } else {
+                path.points.last().copied()
+            };
+        }
+    }
+
+    let raw_time_s = extrusion_time_s + travel_time_s;
+    let disable_first = config.filament.disable_fan_first_layers as usize;
+    let full_layer = config.filament.full_fan_speed_layer as usize;
+    let min_fan = config.filament.fan_min_percent as f64;
+    let max_fan = config.filament.fan_max_percent as f64;
+
+    let base_fan_pct = if layer_idx < disable_first {
+        0.0
+    } else if full_layer <= disable_first || layer_idx >= full_layer {
+        min_fan
+    } else {
+        let span = (full_layer - disable_first + 1) as f64;
+        let step = (layer_idx - disable_first + 1) as f64;
+        min_fan * (step / span)
+    };
+
+    let mut fan_pct = base_fan_pct;
+    let target = config.filament.slow_down_layer_time_s;
+    if layer_idx >= disable_first && target > 0.0 && raw_time_s > 1e-6 && raw_time_s < target {
+        let t = ((target - raw_time_s) / target).clamp(0.0, 1.0);
+        fan_pct = base_fan_pct + t * (max_fan - base_fan_pct).max(0.0);
+
+        let needed_ext = (target - travel_time_s).max(extrusion_time_s);
+        if needed_ext > extrusion_time_s + 1e-9 {
+            let scale = (extrusion_time_s / needed_ext).clamp(0.0, 1.0);
+            for path in paths.iter_mut() {
+                let floor_speed = config
+                    .filament
+                    .slow_down_min_speed_mm_s
+                    .min(path.speed_mm_s);
+                path.speed_mm_s = (path.speed_mm_s * scale).max(floor_speed);
+            }
+        }
+    }
+
+    let final_ext_time_s: f64 = paths
+        .iter()
+        .zip(path_lengths.iter())
+        .map(|(p, &len)| len / p.speed_mm_s.max(1e-6))
+        .sum();
+    let fan_u8 = fan_pct.round().clamp(0.0, 100.0) as u8;
+    (fan_u8, final_ext_time_s + travel_time_s)
 }
 
 fn build_perimeters(
@@ -682,5 +802,73 @@ mod tests {
                 .iter()
                 .any(|p| p.role == ExtrusionRole::TopSurface)
         );
+    }
+
+    #[test]
+    fn volumetric_flow_cap_clamps_path_speeds() {
+        let mesh = make_box_mesh(20.0, 20.0, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.infill_speed_mm_s = 300.0;
+        cfg.process.outer_wall_speed_mm_s = 220.0;
+        cfg.filament.max_volumetric_speed_mm3_s = 6.0;
+        cfg.filament.slow_down_layer_time_s = 0.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        for layer in &plate.layers {
+            for p in &layer.paths {
+                let flow = bead_area_mm2(p.width_mm, p.height_mm) * p.speed_mm_s;
+                assert!(
+                    flow <= cfg.filament.max_volumetric_speed_mm3_s + 1e-6,
+                    "flow {flow} exceeded cap on layer {}",
+                    layer.index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_tower_triggers_fan_boost_and_cooling_slowdown() {
+        let mesh = make_box_mesh(6.0, 6.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.filament.disable_fan_first_layers = 1;
+        cfg.filament.full_fan_speed_layer = 3;
+        cfg.filament.fan_min_percent = 40;
+        cfg.filament.fan_max_percent = 100;
+        cfg.filament.slow_down_layer_time_s = 8.0;
+        cfg.filament.slow_down_min_speed_mm_s = 12.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        assert_eq!(plate.layers[0].fan_percent, 0);
+        assert!(plate.layers[1].fan_percent > 0);
+        let top_upper = &plate.layers[plate.layers.len() - 2];
+        assert!(top_upper.fan_percent >= 80);
+        assert!(
+            top_upper
+                .paths
+                .iter()
+                .all(|p| p.speed_mm_s < cfg.process.outer_wall_speed_mm_s)
+        );
+    }
+
+    #[test]
+    fn top_surface_speed_override_applies() {
+        let mesh = make_box_mesh(30.0, 30.0, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.top_shell_layers = 2;
+        cfg.process.bottom_shell_layers = 1;
+        cfg.process.top_surface_speed_mm_s = Some(28.0);
+        cfg.filament.slow_down_layer_time_s = 0.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let top_layer = plate.layers.last().unwrap();
+        let top_paths: Vec<_> = top_layer
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::TopSurface)
+            .collect();
+        assert!(!top_paths.is_empty());
+        for p in top_paths {
+            assert!((p.speed_mm_s - 28.0).abs() < 1e-6);
+        }
     }
 }

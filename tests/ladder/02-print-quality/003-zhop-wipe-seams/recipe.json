@@ -1,0 +1,25 @@
+{
+  "name": "003-zhop-wipe-seams",
+  "description": "Hollow tube R15/R8 H6 mm with Z-hop 0.4 mm, wipe-on-retract, aligned seams & relative E",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 15.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 6.0,
+    "segments": 48
+  },
+  "config": {
+    "machine": {
+      "relative_extrusion": true,
+      "retraction_length_mm": 0.8,
+      "retraction_speed_mm_s": 35.0,
+      "z_hop_mm": 0.4,
+      "z_hop_speed_mm_s": 15.0,
+      "wipe_on_retract": true,
+      "wipe_distance_mm": 2.0
+    },
+    "process": {
+      "seam_position": "aligned"
+    }
+  }
+}

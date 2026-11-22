@@ -1,0 +1,19 @@
+{
+  "name": "002-volumetric-flow-cap",
+  "description": "20 x 20 x 10 mm box capping high print speeds to 6.0 mm3/s max volumetric flow",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 20.0,
+    "height_mm": 10.0
+  },
+  "config": {
+    "filament": {
+      "max_volumetric_speed_mm3_s": 6.0
+    },
+    "process": {
+      "outer_wall_speed_mm_s": 180.0,
+      "infill_speed_mm_s": 250.0
+    }
+  }
+}

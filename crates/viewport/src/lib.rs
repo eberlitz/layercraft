@@ -251,7 +251,7 @@ pub fn path_color(
     match mode {
         ColorMode::Feature => role_color(path.role),
         ColorMode::Speed => {
-            let t = ((path.speed_mm_s as f32) - 25.0) / 105.0;
+            let t = ((path.speed_mm_s as f32) - 15.0) / 110.0;
             lerp_color([0.18, 0.42, 0.94], [0.96, 0.30, 0.18], t)
         }
         ColorMode::Layer => {

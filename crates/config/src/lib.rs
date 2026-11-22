@@ -33,6 +33,32 @@ pub enum InfillPattern {
     Grid,
 }
 
+/// Strategy for choosing seam start locations on closed wall loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SeamPosition {
+    #[default]
+    Aligned,
+    Back,
+    Nearest,
+    Random,
+}
+
+impl SeamPosition {
+    /// All seam alignment modes.
+    pub const ALL: [Self; 4] = [Self::Aligned, Self::Back, Self::Nearest, Self::Random];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Aligned => "Aligned",
+            Self::Back => "Back",
+            Self::Nearest => "Nearest",
+            Self::Random => "Random",
+        }
+    }
+}
+
 /// Machine hardware parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -46,6 +72,14 @@ pub struct MachineConfig {
     pub retraction_length_mm: f64,
     pub retraction_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
+    pub z_hop_mm: f64,
+    pub z_hop_speed_mm_s: f64,
+    pub wipe_on_retract: bool,
+    pub wipe_distance_mm: f64,
+    pub min_travel_for_retract_mm: f64,
+    pub start_gcode: Option<String>,
+    pub end_gcode: Option<String>,
+    pub layer_change_gcode: Option<String>,
 }
 
 impl Default for MachineConfig {
@@ -60,6 +94,14 @@ impl Default for MachineConfig {
             retraction_length_mm: 0.8,
             retraction_speed_mm_s: 35.0,
             travel_speed_mm_s: 150.0,
+            z_hop_mm: 0.0,
+            z_hop_speed_mm_s: 15.0,
+            wipe_on_retract: false,
+            wipe_distance_mm: 2.0,
+            min_travel_for_retract_mm: 1.0,
+            start_gcode: None,
+            end_gcode: None,
+            layer_change_gcode: None,
         }
     }
 }
@@ -72,6 +114,15 @@ pub struct FilamentConfig {
     pub density_g_cm3: f64,
     pub nozzle_temp_c: u16,
     pub bed_temp_c: u16,
+    pub first_layer_nozzle_temp_c: Option<u16>,
+    pub first_layer_bed_temp_c: Option<u16>,
+    pub max_volumetric_speed_mm3_s: f64,
+    pub fan_min_percent: u8,
+    pub fan_max_percent: u8,
+    pub disable_fan_first_layers: u16,
+    pub full_fan_speed_layer: u16,
+    pub slow_down_layer_time_s: f64,
+    pub slow_down_min_speed_mm_s: f64,
 }
 
 impl Default for FilamentConfig {
@@ -81,7 +132,28 @@ impl Default for FilamentConfig {
             density_g_cm3: 1.24,
             nozzle_temp_c: 200,
             bed_temp_c: 60,
+            first_layer_nozzle_temp_c: None,
+            first_layer_bed_temp_c: None,
+            max_volumetric_speed_mm3_s: 15.0,
+            fan_min_percent: 35,
+            fan_max_percent: 100,
+            disable_fan_first_layers: 1,
+            full_fan_speed_layer: 4,
+            slow_down_layer_time_s: 8.0,
+            slow_down_min_speed_mm_s: 15.0,
         }
+    }
+}
+
+impl FilamentConfig {
+    /// Nozzle temperature for layer 0 (`first_layer_nozzle_temp_c` if set, else `nozzle_temp_c`).
+    pub fn effective_first_layer_nozzle_temp_c(&self) -> u16 {
+        self.first_layer_nozzle_temp_c.unwrap_or(self.nozzle_temp_c)
+    }
+
+    /// Bed temperature for layer 0 (`first_layer_bed_temp_c` if set, else `bed_temp_c`).
+    pub fn effective_first_layer_bed_temp_c(&self) -> u16 {
+        self.first_layer_bed_temp_c.unwrap_or(self.bed_temp_c)
     }
 }
 
@@ -105,6 +177,10 @@ pub struct ProcessConfig {
     pub inner_wall_speed_mm_s: f64,
     pub infill_speed_mm_s: f64,
     pub first_layer_speed_mm_s: f64,
+    pub seam_position: SeamPosition,
+    pub first_layer_infill_speed_mm_s: Option<f64>,
+    pub top_surface_speed_mm_s: Option<f64>,
+    pub solid_infill_speed_mm_s: Option<f64>,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
 }
@@ -127,9 +203,33 @@ impl Default for ProcessConfig {
             inner_wall_speed_mm_s: 100.0,
             infill_speed_mm_s: 120.0,
             first_layer_speed_mm_s: 30.0,
+            seam_position: SeamPosition::Aligned,
+            first_layer_infill_speed_mm_s: None,
+            top_surface_speed_mm_s: None,
+            solid_infill_speed_mm_s: None,
             skirt_loops: 0,
             brim_width_mm: 0.0,
         }
+    }
+}
+
+impl ProcessConfig {
+    /// First-layer infill speed (`first_layer_infill_speed_mm_s` if set, else `first_layer_speed_mm_s`).
+    pub fn effective_first_layer_infill_speed_mm_s(&self) -> f64 {
+        self.first_layer_infill_speed_mm_s
+            .unwrap_or(self.first_layer_speed_mm_s)
+    }
+
+    /// Top surface speed (`top_surface_speed_mm_s` if set, else `infill_speed_mm_s`).
+    pub fn effective_top_surface_speed_mm_s(&self) -> f64 {
+        self.top_surface_speed_mm_s
+            .unwrap_or(self.infill_speed_mm_s)
+    }
+
+    /// Solid infill / bottom surface speed (`solid_infill_speed_mm_s` if set, else `infill_speed_mm_s`).
+    pub fn effective_solid_infill_speed_mm_s(&self) -> f64 {
+        self.solid_infill_speed_mm_s
+            .unwrap_or(self.infill_speed_mm_s)
     }
 }
 
@@ -181,9 +281,58 @@ impl PrintConfig {
             self.machine.retraction_speed_mm_s,
         )?;
         check_pos("machine.travel_speed_mm_s", self.machine.travel_speed_mm_s)?;
+        check_non_neg("machine.z_hop_mm", self.machine.z_hop_mm)?;
+        if self.machine.z_hop_mm > 50.0 {
+            return Err(ConfigError::Invalid {
+                field: "machine.z_hop_mm",
+                reason: "exceeds 50.0 mm",
+            });
+        }
+        check_pos("machine.z_hop_speed_mm_s", self.machine.z_hop_speed_mm_s)?;
+        check_non_neg("machine.wipe_distance_mm", self.machine.wipe_distance_mm)?;
+        if self.machine.wipe_distance_mm > 50.0 {
+            return Err(ConfigError::Invalid {
+                field: "machine.wipe_distance_mm",
+                reason: "exceeds 50.0 mm",
+            });
+        }
+        check_non_neg(
+            "machine.min_travel_for_retract_mm",
+            self.machine.min_travel_for_retract_mm,
+        )?;
 
         check_pos("filament.diameter_mm", self.filament.diameter_mm)?;
         check_pos("filament.density_g_cm3", self.filament.density_g_cm3)?;
+        check_pos(
+            "filament.max_volumetric_speed_mm3_s",
+            self.filament.max_volumetric_speed_mm3_s,
+        )?;
+        if self.filament.fan_min_percent > 100 {
+            return Err(ConfigError::Invalid {
+                field: "filament.fan_min_percent",
+                reason: "must be <= 100",
+            });
+        }
+        if self.filament.fan_max_percent > 100 {
+            return Err(ConfigError::Invalid {
+                field: "filament.fan_max_percent",
+                reason: "must be <= 100",
+            });
+        }
+        if self.filament.fan_min_percent > self.filament.fan_max_percent {
+            return Err(ConfigError::Invalid {
+                field: "filament.fan_min_percent",
+                reason: "must be <= fan_max_percent",
+            });
+        }
+        check_non_neg(
+            "filament.slow_down_layer_time_s",
+            self.filament.slow_down_layer_time_s,
+        )?;
+        check_pos(
+            "filament.slow_down_min_speed_mm_s",
+            self.filament.slow_down_min_speed_mm_s,
+        )?;
 
         check_pos("process.layer_height_mm", self.process.layer_height_mm)?;
         check_pos(
@@ -227,6 +376,24 @@ impl PrintConfig {
             "process.first_layer_speed_mm_s",
             self.process.first_layer_speed_mm_s,
         )?;
+        for (field, opt_val) in [
+            (
+                "process.first_layer_infill_speed_mm_s",
+                self.process.first_layer_infill_speed_mm_s,
+            ),
+            (
+                "process.top_surface_speed_mm_s",
+                self.process.top_surface_speed_mm_s,
+            ),
+            (
+                "process.solid_infill_speed_mm_s",
+                self.process.solid_infill_speed_mm_s,
+            ),
+        ] {
+            if let Some(v) = opt_val {
+                check_pos(field, v)?;
+            }
+        }
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
         if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
@@ -251,7 +418,29 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        assert!(PrintConfig::default().validate().is_ok());
+        let cfg = PrintConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.filament.effective_first_layer_nozzle_temp_c(), 200);
+        assert_eq!(cfg.filament.effective_first_layer_bed_temp_c(), 60);
+        assert_eq!(cfg.process.seam_position, SeamPosition::Aligned);
+    }
+
+    #[test]
+    fn legacy_partial_json_deserializes_with_defaults() {
+        let legacy = r#"{
+            "machine": { "flavor": "klipper", "nozzle_diameter_mm": 0.4 },
+            "filament": { "nozzle_temp_c": 215, "bed_temp_c": 65 },
+            "process": { "layer_height_mm": 0.2, "wall_loops": 3 }
+        }"#;
+        let cfg: PrintConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.filament.effective_first_layer_nozzle_temp_c(), 215);
+        assert_eq!(cfg.filament.effective_first_layer_bed_temp_c(), 65);
+        assert_eq!(cfg.filament.max_volumetric_speed_mm3_s, 15.0);
+        assert_eq!(cfg.filament.fan_min_percent, 35);
+        assert_eq!(cfg.filament.fan_max_percent, 100);
+        assert_eq!(cfg.machine.z_hop_mm, 0.0);
+        assert_eq!(cfg.process.seam_position, SeamPosition::Aligned);
     }
 
     #[test]
@@ -267,5 +456,30 @@ mod tests {
         let mut cfg3 = PrintConfig::default();
         cfg3.machine.bed_width_mm = f64::NAN;
         assert!(cfg3.validate().is_err());
+
+        let mut cfg4 = PrintConfig::default();
+        cfg4.machine.z_hop_mm = -0.1;
+        assert!(cfg4.validate().is_err());
+        cfg4.machine.z_hop_mm = 60.0;
+        assert!(cfg4.validate().is_err());
+
+        let mut cfg5 = PrintConfig::default();
+        cfg5.machine.wipe_distance_mm = 51.0;
+        assert!(cfg5.validate().is_err());
+
+        let mut cfg6 = PrintConfig::default();
+        cfg6.filament.fan_min_percent = 101;
+        assert!(cfg6.validate().is_err());
+        cfg6.filament.fan_min_percent = 80;
+        cfg6.filament.fan_max_percent = 40;
+        assert!(cfg6.validate().is_err());
+
+        let mut cfg7 = PrintConfig::default();
+        cfg7.filament.max_volumetric_speed_mm3_s = 0.0;
+        assert!(cfg7.validate().is_err());
+
+        let mut cfg8 = PrintConfig::default();
+        cfg8.process.top_surface_speed_mm_s = Some(-5.0);
+        assert!(cfg8.validate().is_err());
     }
 }

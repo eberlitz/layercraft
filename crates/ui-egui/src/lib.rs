@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use layercraft_config::{GcodeFlavor, InfillPattern};
+use layercraft_config::{GcodeFlavor, InfillPattern, SeamPosition};
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{SampleShape, inspect_mesh};
 use layercraft_slice::ExtrusionRole;
@@ -464,6 +464,16 @@ impl LayerCraftApp {
                                     .range(0.0..=20.0),
                             );
                             ui.end_row();
+
+                            ui.label("Seam position");
+                            egui::ComboBox::from_id_salt("seam_pos")
+                                .selected_text(p.seam_position.label())
+                                .show_ui(ui, |ui| {
+                                    for pos in SeamPosition::ALL {
+                                        ui.selectable_value(&mut p.seam_position, pos, pos.label());
+                                    }
+                                });
+                            ui.end_row();
                         });
 
                     ui.add_space(6.0);
@@ -501,6 +511,110 @@ impl LayerCraftApp {
                             ui.label("Bed temp (C)");
                             ui.add(egui::DragValue::new(&mut f.bed_temp_c).range(0..=120));
                             ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new("Cooling & Flow")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("cooling_flow_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Max flow (mm³/s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut f.max_volumetric_speed_mm3_s)
+                                            .speed(0.2)
+                                            .range(0.5..=60.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Fan min (%)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut f.fan_min_percent)
+                                                .range(0..=100),
+                                        )
+                                        .changed()
+                                        && f.fan_min_percent > f.fan_max_percent
+                                    {
+                                        f.fan_max_percent = f.fan_min_percent;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Fan max (%)");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut f.fan_max_percent)
+                                                .range(0..=100),
+                                        )
+                                        .changed()
+                                        && f.fan_max_percent < f.fan_min_percent
+                                    {
+                                        f.fan_min_percent = f.fan_max_percent;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Disable fan layers");
+                                    ui.add(
+                                        egui::DragValue::new(&mut f.disable_fan_first_layers)
+                                            .range(0..=20),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Slowdown layer (s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut f.slow_down_layer_time_s)
+                                            .speed(0.2)
+                                            .range(0.0..=60.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Min speed (mm/s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut f.slow_down_min_speed_mm_s)
+                                            .speed(0.5)
+                                            .range(1.0..=100.0),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+
+                    egui::CollapsingHeader::new("Retraction & Travel")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("retract_travel_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Retract len (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut m.retraction_length_mm)
+                                            .speed(0.05)
+                                            .range(0.0..=15.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Z-hop (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut m.z_hop_mm)
+                                            .speed(0.05)
+                                            .range(0.0..=5.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Wipe on retract");
+                                    ui.checkbox(&mut m.wipe_on_retract, "");
+                                    ui.end_row();
+
+                                    ui.label("Wipe dist (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut m.wipe_distance_mm)
+                                            .speed(0.1)
+                                            .range(0.0..=10.0),
+                                    );
+                                    ui.end_row();
+                                });
                         });
 
                     if let Some(mesh) = &self.session.prepared_mesh {
@@ -557,7 +671,7 @@ impl LayerCraftApp {
         let layer_info = sliced
             .layers
             .get(self.max_layer)
-            .map(|l| (l.z_top_mm, l.paths.len()));
+            .map(|l| (l.z_top_mm, l.paths.len(), l.fan_percent, l.estimated_time_s));
 
         egui::Panel::right("layercraft_preview_panel")
             .default_size(195.0)
@@ -575,9 +689,11 @@ impl LayerCraftApp {
                     self.max_layer = layer_1based.saturating_sub(1);
                 }
 
-                if let Some((z_top_mm, path_count)) = layer_info {
+                if let Some((z_top_mm, path_count, fan_percent, est_time_s)) = layer_info {
                     ui.label(format!("Z = {z_top_mm:.2} mm"));
                     ui.label(format!("Paths: {path_count}"));
+                    ui.label(format!("Fan: {fan_percent}%"));
+                    ui.label(format!("Est. layer time: {est_time_s:.1} s"));
                 }
 
                 ui.checkbox(&mut self.single_layer_only, "Single layer only");
