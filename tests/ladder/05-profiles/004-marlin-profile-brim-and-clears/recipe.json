@@ -1,0 +1,16 @@
+{
+  "name": "004-marlin-profile-brim-and-clears",
+  "description": "Marlin2 profile dialect mapping, empty layer_change_gcode macro clear, outer brim, and cubic infill",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 15.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 4.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "machine": "marlin_child",
+    "process": "cubic_brim_020"
+  }
+}

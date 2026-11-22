@@ -1,0 +1,16 @@
+{
+  "name": "001-builtin-presets-petg-quality",
+  "description": "Built-in LayerCraft Klipper 250mm, PETG, and 0.16mm Quality presets sliced cleanly",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 20.0,
+    "height_mm": 6.6
+  },
+  "profile_bundle": {
+    "use_builtins": true,
+    "machine": "LayerCraft Generic Klipper 250mm",
+    "filament": "LayerCraft Generic PETG",
+    "process": "LayerCraft 0.16mm Quality"
+  }
+}

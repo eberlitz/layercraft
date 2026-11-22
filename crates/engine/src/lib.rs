@@ -2,7 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use layercraft_config::{ConfigError, PrintConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use layercraft_config::ProfileDirLoadReport;
+use layercraft_config::{
+    ActiveProfiles, ConfigError, PrintConfig, ProfileApplyResult, ProfileError, ProfileKind,
+    ProfileLibrary, ProfileSummary, ResolvedProfile,
+};
 use layercraft_gcode::{GcodeError, GcodeOutput, GcodeReport, emit_gcode, evaluate_gcode};
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{IoError, read_3mf_bytes, read_stl_bytes};
@@ -37,6 +42,8 @@ pub enum EngineError {
     Mesh(#[from] MeshError),
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
     #[error(transparent)]
     Slice(#[from] SliceError),
     #[error(transparent)]
@@ -78,15 +85,33 @@ pub struct PlateObjectInfo {
 }
 
 /// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Session {
     pub config: PrintConfig,
+    pub profiles: ProfileLibrary,
+    pub active_profiles: ActiveProfiles,
     pub objects: Vec<PlateObjectEntry>,
     pub next_object_id: u64,
     pub mesh: Option<TriangleMesh>,
     pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            config: PrintConfig::default(),
+            profiles: ProfileLibrary::with_builtin_presets(),
+            active_profiles: ActiveProfiles::default(),
+            objects: Vec::new(),
+            next_object_id: 0,
+            mesh: None,
+            prepared_mesh: None,
+            sliced: None,
+            last_gcode: None,
+        }
+    }
 }
 
 /// Metadata + JSON schemas describing a registered engine command.
@@ -159,6 +184,49 @@ pub struct AutoArrangeParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SetConfigParams {
     pub config: PrintConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ListProfilesParams {
+    #[serde(default)]
+    pub kind: Option<ProfileKind>,
+    #[serde(default)]
+    pub include_abstract: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadProfileJsonParams {
+    pub json: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadProfileFileParams {
+    pub path: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadProfileDirParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResolveProfileParams {
+    pub kind: ProfileKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ApplyProfilesParams {
+    #[serde(default)]
+    pub machine: Option<String>,
+    #[serde(default)]
+    pub filament: Option<String>,
+    #[serde(default)]
+    pub process: Option<String>,
+    #[serde(default)]
+    pub reset_to_defaults: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -269,6 +337,30 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             result_schema: schema_val::<PrintConfig>(),
         },
         CommandDescriptor {
+            name: "profile.list",
+            summary: "List loaded machine, filament, and process profiles.",
+            params_schema: schema_val::<ListProfilesParams>(),
+            result_schema: schema_val::<Vec<ProfileSummary>>(),
+        },
+        CommandDescriptor {
+            name: "profile.load_json",
+            summary: "Load one or more JSON profile objects into the session library.",
+            params_schema: schema_val::<LoadProfileJsonParams>(),
+            result_schema: schema_val::<Vec<ProfileSummary>>(),
+        },
+        CommandDescriptor {
+            name: "profile.resolve",
+            summary: "Resolve a named profile with its full inheritance chain.",
+            params_schema: schema_val::<ResolveProfileParams>(),
+            result_schema: schema_val::<ResolvedProfile>(),
+        },
+        CommandDescriptor {
+            name: "profile.apply",
+            summary: "Resolve and apply machine, filament, and/or process profiles onto the active configuration.",
+            params_schema: schema_val::<ApplyProfilesParams>(),
+            result_schema: schema_val::<ProfileApplyResult>(),
+        },
+        CommandDescriptor {
             name: "slice.run",
             summary: "Slice the loaded mesh using the active print configuration.",
             params_schema: schema_val::<EmptyParams>(),
@@ -299,6 +391,20 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
         summary: "Load an STL or 3MF mesh file from disk.",
         params_schema: schema_val::<AddMeshFileParams>(),
         result_schema: schema_val::<MeshInspection>(),
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "profile.load_file",
+        summary: "Load one or more JSON profiles from a file on disk.",
+        params_schema: schema_val::<LoadProfileFileParams>(),
+        result_schema: schema_val::<Vec<ProfileSummary>>(),
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "profile.load_dir",
+        summary: "Recursively load JSON profiles from a directory tree.",
+        params_schema: schema_val::<LoadProfileDirParams>(),
+        result_schema: schema_val::<ProfileDirLoadReport>(),
     });
     cmds
 }
@@ -395,6 +501,29 @@ fn add_plate_object(
 
 fn object_infos(session: &Session) -> Vec<PlateObjectInfo> {
     session.objects.iter().map(PlateObjectEntry::info).collect()
+}
+
+fn apply_session_config(session: &mut Session, new_config: PrintConfig) -> Result<(), EngineError> {
+    new_config.validate()?;
+    let old_cx = 0.5 * session.config.machine.bed_width_mm;
+    let old_cy = 0.5 * session.config.machine.bed_depth_mm;
+    session.config = new_config;
+    let new_cx = 0.5 * session.config.machine.bed_width_mm;
+    let new_cy = 0.5 * session.config.machine.bed_depth_mm;
+    if session.objects.len() == 1
+        && ((new_cx - old_cx).abs() > 1e-4 || (new_cy - old_cy).abs() > 1e-4)
+        && let Some(obj) = session.objects.first_mut()
+        && (obj.transform.position_xy_mm[0] - old_cx).abs() < 1e-4
+        && (obj.transform.position_xy_mm[1] - old_cy).abs() < 1e-4
+    {
+        obj.transform.position_xy_mm = [new_cx, new_cy];
+        obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
+        let _ = rebuild_plate_mesh(session)?;
+    } else {
+        session.sliced = None;
+        session.last_gcode = None;
+    }
+    Ok(())
 }
 
 /// Execute a named command with JSON parameters against `session`.
@@ -504,26 +633,79 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         "config.get" => Ok(serde_json::to_value(&session.config)?),
         "config.set" => {
             let p: SetConfigParams = serde_json::from_value(params)?;
-            p.config.validate()?;
-            let old_cx = 0.5 * session.config.machine.bed_width_mm;
-            let old_cy = 0.5 * session.config.machine.bed_depth_mm;
-            session.config = p.config;
-            let new_cx = 0.5 * session.config.machine.bed_width_mm;
-            let new_cy = 0.5 * session.config.machine.bed_depth_mm;
-            if session.objects.len() == 1
-                && ((new_cx - old_cx).abs() > 1e-4 || (new_cy - old_cy).abs() > 1e-4)
-                && let Some(obj) = session.objects.first_mut()
-                && (obj.transform.position_xy_mm[0] - old_cx).abs() < 1e-4
-                && (obj.transform.position_xy_mm[1] - old_cy).abs() < 1e-4
-            {
-                obj.transform.position_xy_mm = [new_cx, new_cy];
-                obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
-                let _ = rebuild_plate_mesh(session)?;
-            } else {
-                session.sliced = None;
-                session.last_gcode = None;
-            }
+            apply_session_config(session, p.config)?;
             Ok(serde_json::to_value(&session.config)?)
+        }
+        "profile.list" => {
+            let p: ListProfilesParams = if params.is_null() {
+                ListProfilesParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            let list = session.profiles.list(p.kind, p.include_abstract);
+            Ok(serde_json::to_value(list)?)
+        }
+        "profile.load_json" => {
+            let p: LoadProfileJsonParams = serde_json::from_value(params)?;
+            let loaded = session.profiles.load_json_str(&p.json)?;
+            Ok(serde_json::to_value(loaded)?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "profile.load_file" => {
+            let p: LoadProfileFileParams = serde_json::from_value(params)?;
+            let loaded = session.profiles.load_file(std::path::Path::new(&p.path))?;
+            Ok(serde_json::to_value(loaded)?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "profile.load_dir" => {
+            let p: LoadProfileDirParams = serde_json::from_value(params)?;
+            let report = session.profiles.load_dir(std::path::Path::new(&p.path))?;
+            Ok(serde_json::to_value(report)?)
+        }
+        "profile.resolve" => {
+            let p: ResolveProfileParams = serde_json::from_value(params)?;
+            let resolved = session.profiles.resolve(p.kind, &p.name)?;
+            Ok(serde_json::to_value(resolved)?)
+        }
+        "profile.apply" => {
+            let p: ApplyProfilesParams = serde_json::from_value(params)?;
+            let baseline = if p.reset_to_defaults {
+                PrintConfig::default()
+            } else {
+                session.config.clone()
+            };
+            let apply_res = session.profiles.build_print_config(
+                &baseline,
+                p.machine.as_deref(),
+                p.filament.as_deref(),
+                p.process.as_deref(),
+            )?;
+            apply_session_config(session, apply_res.config.clone())?;
+            if p.reset_to_defaults {
+                session.active_profiles = ActiveProfiles::default();
+            }
+            if let Some(m) = p
+                .machine
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+            {
+                session.active_profiles.machine = Some(m);
+            }
+            if let Some(f) = p
+                .filament
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+            {
+                session.active_profiles.filament = Some(f);
+            }
+            if let Some(pr) = p
+                .process
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+            {
+                session.active_profiles.process = Some(pr);
+            }
+            Ok(serde_json::to_value(apply_res)?)
         }
         "slice.run" => {
             let plate = if let Some(prepared) = session.prepared_mesh.as_ref() {
@@ -846,6 +1028,116 @@ mod tests {
                 &mut sess,
                 "plate.transform_object",
                 serde_json::json!({ "id": 9999, "scale": [1.0, 1.0, 1.0] })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_commands_load_resolve_apply_and_slice() {
+        let mut sess = Session::default();
+
+        let listed: Vec<ProfileSummary> =
+            serde_json::from_value(execute(&mut sess, "profile.list", Value::Null).unwrap())
+                .unwrap();
+        assert!(listed.iter().any(|p| p.name == "LayerCraft Generic PETG"));
+
+        let custom_json = r#"{
+            "type": "filament",
+            "name": "Custom Carbon PETG",
+            "inherits": "LayerCraft Generic PETG",
+            "nozzle_temperature": ["250"],
+            "filament_z_hop": ["0.45"]
+        }"#;
+        let loaded: Vec<ProfileSummary> = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.load_json",
+                serde_json::json!({ "json": custom_json }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Custom Carbon PETG");
+
+        let resolved: ResolvedProfile = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.resolve",
+                serde_json::json!({ "kind": "filament", "name": "Custom Carbon PETG" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.inheritance_chain,
+            vec![
+                "lc_filament_base",
+                "LayerCraft Generic PETG",
+                "Custom Carbon PETG"
+            ]
+        );
+
+        let applied: ProfileApplyResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.apply",
+                serde_json::json!({
+                    "machine": "LayerCraft Generic Klipper 250mm",
+                    "filament": "Custom Carbon PETG",
+                    "process": "LayerCraft 0.16mm Quality",
+                    "reset_to_defaults": true
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied.config.filament.nozzle_temp_c, 250);
+        assert!((applied.config.machine.z_hop_mm - 0.45).abs() < 1e-6);
+        assert_eq!(
+            sess.active_profiles.filament.as_deref(),
+            Some("Custom Carbon PETG")
+        );
+
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20" }),
+        )
+        .unwrap();
+        let slice_res = execute(&mut sess, "slice.run", Value::Null).unwrap();
+        assert_eq!(slice_res["layer_count"], 125);
+        let g = execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let gstr = g["gcode"].as_str().unwrap().to_owned();
+        assert!(gstr.contains("M104 S250"));
+
+        let rep: GcodeReport = serde_json::from_value(
+            execute(
+                &mut sess,
+                "gcode.evaluate",
+                serde_json::json!({ "gcode": gstr }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean());
+        assert!(rep.z_hop_count > 0);
+
+        // Hostile inputs never panic.
+        assert!(
+            execute(
+                &mut sess,
+                "profile.load_json",
+                serde_json::json!({ "json": "{" })
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                &mut sess,
+                "profile.resolve",
+                serde_json::json!({ "kind": "process", "name": "missing_profile" })
             )
             .is_err()
         );

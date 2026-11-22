@@ -34,6 +34,8 @@ pub struct TemplateVars {
     pub layer_num: usize,
     pub layer_z: f64,
     pub layer_height: f64,
+    #[serde(default)]
+    pub first_layer_height: f64,
     pub total_layer_count: usize,
     pub max_z: f64,
     pub bed_width: f64,
@@ -53,8 +55,35 @@ fn format_template_f64(val: f64) -> String {
     }
 }
 
+fn lookup_template_var(key: &str, vars: &TemplateVars) -> Option<String> {
+    match key {
+        "nozzle_temperature" => Some(vars.nozzle_temperature.to_string()),
+        "first_layer_temperature" | "nozzle_temperature_initial_layer" => {
+            Some(vars.first_layer_temperature.to_string())
+        }
+        "bed_temperature" | "hot_plate_temp" => Some(vars.bed_temperature.to_string()),
+        "first_layer_bed_temperature"
+        | "bed_temperature_initial_layer"
+        | "bed_temperature_initial_layer_single"
+        | "hot_plate_temp_initial_layer" => Some(vars.first_layer_bed_temperature.to_string()),
+        "layer_num" => Some(vars.layer_num.to_string()),
+        "layer_z" => Some(format_template_f64(vars.layer_z)),
+        "layer_height" => Some(format_template_f64(vars.layer_height)),
+        "initial_layer_print_height" => Some(format_template_f64(vars.first_layer_height)),
+        "total_layer_count" | "total_layer_number" => Some(vars.total_layer_count.to_string()),
+        "max_z" | "max_layer_z" => Some(format_template_f64(vars.max_z)),
+        "bed_width" => Some(format_template_f64(vars.bed_width)),
+        "bed_depth" => Some(format_template_f64(vars.bed_depth)),
+        "bed_height" => Some(format_template_f64(vars.bed_height)),
+        "nozzle_diameter" => Some(format_template_f64(vars.nozzle_diameter)),
+        "filament_diameter" => Some(format_template_f64(vars.filament_diameter)),
+        _ => None,
+    }
+}
+
 /// Single-pass expansion of LayerCraft `[placeholder]` macros in G-code templates.
-/// Unknown `[...]` tokens are preserved verbatim without recursive re-expansion.
+/// Supports Orca/Bambu single-extruder aliases and `[var[0]]` / `[var[initial_extruder]]`
+/// indexed syntax while preserving unknown `[...]` tokens verbatim.
 pub fn expand_gcode_template(template: &str, vars: &TemplateVars) -> String {
     let normalized = template.replace("\r\n", "\n");
     let mut out = String::with_capacity(normalized.len() + 32);
@@ -75,30 +104,35 @@ pub fn expand_gcode_template(template: &str, vars: &TemplateVars) -> String {
         let newline_pos = rest.find('\n');
         let nested_open = rest.find('[');
 
+        if let Some(no) = nested_open
+            && no > 0
+            && newline_pos.is_none_or(|nl| no < nl)
+            && let Some(tail) = rest.get(no..)
+        {
+            let suffix = if tail.starts_with("[0]]") {
+                Some("[0]]")
+            } else if tail.starts_with("[initial_extruder]]") {
+                Some("[initial_extruder]]")
+            } else {
+                None
+            };
+            if let Some(suf) = suffix
+                && let Some(key) = rest.get(..no)
+                && let Some(val) = lookup_template_var(key, vars)
+            {
+                out.push_str(&val);
+                cursor = after_open + no + suf.len();
+                continue;
+            }
+        }
+
         let valid_close = close_pos.filter(|&c| {
             newline_pos.is_none_or(|nl| c < nl) && nested_open.is_none_or(|no| c < no)
         });
 
         if let Some(rel_close) = valid_close {
             let key = rest.get(..rel_close).unwrap_or("");
-            let replacement = match key {
-                "nozzle_temperature" => Some(vars.nozzle_temperature.to_string()),
-                "first_layer_temperature" => Some(vars.first_layer_temperature.to_string()),
-                "bed_temperature" => Some(vars.bed_temperature.to_string()),
-                "first_layer_bed_temperature" => Some(vars.first_layer_bed_temperature.to_string()),
-                "layer_num" => Some(vars.layer_num.to_string()),
-                "layer_z" => Some(format_template_f64(vars.layer_z)),
-                "layer_height" => Some(format_template_f64(vars.layer_height)),
-                "total_layer_count" => Some(vars.total_layer_count.to_string()),
-                "max_z" => Some(format_template_f64(vars.max_z)),
-                "bed_width" => Some(format_template_f64(vars.bed_width)),
-                "bed_depth" => Some(format_template_f64(vars.bed_depth)),
-                "bed_height" => Some(format_template_f64(vars.bed_height)),
-                "nozzle_diameter" => Some(format_template_f64(vars.nozzle_diameter)),
-                "filament_diameter" => Some(format_template_f64(vars.filament_diameter)),
-                _ => None,
-            };
-            if let Some(val) = replacement {
+            if let Some(val) = lookup_template_var(key, vars) {
                 out.push_str(&val);
                 cursor = after_open + rel_close + 1;
                 continue;
@@ -174,6 +208,7 @@ fn make_template_vars(
         layer_num,
         layer_z,
         layer_height,
+        first_layer_height: config.process.first_layer_height_mm,
         total_layer_count,
         max_z,
         bed_width: config.machine.bed_width_mm,
@@ -1688,6 +1723,7 @@ mod tests {
             layer_num: 3,
             layer_z: 0.600000000001,
             layer_height: 0.2,
+            first_layer_height: 0.25,
             total_layer_count: 10,
             max_z: 2.0,
             bed_width: 250.0,
@@ -1728,6 +1764,44 @@ mod tests {
         assert!(rep.safety.is_clean());
         let bbox = rep.extrusion_bbox_xy.unwrap();
         assert!(bbox[0] > 100.0 && bbox[1] > 100.0);
+    }
+
+    #[test]
+    fn orca_bambu_template_aliases_and_indexed_placeholders() {
+        let vars = TemplateVars {
+            nozzle_temperature: 210,
+            first_layer_temperature: 220,
+            bed_temperature: 60,
+            first_layer_bed_temperature: 65,
+            layer_num: 2,
+            layer_z: 0.45,
+            layer_height: 0.2,
+            first_layer_height: 0.25,
+            total_layer_count: 15,
+            max_z: 3.05,
+            bed_width: 250.0,
+            bed_depth: 250.0,
+            bed_height: 250.0,
+            nozzle_diameter: 0.4,
+            filament_diameter: 1.75,
+        };
+        let tpl = "M104 S[nozzle_temperature_initial_layer[0]] \
+                   M109 S[first_layer_temperature[initial_extruder]] \
+                   M140 S[bed_temperature_initial_layer_single] \
+                   M190 S[hot_plate_temp_initial_layer] \
+                   M140 S[hot_plate_temp] \
+                   ;BED=[bed_temperature_initial_layer] \
+                   ;Z=[max_layer_z]/[total_layer_number] H=[initial_layer_print_height] \
+                   ;KEEP=[[nozzle_temperature]] [unknown_indexed[0]]";
+        let out = expand_gcode_template(tpl, &vars);
+        assert!(out.contains("M104 S220"));
+        assert!(out.contains("M109 S220"));
+        assert!(out.contains("M140 S65"));
+        assert!(out.contains("M190 S65"));
+        assert!(out.contains("M140 S60"));
+        assert!(out.contains(";BED=65"));
+        assert!(out.contains(";Z=3.05/15 H=0.25"));
+        assert!(out.contains(";KEEP=[210] [unknown_indexed[0]]"));
     }
 
     #[test]

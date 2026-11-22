@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use layercraft_config::PrintConfig;
+use layercraft_config::{PrintConfig, ProfileKind, ProfileLibrary, ProfileSummary};
 use layercraft_engine::{Session, command_registry, execute};
 use layercraft_gcode::{compare_layer_iou, emit_gcode, evaluate_gcode};
 use layercraft_io::read_mesh_file;
@@ -54,6 +54,38 @@ enum Cmd {
         config: Option<PathBuf>,
         #[arg(long)]
         stats: Option<PathBuf>,
+        #[arg(long)]
+        profile_dir: Vec<PathBuf>,
+        #[arg(long)]
+        profile_file: Vec<PathBuf>,
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long)]
+        filament: Option<String>,
+        #[arg(long)]
+        process: Option<String>,
+    },
+    /// List available machine, filament, and process JSON profiles.
+    Profiles {
+        #[arg(long)]
+        profile_dir: Vec<PathBuf>,
+        #[arg(long)]
+        profile_file: Vec<PathBuf>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Resolve a named profile with its full inheritance chain to JSON.
+    ResolveProfile {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        profile_dir: Vec<PathBuf>,
+        #[arg(long)]
+        profile_file: Vec<PathBuf>,
     },
     /// Render a build plate, 3D toolpath preview, or single top-down layer PNG.
     Render {
@@ -131,6 +163,42 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn load_cli_profile_library(
+    profile_dirs: &[PathBuf],
+    profile_files: &[PathBuf],
+) -> Result<(ProfileLibrary, Vec<ProfileSummary>), String> {
+    let mut lib = ProfileLibrary::with_builtin_presets();
+    for dir in profile_dirs {
+        lib.load_dir(dir).map_err(|e| e.to_string())?;
+    }
+    let mut file_summaries = Vec::new();
+    for file in profile_files {
+        let mut loaded = lib.load_file(file).map_err(|e| e.to_string())?;
+        file_summaries.append(&mut loaded);
+    }
+    Ok((lib, file_summaries))
+}
+
+fn auto_select_single(summaries: &[ProfileSummary], kind: ProfileKind) -> Option<String> {
+    let mut instantiable: Vec<&str> = summaries
+        .iter()
+        .filter(|s| s.kind == kind && s.instantiation)
+        .map(|s| s.name.as_str())
+        .collect();
+    if instantiable.len() == 1 {
+        return instantiable.pop().map(str::to_owned);
+    }
+    let mut all_of_kind: Vec<&str> = summaries
+        .iter()
+        .filter(|s| s.kind == kind)
+        .map(|s| s.name.as_str())
+        .collect();
+    if all_of_kind.len() == 1 {
+        return all_of_kind.pop().map(str::to_owned);
+    }
+    None
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::Slice {
@@ -138,8 +206,13 @@ fn run(cli: Cli) -> Result<(), String> {
             output,
             config,
             stats,
+            profile_dir,
+            profile_file,
+            machine,
+            filament,
+            process,
         } => {
-            let cfg: PrintConfig = match config {
+            let mut cfg: PrintConfig = match config {
                 Some(path) => {
                     let txt = std::fs::read_to_string(&path)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -147,6 +220,30 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 None => PrintConfig::default(),
             };
+            if !profile_dir.is_empty()
+                || !profile_file.is_empty()
+                || machine.is_some()
+                || filament.is_some()
+                || process.is_some()
+            {
+                let (lib, file_summaries) = load_cli_profile_library(&profile_dir, &profile_file)?;
+                let m_sel =
+                    machine.or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
+                let f_sel =
+                    filament.or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
+                let p_sel =
+                    process.or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
+                let res = lib
+                    .build_print_config(&cfg, m_sel.as_deref(), f_sel.as_deref(), p_sel.as_deref())
+                    .map_err(|e| e.to_string())?;
+                for w in &res.warnings {
+                    eprintln!(
+                        "profile warning [{} :: {}]: {}",
+                        w.profile, w.key, w.message
+                    );
+                }
+                cfg = res.config;
+            }
             let mesh = read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
             let gcode_out = emit_gcode(&sliced, &cfg).map_err(|e| e.to_string())?;
@@ -165,6 +262,35 @@ fn run(cli: Cli) -> Result<(), String> {
                 gcode_out.stats.layer_count,
                 gcode_out.stats.filament_volume_mm3
             );
+            Ok(())
+        }
+        Cmd::Profiles {
+            profile_dir,
+            profile_file,
+            kind,
+            all,
+        } => {
+            let (lib, _) = load_cli_profile_library(&profile_dir, &profile_file)?;
+            let kind_filter = match kind {
+                Some(k) => Some(ProfileKind::parse_str(&k).map_err(|e| e.to_string())?),
+                None => None,
+            };
+            let list = lib.list(kind_filter, all);
+            let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+            println!("{json}");
+            Ok(())
+        }
+        Cmd::ResolveProfile {
+            kind,
+            name,
+            profile_dir,
+            profile_file,
+        } => {
+            let (lib, _) = load_cli_profile_library(&profile_dir, &profile_file)?;
+            let parsed_kind = ProfileKind::parse_str(&kind).map_err(|e| e.to_string())?;
+            let resolved = lib.resolve(parsed_kind, &name).map_err(|e| e.to_string())?;
+            let json = serde_json::to_string_pretty(&resolved).map_err(|e| e.to_string())?;
+            println!("{json}");
             Ok(())
         }
         Cmd::Render {

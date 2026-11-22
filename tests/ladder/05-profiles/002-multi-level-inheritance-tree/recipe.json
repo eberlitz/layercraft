@@ -1,0 +1,17 @@
+{
+  "name": "002-multi-level-inheritance-tree",
+  "description": "3-level inheritance across machine_model/machine/filament/process, percentage widths, bed plate selection, indexed macros, and unmapped key tracking",
+  "shape": {
+    "kind": "box",
+    "width_mm": 24.0,
+    "depth_mm": 24.0,
+    "height_mm": 5.08
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "machine": "Custom CoreXY 0.6",
+    "filament": "HighFlow PLA",
+    "process": "Fast Gyroid 0.24"
+  }
+}

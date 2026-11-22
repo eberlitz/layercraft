@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use layercraft_config::PrintConfig;
+use layercraft_config::{PrintConfig, ProfileApplyResult, ProfileLibrary};
 use layercraft_gcode::{emit_gcode, evaluate_gcode};
 use layercraft_mesh::{ObjectTransform, auto_arrange_footprints, prepare_transformed_object};
 use layercraft_slice::{slice_meshes, slice_single_mesh};
@@ -17,6 +17,26 @@ struct LadderObjectSpec {
     transform: Option<ObjectTransform>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct LadderProfileSpec {
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    machine: Option<String>,
+    #[serde(default)]
+    filament: Option<String>,
+    #[serde(default)]
+    process: Option<String>,
+    #[serde(default = "default_true")]
+    use_builtins: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct LadderRecipe {
     name: String,
@@ -27,6 +47,9 @@ struct LadderRecipe {
     objects: Vec<LadderObjectSpec>,
     #[serde(default)]
     auto_arrange_spacing_mm: Option<f64>,
+    #[serde(default)]
+    profile_bundle: Option<LadderProfileSpec>,
+    #[serde(default)]
     config: PrintConfig,
 }
 
@@ -68,6 +91,18 @@ struct LadderExpected {
     min_bbox_width_mm: Option<f64>,
     #[serde(default)]
     require_gcode_contains: Vec<String>,
+    #[serde(default)]
+    forbid_gcode_contains: Vec<String>,
+    #[serde(default)]
+    expected_machine_chain: Vec<String>,
+    #[serde(default)]
+    expected_filament_chain: Vec<String>,
+    #[serde(default)]
+    expected_process_chain: Vec<String>,
+    #[serde(default)]
+    expected_unmapped_keys: Vec<String>,
+    #[serde(default)]
+    max_profile_warnings: Option<usize>,
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
@@ -115,6 +150,34 @@ pub fn run(root: &Path) -> Result<(), String> {
                 .map_err(|e| format!("parsing expected.json: {e}"))?;
 
             let start = Instant::now();
+            let (effective_config, profile_apply_res): (PrintConfig, Option<ProfileApplyResult>) =
+                if let Some(pb) = &recipe.profile_bundle {
+                    let mut lib = if pb.use_builtins {
+                        ProfileLibrary::with_builtin_presets()
+                    } else {
+                        ProfileLibrary::new()
+                    };
+                    if let Some(rel_dir) = &pb.dir {
+                        lib.load_dir(&cdir.join(rel_dir))
+                            .map_err(|e| format!("{tier_name}/{}: {e}", recipe.name))?;
+                    }
+                    for rel_file in &pb.files {
+                        lib.load_file(&cdir.join(rel_file))
+                            .map_err(|e| format!("{tier_name}/{}: {e}", recipe.name))?;
+                    }
+                    let res = lib
+                        .build_print_config(
+                            &recipe.config,
+                            pb.machine.as_deref(),
+                            pb.filament.as_deref(),
+                            pb.process.as_deref(),
+                        )
+                        .map_err(|e| format!("{tier_name}/{}: {e}", recipe.name))?;
+                    (res.config.clone(), Some(res))
+                } else {
+                    (recipe.config.clone(), None)
+                };
+
             let plate = if !recipe.objects.is_empty() {
                 let mut transforms = Vec::with_capacity(recipe.objects.len());
                 let mut raw_meshes = Vec::with_capacity(recipe.objects.len());
@@ -124,8 +187,8 @@ pub fn run(root: &Path) -> Result<(), String> {
                     let raw = build_shape(&obj.shape).map_err(|e| e.to_string())?;
                     let xf = obj.transform.unwrap_or_else(|| ObjectTransform {
                         position_xy_mm: [
-                            0.5 * recipe.config.machine.bed_width_mm,
-                            0.5 * recipe.config.machine.bed_depth_mm,
+                            0.5 * effective_config.machine.bed_width_mm,
+                            0.5 * effective_config.machine.bed_depth_mm,
                         ],
                         ..ObjectTransform::default()
                     });
@@ -142,8 +205,8 @@ pub fn run(root: &Path) -> Result<(), String> {
                 if let Some(spacing) = recipe.auto_arrange_spacing_mm {
                     let centers = auto_arrange_footprints(
                         &sizes_xy,
-                        recipe.config.machine.bed_width_mm,
-                        recipe.config.machine.bed_depth_mm,
+                        effective_config.machine.bed_width_mm,
+                        effective_config.machine.bed_depth_mm,
                         spacing,
                     )
                     .map_err(|e| e.to_string())?;
@@ -157,22 +220,22 @@ pub fn run(root: &Path) -> Result<(), String> {
                     prepared_meshes
                         .push(prepare_transformed_object(raw, xf).map_err(|e| e.to_string())?);
                 }
-                slice_meshes(&prepared_meshes, &recipe.config).map_err(|e| e.to_string())?
+                slice_meshes(&prepared_meshes, &effective_config).map_err(|e| e.to_string())?
             } else if let Some(shape) = &recipe.shape {
                 let mesh = build_shape(shape).map_err(|e| e.to_string())?;
-                slice_single_mesh(&mesh, &recipe.config).map_err(|e| e.to_string())?
+                slice_single_mesh(&mesh, &effective_config).map_err(|e| e.to_string())?
             } else {
                 return Err(format!(
                     "{tier_name}/{}: recipe must specify `shape` or `objects`",
                     recipe.name
                 ));
             };
-            let out = emit_gcode(&plate, &recipe.config).map_err(|e| e.to_string())?;
+            let out = emit_gcode(&plate, &effective_config).map_err(|e| e.to_string())?;
             let (rep, segs) = evaluate_gcode(
                 &out.gcode,
-                recipe.config.filament.diameter_mm,
-                recipe.config.machine.bed_width_mm,
-                recipe.config.machine.bed_depth_mm,
+                effective_config.filament.diameter_mm,
+                effective_config.machine.bed_width_mm,
+                effective_config.machine.bed_depth_mm,
             )
             .map_err(|e| e.to_string())?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -299,6 +362,74 @@ pub fn run(root: &Path) -> Result<(), String> {
             for needle in &exp.require_gcode_contains {
                 if !out.gcode.contains(needle) {
                     errs.push(format!("missing expected G-code substring `{needle}`"));
+                }
+            }
+            for needle in &exp.forbid_gcode_contains {
+                if out.gcode.contains(needle) {
+                    errs.push(format!("forbidden G-code substring `{needle}` present"));
+                }
+            }
+            if !exp.expected_machine_chain.is_empty() {
+                match &profile_apply_res {
+                    Some(pr) if pr.machine_chain == exp.expected_machine_chain => {}
+                    Some(pr) => errs.push(format!(
+                        "machine chain {:?} != {:?}",
+                        pr.machine_chain, exp.expected_machine_chain
+                    )),
+                    None => {
+                        errs.push("expected profile_bundle result for machine chain".to_owned())
+                    }
+                }
+            }
+            if !exp.expected_filament_chain.is_empty() {
+                match &profile_apply_res {
+                    Some(pr) if pr.filament_chain == exp.expected_filament_chain => {}
+                    Some(pr) => errs.push(format!(
+                        "filament chain {:?} != {:?}",
+                        pr.filament_chain, exp.expected_filament_chain
+                    )),
+                    None => {
+                        errs.push("expected profile_bundle result for filament chain".to_owned())
+                    }
+                }
+            }
+            if !exp.expected_process_chain.is_empty() {
+                match &profile_apply_res {
+                    Some(pr) if pr.process_chain == exp.expected_process_chain => {}
+                    Some(pr) => errs.push(format!(
+                        "process chain {:?} != {:?}",
+                        pr.process_chain, exp.expected_process_chain
+                    )),
+                    None => {
+                        errs.push("expected profile_bundle result for process chain".to_owned())
+                    }
+                }
+            }
+            if !exp.expected_unmapped_keys.is_empty() {
+                let mut want = exp.expected_unmapped_keys.clone();
+                want.sort();
+                match &profile_apply_res {
+                    Some(pr) if pr.unmapped_keys == want => {}
+                    Some(pr) => errs.push(format!(
+                        "unmapped keys {:?} != {:?}",
+                        pr.unmapped_keys, want
+                    )),
+                    None => {
+                        errs.push("expected profile_bundle result for unmapped keys".to_owned())
+                    }
+                }
+            }
+            if let Some(max_w) = exp.max_profile_warnings {
+                match &profile_apply_res {
+                    Some(pr) if pr.warnings.len() <= max_w => {}
+                    Some(pr) => errs.push(format!(
+                        "profile warnings {} exceeded max {max_w}: {:?}",
+                        pr.warnings.len(),
+                        pr.warnings
+                    )),
+                    None => {
+                        errs.push("expected profile_bundle result for warnings check".to_owned())
+                    }
                 }
             }
 

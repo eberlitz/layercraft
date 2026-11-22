@@ -1,5 +1,8 @@
 //! Typed and validated machine, filament, and print-process configuration.
 
+pub mod profile;
+pub use profile::*;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -1,0 +1,50 @@
+[
+  {
+    "type": "filament",
+    "name": "fil_parent",
+    "instantiation": false,
+    "filament_diameter": ["1.75"],
+    "filament_density": ["1.24"],
+    "nozzle_temperature": ["215"],
+    "nozzle_temperature_initial_layer": ["220"],
+    "hot_plate_temp": ["60"],
+    "hot_plate_temp_initial_layer": ["60"],
+    "filament_max_volumetric_speed": ["15.0"]
+  },
+  {
+    "type": "filament",
+    "name": "fil_override_cap",
+    "inherits": "fil_parent",
+    "filament_max_volumetric_speed": ["8.0"],
+    "filament_retraction_length": ["1.0"],
+    "filament_retraction_speed": ["40"],
+    "filament_z_hop": ["0.4"],
+    "filament_wipe": ["1"],
+    "filament_wipe_distance": ["2.0"]
+  },
+  {
+    "type": "process",
+    "name": "proc_parent",
+    "instantiation": false,
+    "layer_height": "0.2",
+    "initial_layer_print_height": "0.2",
+    "wall_loops": "2",
+    "top_shell_layers": "3",
+    "bottom_shell_layers": "3",
+    "outer_wall_speed": "160",
+    "inner_wall_speed": "200",
+    "sparse_infill_speed": "220",
+    "internal_solid_infill_speed": "200"
+  },
+  {
+    "type": "process",
+    "name": "proc_snug_support",
+    "inherits": "proc_parent",
+    "enable_support": "1",
+    "support_style": "snug",
+    "support_threshold_angle": "45",
+    "support_top_z_distance": "0.2",
+    "support_interface_top_layers": "2",
+    "support_speed": "140"
+  }
+]

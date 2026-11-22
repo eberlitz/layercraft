@@ -1,0 +1,35 @@
+{
+  "layer_count": 21,
+  "max_z_mm": 5.08,
+  "require_outer_wall": true,
+  "require_top_surface": true,
+  "require_bottom_surface": true,
+  "require_sparse_infill": true,
+  "require_z_hops": true,
+  "expected_machine_chain": [
+    "CustomCoreXY_Model",
+    "common_machine",
+    "Custom CoreXY 0.6"
+  ],
+  "expected_filament_chain": [
+    "common_filament",
+    "pla_base",
+    "HighFlow PLA"
+  ],
+  "expected_process_chain": [
+    "common_process",
+    "standard_020",
+    "Fast Gyroid 0.24"
+  ],
+  "expected_unmapped_keys": [
+    "xy_hole_compensation"
+  ],
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "M140 S72",
+    "M109 S225",
+    ";START_H=0.28",
+    "M104 S220",
+    "M140 S68"
+  ]
+}

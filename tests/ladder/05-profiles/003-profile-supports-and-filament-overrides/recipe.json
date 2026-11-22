@@ -1,0 +1,18 @@
+{
+  "name": "003-profile-supports-and-filament-overrides",
+  "description": "Inherited process Snug supports and filament retraction, wipe, Z-hop, and 8.0 mm3/s flow cap overrides on a bridge arch",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 6.0,
+    "span_mm": 18.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 6.0,
+    "deck_height_mm": 3.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "filament": "fil_override_cap",
+    "process": "proc_snug_support"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_sparse_infill": true,
+  "forbid_center_extrusion_mm": [
+    125.0,
+    125.0
+  ],
+  "expected_machine_chain": [
+    "klipper_parent",
+    "marlin_child"
+  ],
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "; flavor: marlin",
+    ";TYPE:Brim",
+    "M82"
+  ],
+  "forbid_gcode_contains": [
+    ";SHOULD_BE_CLEARED"
+  ]
+}

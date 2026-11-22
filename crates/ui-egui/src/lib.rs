@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use layercraft_config::{GcodeFlavor, InfillPattern, SeamPosition, SupportStyle};
+use layercraft_config::{
+    GcodeFlavor, InfillPattern, ProfileApplyResult, ProfileKind, ProfileSummary, SeamPosition,
+    SupportStyle,
+};
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{SampleShape, inspect_mesh};
 use layercraft_slice::ExtrusionRole;
@@ -31,6 +34,12 @@ pub struct LayerCraftApp {
     show_ghost_mesh: bool,
     selected_sample: SampleShape,
     selected_object_id: Option<u64>,
+    selected_machine_profile: Option<String>,
+    selected_filament_profile: Option<String>,
+    selected_process_profile: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    profile_path_input: String,
+    profile_warning_count: usize,
     #[cfg(not(target_arch = "wasm32"))]
     file_path_input: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -65,6 +74,12 @@ impl LayerCraftApp {
             show_ghost_mesh: false,
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
             selected_object_id: None,
+            selected_machine_profile: None,
+            selected_filament_profile: None,
+            selected_process_profile: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            profile_path_input: String::new(),
+            profile_warning_count: 0,
             #[cfg(not(target_arch = "wasm32"))]
             file_path_input: String::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -111,6 +126,132 @@ impl LayerCraftApp {
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed to load `{name}`: {e}"));
+            }
+        }
+    }
+
+    fn apply_loaded_profile_selection(&mut self, loaded: &[ProfileSummary]) {
+        for summary in loaded.iter().filter(|s| s.instantiation) {
+            match summary.kind {
+                ProfileKind::Machine => {
+                    self.selected_machine_profile = Some(summary.name.clone());
+                }
+                ProfileKind::Filament => {
+                    self.selected_filament_profile = Some(summary.name.clone());
+                }
+                ProfileKind::Process => {
+                    self.selected_process_profile = Some(summary.name.clone());
+                }
+                ProfileKind::MachineModel => {}
+            }
+        }
+    }
+
+    /// Load JSON profile(s) from raw UTF-8 bytes via `profile.load_json`.
+    pub fn load_profile_json_bytes(&mut self, name: &str, bytes: Vec<u8>) {
+        let json = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_error = Some(format!("Invalid UTF-8 in profile `{name}`: {e}"));
+                return;
+            }
+        };
+        match execute(
+            &mut self.session,
+            "profile.load_json",
+            serde_json::json!({ "json": json }),
+        ) {
+            Ok(val) => {
+                let loaded: Vec<ProfileSummary> = serde_json::from_value(val).unwrap_or_default();
+                self.apply_loaded_profile_selection(&loaded);
+                self.last_error = None;
+                self.status_message = format!("Loaded {} profile(s) from `{name}`.", loaded.len());
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed loading profile `{name}`: {e}"));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_native_profile_path(&mut self, path: &str) {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            match execute(
+                &mut self.session,
+                "profile.load_dir",
+                serde_json::json!({ "path": path }),
+            ) {
+                Ok(val) => {
+                    let report: layercraft_config::ProfileDirLoadReport =
+                        match serde_json::from_value(val) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.last_error = Some(e.to_string());
+                                return;
+                            }
+                        };
+                    self.apply_loaded_profile_selection(&report.loaded);
+                    self.last_error = None;
+                    self.status_message = format!(
+                        "Loaded {} profile(s) from `{path}` ({} skipped).",
+                        report.loaded.len(),
+                        report.skipped.len()
+                    );
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed loading profiles `{path}`: {e}"));
+                }
+            }
+        } else {
+            match execute(
+                &mut self.session,
+                "profile.load_file",
+                serde_json::json!({ "path": path }),
+            ) {
+                Ok(val) => {
+                    let loaded: Vec<ProfileSummary> =
+                        serde_json::from_value(val).unwrap_or_default();
+                    self.apply_loaded_profile_selection(&loaded);
+                    self.last_error = None;
+                    self.status_message =
+                        format!("Loaded {} profile(s) from `{path}`.", loaded.len());
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed loading profile `{path}`: {e}"));
+                }
+            }
+        }
+    }
+
+    fn apply_selected_profiles(&mut self) {
+        match execute(
+            &mut self.session,
+            "profile.apply",
+            serde_json::json!({
+                "machine": self.selected_machine_profile,
+                "filament": self.selected_filament_profile,
+                "process": self.selected_process_profile,
+                "reset_to_defaults": true
+            }),
+        ) {
+            Ok(val) => {
+                let res: Option<ProfileApplyResult> = serde_json::from_value(val).ok();
+                self.profile_warning_count = res.as_ref().map(|r| r.warnings.len()).unwrap_or(0);
+                self.last_error = None;
+                self.status_message = if self.profile_warning_count > 0 {
+                    format!(
+                        "Applied profiles ({} warning(s)).",
+                        self.profile_warning_count
+                    )
+                } else {
+                    "Applied selected profiles.".to_owned()
+                };
+                self.frame_camera(CameraPreset::Isometric);
+                self.rebuild_scene();
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Profile apply failed: {e}"));
             }
         }
     }
@@ -252,7 +393,13 @@ impl LayerCraftApp {
                 std::mem::take(&mut *self.pending_drops.borrow_mut());
             for (name, res) in ready {
                 match res {
-                    Ok(bytes) => self.load_mesh_bytes(&name, bytes),
+                    Ok(bytes) => {
+                        if name.to_ascii_lowercase().ends_with(".json") {
+                            self.load_profile_json_bytes(&name, bytes);
+                        } else {
+                            self.load_mesh_bytes(&name, bytes);
+                        }
+                    }
                     Err(e) => self.last_error = Some(format!("Failed reading `{name}`: {e}")),
                 }
             }
@@ -271,11 +418,22 @@ impl LayerCraftApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let is_json = name.to_ascii_lowercase().ends_with(".json");
             match file.bytes() {
-                Ok(bytes) => self.load_mesh_bytes(&name, bytes),
+                Ok(bytes) => {
+                    if is_json {
+                        self.load_profile_json_bytes(&name, bytes);
+                    } else {
+                        self.load_mesh_bytes(&name, bytes);
+                    }
+                }
                 Err(_) => {
                     let p = file.path().to_string_lossy().into_owned();
-                    self.load_native_path(&p);
+                    if is_json {
+                        self.load_native_profile_path(&p);
+                    } else {
+                        self.load_native_path(&p);
+                    }
                 }
             }
         }
@@ -410,6 +568,155 @@ impl LayerCraftApp {
             .default_size(275.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut profile_apply_requested = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let mut native_profile_load_path: Option<String> = None;
+
+                    egui::CollapsingHeader::new("Profiles")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let machines = self
+                                .session
+                                .profiles
+                                .list(Some(ProfileKind::Machine), false);
+                            let filaments = self
+                                .session
+                                .profiles
+                                .list(Some(ProfileKind::Filament), false);
+                            let processes = self
+                                .session
+                                .profiles
+                                .list(Some(ProfileKind::Process), false);
+
+                            egui::Grid::new("profiles_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Machine");
+                                    let m_text = self
+                                        .selected_machine_profile
+                                        .as_deref()
+                                        .unwrap_or("(Default)");
+                                    egui::ComboBox::from_id_salt("prof_machine")
+                                        .selected_text(m_text)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_machine_profile.is_none(),
+                                                    "(Default)",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_machine_profile = None;
+                                                profile_apply_requested = true;
+                                            }
+                                            for item in &machines {
+                                                let sel = self.selected_machine_profile.as_deref()
+                                                    == Some(item.name.as_str());
+                                                if ui.selectable_label(sel, &item.name).clicked() {
+                                                    self.selected_machine_profile =
+                                                        Some(item.name.clone());
+                                                    profile_apply_requested = true;
+                                                }
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("Filament");
+                                    let f_text = self
+                                        .selected_filament_profile
+                                        .as_deref()
+                                        .unwrap_or("(Default)");
+                                    egui::ComboBox::from_id_salt("prof_filament")
+                                        .selected_text(f_text)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_filament_profile.is_none(),
+                                                    "(Default)",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_filament_profile = None;
+                                                profile_apply_requested = true;
+                                            }
+                                            for item in &filaments {
+                                                let sel = self.selected_filament_profile.as_deref()
+                                                    == Some(item.name.as_str());
+                                                if ui.selectable_label(sel, &item.name).clicked() {
+                                                    self.selected_filament_profile =
+                                                        Some(item.name.clone());
+                                                    profile_apply_requested = true;
+                                                }
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("Process");
+                                    let p_text = self
+                                        .selected_process_profile
+                                        .as_deref()
+                                        .unwrap_or("(Default)");
+                                    egui::ComboBox::from_id_salt("prof_process")
+                                        .selected_text(p_text)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_process_profile.is_none(),
+                                                    "(Default)",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_process_profile = None;
+                                                profile_apply_requested = true;
+                                            }
+                                            for item in &processes {
+                                                let sel = self.selected_process_profile.as_deref()
+                                                    == Some(item.name.as_str());
+                                                if ui.selectable_label(sel, &item.name).clicked() {
+                                                    self.selected_process_profile =
+                                                        Some(item.name.clone());
+                                                    profile_apply_requested = true;
+                                                }
+                                            }
+                                        });
+                                    ui.end_row();
+                                });
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Apply").clicked() {
+                                    profile_apply_requested = true;
+                                }
+                                if self.profile_warning_count > 0 {
+                                    ui.weak(format!("{} warning(s)", self.profile_warning_count));
+                                }
+                            });
+
+                            #[cfg(not(target_arch = "wasm32"))]
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.profile_path_input)
+                                        .hint_text("path/to/profiles or .json")
+                                        .desired_width(145.0),
+                                );
+                                if ui.button("Load JSON/Dir").clicked()
+                                    && !self.profile_path_input.trim().is_empty()
+                                {
+                                    native_profile_load_path =
+                                        Some(self.profile_path_input.trim().to_owned());
+                                }
+                            });
+                        });
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(p) = native_profile_load_path {
+                        self.load_native_profile_path(&p);
+                    }
+                    if profile_apply_requested {
+                        self.apply_selected_profiles();
+                    }
+
+                    ui.add_space(4.0);
                     ui.heading("Process Settings");
                     ui.add_space(4.0);
 

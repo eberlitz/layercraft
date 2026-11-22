@@ -1,0 +1,29 @@
+{
+  "layer_count": 41,
+  "max_z_mm": 6.6,
+  "require_outer_wall": true,
+  "require_top_surface": true,
+  "require_bottom_surface": true,
+  "require_sparse_infill": true,
+  "require_z_hops": true,
+  "require_first_layer_fan_off": true,
+  "expected_machine_chain": [
+    "lc_machine_base",
+    "LayerCraft Generic Klipper 250mm"
+  ],
+  "expected_filament_chain": [
+    "lc_filament_base",
+    "LayerCraft Generic PETG"
+  ],
+  "expected_process_chain": [
+    "lc_process_base",
+    "LayerCraft 0.16mm Quality"
+  ],
+  "max_profile_warnings": 0,
+  "require_gcode_contains": [
+    "M109 S245",
+    "M104 S240",
+    "M190 S80",
+    "M83"
+  ]
+}
