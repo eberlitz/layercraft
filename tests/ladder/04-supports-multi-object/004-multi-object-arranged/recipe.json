@@ -1,0 +1,39 @@
+{
+  "name": "004-multi-object-arranged",
+  "description": "Three transformed parts auto-arranged onto one bed with 8 mm spacing & sliced together",
+  "objects": [
+    {
+      "shape": {
+        "kind": "box",
+        "width_mm": 20.0,
+        "depth_mm": 20.0,
+        "height_mm": 10.0
+      }
+    },
+    {
+      "shape": {
+        "kind": "cylinder",
+        "radius_mm": 10.0,
+        "height_mm": 12.0,
+        "segments": 48
+      }
+    },
+    {
+      "shape": {
+        "kind": "box",
+        "width_mm": 15.0,
+        "depth_mm": 15.0,
+        "height_mm": 8.0
+      },
+      "transform": {
+        "rotation_deg": [
+          0.0,
+          0.0,
+          45.0
+        ]
+      }
+    }
+  ],
+  "auto_arrange_spacing_mm": 8.0,
+  "config": {}
+}

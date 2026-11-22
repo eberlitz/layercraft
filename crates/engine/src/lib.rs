@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 
 use layercraft_config::{ConfigError, PrintConfig};
 use layercraft_gcode::{GcodeError, GcodeOutput, GcodeReport, emit_gcode, evaluate_gcode};
-use layercraft_geom::{GeomError, TriangleMesh};
+use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{IoError, read_3mf_bytes, read_stl_bytes};
 use layercraft_mesh::{
-    MeshError, MeshInspection, SampleShape, build_sample_shape, inspect_mesh, prepare_for_plate,
+    MeshError, MeshInspection, ObjectTransform, SampleShape, auto_arrange_footprints,
+    build_sample_shape, inspect_mesh, prepare_transformed_object,
 };
-use layercraft_slice::{SliceError, SlicedPlate, slice_single_mesh};
+use layercraft_slice::{SliceError, SlicedPlate, slice_prepared_mesh, slice_single_mesh};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +25,8 @@ pub enum EngineError {
     InvalidParams(#[from] serde_json::Error),
     #[error("no mesh loaded on build plate")]
     NoMeshLoaded,
+    #[error("plate object id {0} not found")]
+    ObjectNotFound(u64),
     #[error("plate has not been sliced yet")]
     NotSliced,
     #[error("layer index {index} out of range (plate has {count} layers)")]
@@ -42,10 +45,44 @@ pub enum EngineError {
     Io(#[from] IoError),
 }
 
+/// Stored plate object entry with raw mesh, transform, and prepared world-space mesh.
+#[derive(Debug, Clone)]
+pub struct PlateObjectEntry {
+    pub id: u64,
+    pub name: String,
+    pub raw_mesh: TriangleMesh,
+    pub transform: ObjectTransform,
+    pub prepared_mesh: TriangleMesh,
+}
+
+impl PlateObjectEntry {
+    fn info(&self) -> PlateObjectInfo {
+        PlateObjectInfo {
+            id: self.id,
+            name: self.name.clone(),
+            transform: self.transform,
+            triangle_count: self.prepared_mesh.triangles.len(),
+            aabb: self.prepared_mesh.aabb(),
+        }
+    }
+}
+
+/// Public serializable summary of a single object on the build plate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PlateObjectInfo {
+    pub id: u64,
+    pub name: String,
+    pub transform: ObjectTransform,
+    pub triangle_count: usize,
+    pub aabb: Option<Aabb3>,
+}
+
 /// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
 #[derive(Debug, Default)]
 pub struct Session {
     pub config: PrintConfig,
+    pub objects: Vec<PlateObjectEntry>,
+    pub next_object_id: u64,
     pub mesh: Option<TriangleMesh>,
     pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
@@ -67,22 +104,56 @@ pub struct EmptyParams {}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AddStlBytesParams {
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Add3mfBytesParams {
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AddSampleShapeParams {
     pub shape: SampleShape,
+    #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AddMeshFileParams {
     pub path: String,
+    #[serde(default)]
+    pub append: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RemoveObjectParams {
+    pub id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TransformObjectParams {
+    pub id: u64,
+    pub position_xy_mm: Option<[f64; 2]>,
+    pub rotation_deg: Option<[f64; 3]>,
+    pub scale: Option<[f64; 3]>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AutoArrangeParams {
+    pub spacing_mm: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -162,6 +233,30 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             result_schema: schema_val::<MeshInspection>(),
         },
         CommandDescriptor {
+            name: "plate.list_objects",
+            summary: "List individual objects on the build plate with IDs, names, transforms, and bounds.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<Vec<PlateObjectInfo>>(),
+        },
+        CommandDescriptor {
+            name: "plate.remove_object",
+            summary: "Remove an object from the build plate by ID.",
+            params_schema: schema_val::<RemoveObjectParams>(),
+            result_schema: schema_val::<OkResult>(),
+        },
+        CommandDescriptor {
+            name: "plate.transform_object",
+            summary: "Update XY position, Euler rotation, or XYZ scale on a plate object by ID.",
+            params_schema: schema_val::<TransformObjectParams>(),
+            result_schema: schema_val::<PlateObjectInfo>(),
+        },
+        CommandDescriptor {
+            name: "plate.auto_arrange",
+            summary: "Pack all plate objects onto the bed with non-overlapping spacing.",
+            params_schema: schema_val::<AutoArrangeParams>(),
+            result_schema: schema_val::<Vec<PlateObjectInfo>>(),
+        },
+        CommandDescriptor {
             name: "config.get",
             summary: "Return the active print configuration.",
             params_schema: schema_val::<EmptyParams>(),
@@ -212,21 +307,94 @@ fn schema_val<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null)
 }
 
-fn set_loaded_mesh(
-    session: &mut Session,
-    mesh: TriangleMesh,
-) -> Result<MeshInspection, EngineError> {
-    let prepared = prepare_for_plate(
-        &mesh,
-        session.config.machine.bed_width_mm,
-        session.config.machine.bed_depth_mm,
-    )?;
-    let insp = inspect_mesh(&prepared);
-    session.mesh = Some(mesh);
-    session.prepared_mesh = Some(prepared);
+fn rebuild_plate_mesh(session: &mut Session) -> Result<Option<MeshInspection>, EngineError> {
     session.sliced = None;
     session.last_gcode = None;
-    Ok(insp)
+    if session.objects.is_empty() {
+        session.mesh = None;
+        session.prepared_mesh = None;
+        return Ok(None);
+    }
+    let raw_list: Vec<TriangleMesh> = session.objects.iter().map(|o| o.raw_mesh.clone()).collect();
+    let prep_list: Vec<TriangleMesh> = session
+        .objects
+        .iter()
+        .map(|o| o.prepared_mesh.clone())
+        .collect();
+    let merged_raw = TriangleMesh::merge(&raw_list)?;
+    let merged_prep = TriangleMesh::merge(&prep_list)?;
+    let insp = inspect_mesh(&merged_prep);
+    session.mesh = Some(merged_raw);
+    session.prepared_mesh = Some(merged_prep);
+    Ok(Some(insp))
+}
+
+fn auto_arrange_session_objects(session: &mut Session, spacing_mm: f64) -> Result<(), EngineError> {
+    if session.objects.is_empty() {
+        return Ok(());
+    }
+    let mut footprints = Vec::with_capacity(session.objects.len());
+    for obj in &session.objects {
+        let size = obj
+            .prepared_mesh
+            .aabb()
+            .map(|bb| bb.size())
+            .ok_or(EngineError::NoMeshLoaded)?;
+        footprints.push((size.x.max(0.1), size.y.max(0.1)));
+    }
+    let positions = auto_arrange_footprints(
+        &footprints,
+        session.config.machine.bed_width_mm,
+        session.config.machine.bed_depth_mm,
+        spacing_mm,
+    )?;
+    for (obj, pos) in session.objects.iter_mut().zip(positions) {
+        obj.transform.position_xy_mm = pos;
+        obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
+    }
+    Ok(())
+}
+
+fn add_plate_object(
+    session: &mut Session,
+    name: String,
+    mesh: TriangleMesh,
+    append: bool,
+) -> Result<MeshInspection, EngineError> {
+    if !append {
+        session.objects.clear();
+    }
+    let id = if session.next_object_id == 0 {
+        1
+    } else {
+        session.next_object_id
+    };
+    session.next_object_id = id + 1;
+
+    let transform = ObjectTransform {
+        position_xy_mm: [
+            0.5 * session.config.machine.bed_width_mm,
+            0.5 * session.config.machine.bed_depth_mm,
+        ],
+        rotation_deg: [0.0, 0.0, 0.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+    let prepared = prepare_transformed_object(&mesh, transform)?;
+    session.objects.push(PlateObjectEntry {
+        id,
+        name,
+        raw_mesh: mesh,
+        transform,
+        prepared_mesh: prepared,
+    });
+    if append && session.objects.len() > 1 {
+        auto_arrange_session_objects(session, 6.0)?;
+    }
+    rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
+}
+
+fn object_infos(session: &Session) -> Vec<PlateObjectInfo> {
+    session.objects.iter().map(PlateObjectEntry::info).collect()
 }
 
 /// Execute a named command with JSON parameters against `session`.
@@ -238,35 +406,43 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             } else {
                 serde_json::from_value(params)?
             };
-            session.mesh = None;
-            session.prepared_mesh = None;
-            session.sliced = None;
-            session.last_gcode = None;
+            session.objects.clear();
+            let _ = rebuild_plate_mesh(session)?;
             Ok(serde_json::to_value(OkResult { ok: true })?)
         }
         "plate.add_stl_bytes" => {
             let p: AddStlBytesParams = serde_json::from_value(params)?;
             let mesh = read_stl_bytes(&p.bytes)?;
-            let insp = set_loaded_mesh(session, mesh)?;
+            let label = p.name.unwrap_or_else(|| "STL Part".to_owned());
+            let insp = add_plate_object(session, label, mesh, p.append)?;
             Ok(serde_json::to_value(insp)?)
         }
         "plate.add_3mf_bytes" => {
             let p: Add3mfBytesParams = serde_json::from_value(params)?;
             let mesh = read_3mf_bytes(&p.bytes)?;
-            let insp = set_loaded_mesh(session, mesh)?;
+            let label = p.name.unwrap_or_else(|| "3MF Part".to_owned());
+            let insp = add_plate_object(session, label, mesh, p.append)?;
             Ok(serde_json::to_value(insp)?)
         }
         "plate.add_sample_shape" => {
             let p: AddSampleShapeParams = serde_json::from_value(params)?;
             let mesh = build_sample_shape(p.shape)?;
-            let insp = set_loaded_mesh(session, mesh)?;
+            let label = p.name.unwrap_or_else(|| p.shape.label().to_owned());
+            let insp = add_plate_object(session, label, mesh, p.append)?;
             Ok(serde_json::to_value(insp)?)
         }
         #[cfg(not(target_arch = "wasm32"))]
         "plate.add_mesh_file" => {
             let p: AddMeshFileParams = serde_json::from_value(params)?;
-            let mesh = layercraft_io::read_mesh_file(std::path::Path::new(&p.path))?;
-            let insp = set_loaded_mesh(session, mesh)?;
+            let path = std::path::Path::new(&p.path);
+            let mesh = layercraft_io::read_mesh_file(path)?;
+            let label = p.name.unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Mesh Part")
+                    .to_owned()
+            });
+            let insp = add_plate_object(session, label, mesh, p.append)?;
             Ok(serde_json::to_value(insp)?)
         }
         "plate.inspect" => {
@@ -277,29 +453,86 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
                 .ok_or(EngineError::NoMeshLoaded)?;
             Ok(serde_json::to_value(inspect_mesh(mesh))?)
         }
+        "plate.list_objects" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            Ok(serde_json::to_value(object_infos(session))?)
+        }
+        "plate.remove_object" => {
+            let p: RemoveObjectParams = serde_json::from_value(params)?;
+            let before = session.objects.len();
+            session.objects.retain(|o| o.id != p.id);
+            if session.objects.len() == before {
+                return Err(EngineError::ObjectNotFound(p.id));
+            }
+            let _ = rebuild_plate_mesh(session)?;
+            Ok(serde_json::to_value(OkResult { ok: true })?)
+        }
+        "plate.transform_object" => {
+            let p: TransformObjectParams = serde_json::from_value(params)?;
+            let entry = session
+                .objects
+                .iter_mut()
+                .find(|o| o.id == p.id)
+                .ok_or(EngineError::ObjectNotFound(p.id))?;
+            let next_transform = ObjectTransform {
+                position_xy_mm: p.position_xy_mm.unwrap_or(entry.transform.position_xy_mm),
+                rotation_deg: p.rotation_deg.unwrap_or(entry.transform.rotation_deg),
+                scale: p.scale.unwrap_or(entry.transform.scale),
+            };
+            let next_prep = prepare_transformed_object(&entry.raw_mesh, next_transform)?;
+            entry.transform = next_transform;
+            entry.prepared_mesh = next_prep;
+            let info = entry.info();
+            let _ = rebuild_plate_mesh(session)?;
+            Ok(serde_json::to_value(info)?)
+        }
+        "plate.auto_arrange" => {
+            let p: AutoArrangeParams = if params.is_null() {
+                AutoArrangeParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            let spacing = p.spacing_mm.unwrap_or(6.0);
+            auto_arrange_session_objects(session, spacing)?;
+            let _ = rebuild_plate_mesh(session)?;
+            Ok(serde_json::to_value(object_infos(session))?)
+        }
         "config.get" => Ok(serde_json::to_value(&session.config)?),
         "config.set" => {
             let p: SetConfigParams = serde_json::from_value(params)?;
             p.config.validate()?;
+            let old_cx = 0.5 * session.config.machine.bed_width_mm;
+            let old_cy = 0.5 * session.config.machine.bed_depth_mm;
             session.config = p.config;
-            if let Some(raw) = session.mesh.as_ref() {
-                session.prepared_mesh = Some(prepare_for_plate(
-                    raw,
-                    session.config.machine.bed_width_mm,
-                    session.config.machine.bed_depth_mm,
-                )?);
+            let new_cx = 0.5 * session.config.machine.bed_width_mm;
+            let new_cy = 0.5 * session.config.machine.bed_depth_mm;
+            if session.objects.len() == 1
+                && ((new_cx - old_cx).abs() > 1e-4 || (new_cy - old_cy).abs() > 1e-4)
+                && let Some(obj) = session.objects.first_mut()
+                && (obj.transform.position_xy_mm[0] - old_cx).abs() < 1e-4
+                && (obj.transform.position_xy_mm[1] - old_cy).abs() < 1e-4
+            {
+                obj.transform.position_xy_mm = [new_cx, new_cy];
+                obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
+                let _ = rebuild_plate_mesh(session)?;
+            } else {
+                session.sliced = None;
+                session.last_gcode = None;
             }
-            session.sliced = None;
-            session.last_gcode = None;
             Ok(serde_json::to_value(&session.config)?)
         }
         "slice.run" => {
-            let mesh = session
-                .prepared_mesh
-                .as_ref()
-                .or(session.mesh.as_ref())
-                .ok_or(EngineError::NoMeshLoaded)?;
-            let plate = slice_single_mesh(mesh, &session.config)?;
+            let plate = if let Some(prepared) = session.prepared_mesh.as_ref() {
+                slice_prepared_mesh(prepared, &session.config)?
+            } else if let Some(raw) = session.mesh.as_ref() {
+                slice_single_mesh(raw, &session.config)?
+            } else {
+                return Err(EngineError::NoMeshLoaded);
+            };
             let total_paths = plate.layers.iter().map(|l| l.paths.len()).sum();
             let res = SliceSummaryResult {
                 layer_count: plate.layers.len(),
@@ -520,5 +753,101 @@ mod tests {
             assert_eq!(rep["safety"]["non_finite_values"], 0);
             assert_eq!(rep["safety"]["out_of_bounds_moves"], 0);
         }
+    }
+
+    #[test]
+    fn multi_object_append_transform_arrange_and_slice() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": false }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cylinder", "append": true, "name": "Cyl" }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "thin_rib", "append": true }),
+        )
+        .unwrap();
+
+        let objs: Vec<PlateObjectInfo> =
+            serde_json::from_value(execute(&mut sess, "plate.list_objects", Value::Null).unwrap())
+                .unwrap();
+        assert_eq!(objs.len(), 3);
+        let id1 = objs[0].id;
+        let id3 = objs[2].id;
+
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({
+                "id": id3,
+                "rotation_deg": [0.0, 0.0, 45.0],
+                "scale": [1.2, 1.2, 1.0]
+            }),
+        )
+        .unwrap();
+
+        let arranged: Vec<PlateObjectInfo> = serde_json::from_value(
+            execute(
+                &mut sess,
+                "plate.auto_arrange",
+                serde_json::json!({ "spacing_mm": 8.0 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arranged.len(), 3);
+
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        let g = execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let gstr = g["gcode"].as_str().unwrap().to_owned();
+        let rep: GcodeReport = serde_json::from_value(
+            execute(
+                &mut sess,
+                "gcode.evaluate",
+                serde_json::json!({ "gcode": gstr }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean());
+        let bbox = rep.extrusion_bbox_xy.unwrap();
+        assert!(bbox[2] - bbox[0] > 50.0, "expected arranged width > 50 mm");
+
+        execute(
+            &mut sess,
+            "plate.remove_object",
+            serde_json::json!({ "id": id1 }),
+        )
+        .unwrap();
+        let after_rem: Vec<PlateObjectInfo> =
+            serde_json::from_value(execute(&mut sess, "plate.list_objects", Value::Null).unwrap())
+                .unwrap();
+        assert_eq!(after_rem.len(), 2);
+
+        assert!(
+            execute(
+                &mut sess,
+                "plate.remove_object",
+                serde_json::json!({ "id": 9999 })
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                &mut sess,
+                "plate.transform_object",
+                serde_json::json!({ "id": 9999, "scale": [1.0, 1.0, 1.0] })
+            )
+            .is_err()
+        );
     }
 }

@@ -6,7 +6,7 @@ use layercraft_clip::{
     ClipError, JoinType, clip_lines, clip_polylines, clip_polylines_difference, difference,
     intersection, offset, union,
 };
-use layercraft_config::{InfillPattern, PrintConfig};
+use layercraft_config::{InfillPattern, PrintConfig, SupportStyle};
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
 use layercraft_mesh::{MeshError, RawSliceLayer, prepare_for_plate, slice_mesh};
 use schemars::JsonSchema;
@@ -39,6 +39,8 @@ pub enum ExtrusionRole {
     InternalSolidInfill,
     Bridge,
     SparseInfill,
+    Support,
+    SupportInterface,
     Skirt,
     Brim,
 }
@@ -55,6 +57,8 @@ impl ExtrusionRole {
             Self::InternalSolidInfill => "Internal solid infill",
             Self::Bridge => "Bridge",
             Self::SparseInfill => "Sparse infill",
+            Self::Support => "Support",
+            Self::SupportInterface => "Support interface",
             Self::Skirt => "Skirt",
             Self::Brim => "Brim",
         }
@@ -115,7 +119,7 @@ pub fn stadium_spacing_mm(width_mm: f64, height_mm: f64) -> f64 {
     (width_mm - overlap).max(0.05 * width_mm)
 }
 
-/// Run the full slicing pipeline for a single mesh onto the configured bed.
+/// Run the full slicing pipeline for a single mesh, centering and grounding it on the configured bed.
 pub fn slice_single_mesh(
     mesh: &TriangleMesh,
     config: &PrintConfig,
@@ -126,21 +130,41 @@ pub fn slice_single_mesh(
         config.machine.bed_width_mm,
         config.machine.bed_depth_mm,
     )?;
+    slice_prepared_mesh(&prepared, config)
+}
+
+/// Run the full slicing pipeline on an already positioned/grounded plate mesh without re-centering.
+pub fn slice_prepared_mesh(
+    prepared: &TriangleMesh,
+    config: &PrintConfig,
+) -> Result<SlicedPlate, SliceError> {
+    config.validate()?;
     let raw_layers = slice_mesh(
-        &prepared,
+        prepared,
         config.process.first_layer_height_mm,
         config.process.layer_height_mm,
     )?;
     slice_from_raw_layers(&raw_layers, config)
 }
 
-/// Execute perimeters, skin detection, infill, and adhesion from pre-sliced Z layers.
+/// Merge multiple prepared plate meshes and slice them together while preserving their transforms.
+pub fn slice_meshes(
+    prepared_meshes: &[TriangleMesh],
+    config: &PrintConfig,
+) -> Result<SlicedPlate, SliceError> {
+    config.validate()?;
+    let combined = TriangleMesh::merge(prepared_meshes)?;
+    slice_prepared_mesh(&combined, config)
+}
+
+/// Execute perimeters, skin detection, infill, supports, and adhesion from pre-sliced Z layers.
 pub fn slice_from_raw_layers(
     raw_layers: &[RawSliceLayer],
     config: &PrintConfig,
 ) -> Result<SlicedPlate, SliceError> {
     config.validate()?;
     let n = raw_layers.len();
+    let support_paths_per_layer = generate_support_paths(raw_layers, config)?;
 
     let mut per_layer_walls: Vec<Vec<ExtrusionPath>> = Vec::with_capacity(n);
     let mut per_layer_infill_areas: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
@@ -193,6 +217,11 @@ pub fn slice_from_raw_layers(
         // Optional Stage 5 adhesion on layer 0 before part walls.
         if is_first {
             append_adhesion_paths(&raw.regions, h, config, &mut paths)?;
+        }
+
+        // Emit support structures (base & dense interface) before part walls.
+        if let Some(spaths) = support_paths_per_layer.get(idx) {
+            paths.extend(spaths.iter().cloned());
         }
 
         // Emit walls (already ordered inner -> outer), splitting unsupported outer walls into overhangs.
@@ -750,6 +779,277 @@ fn compute_bridge_angle(bridge: &ExPolygon, below: &[ExPolygon]) -> Result<f64, 
         }
     }
     Ok(best_angle)
+}
+
+fn bed_clamp_expolygon(config: &PrintConfig) -> Result<ExPolygon, SliceError> {
+    let bw = config.machine.bed_width_mm;
+    let bd = config.machine.bed_depth_mm;
+    let pad = if bw > 2.0 && bd > 2.0 { 0.5 } else { 0.0 };
+    let outer = Polygon::new(vec![
+        Point2::from_mm(pad, pad)?,
+        Point2::from_mm(bw - pad, pad)?,
+        Point2::from_mm(bw - pad, bd - pad)?,
+        Point2::from_mm(pad, bd - pad)?,
+    ]);
+    Ok(ExPolygon::new(outer, Vec::new()))
+}
+
+fn generate_support_paths(
+    raw_layers: &[RawSliceLayer],
+    config: &PrintConfig,
+) -> Result<Vec<Vec<ExtrusionPath>>, SliceError> {
+    let n = raw_layers.len();
+    let mut per_layer = vec![Vec::new(); n];
+    let s = &config.process.support;
+    if !s.enabled || n < 2 {
+        return Ok(per_layer);
+    }
+
+    let join = JoinType::Miter { limit: 2.0 };
+    let bed_box = bed_clamp_expolygon(config)?;
+    let bed_slice = std::slice::from_ref(&bed_box);
+
+    // Pass 1: Overhang detection & top Z contact mapping.
+    let top_gap_layers = (s.top_z_distance_mm / config.process.layer_height_mm)
+        .round()
+        .max(0.0) as usize;
+    let mut contact_overhangs: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
+
+    for idx in 1..n {
+        let Some(here_layer) = raw_layers.get(idx) else {
+            continue;
+        };
+        let Some(below_layer) = raw_layers.get(idx - 1) else {
+            continue;
+        };
+        if here_layer.regions.is_empty() {
+            continue;
+        }
+        let h = here_layer.plane.height_mm;
+        let dx_safe = h * s.threshold_angle_deg.to_radians().tan();
+        let supported = offset(&below_layer.regions, mm_to_nm(dx_safe)?, join)?;
+        let mut ovh = difference(&here_layer.regions, &supported)?;
+        if ovh.is_empty() {
+            continue;
+        }
+        if s.style == SupportStyle::Grid {
+            let expanded = offset(&ovh, mm_to_nm(0.5 * s.line_width_mm)?, join)?;
+            ovh = intersection(&expanded, bed_slice)?;
+        }
+        if idx > top_gap_layers
+            && let Some(slot) = contact_overhangs.get_mut(idx - 1 - top_gap_layers)
+        {
+            slot.extend(ovh);
+        }
+    }
+
+    for slot in &mut contact_overhangs {
+        if slot.len() > 1 {
+            *slot = union(slot)?;
+        }
+    }
+
+    // Pass 2: Top-down column projection with XY & bottom-Z model clearance.
+    let bottom_gap_layers = (s.bottom_z_distance_mm / config.process.layer_height_mm)
+        .round()
+        .max(0.0) as usize;
+    let mut support_volume: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
+    let mut carried: Vec<ExPolygon> = Vec::new();
+
+    for idx in (0..n).rev() {
+        let mut combined = contact_overhangs.get(idx).cloned().unwrap_or_default();
+        combined.extend(carried.iter().cloned());
+        if combined.is_empty() {
+            carried.clear();
+            continue;
+        }
+        let combined = union(&combined)?;
+
+        let mut excl_sources = if let Some(cur_layer) = raw_layers.get(idx) {
+            offset(&cur_layer.regions, mm_to_nm(s.xy_distance_mm)?, join)?
+        } else {
+            Vec::new()
+        };
+        if bottom_gap_layers > 0 {
+            let min_j = idx.saturating_sub(bottom_gap_layers);
+            for j in min_j..idx {
+                if let Some(rl) = raw_layers.get(j) {
+                    excl_sources.extend(rl.regions.iter().cloned());
+                }
+            }
+        }
+        let clipped = if excl_sources.is_empty() {
+            combined
+        } else {
+            let excl = union(&excl_sources)?;
+            difference(&combined, &excl)?
+        };
+        let mut clamped = intersection(&clipped, bed_slice)?;
+        clamped.retain(|ex| ex.area_mm2() >= 0.05);
+
+        carried = clamped.clone();
+        if let Some(slot) = support_volume.get_mut(idx) {
+            *slot = clamped;
+        }
+    }
+
+    // Pass 3: Optional build-plate-only reachability filter.
+    if s.on_build_plate_only {
+        let mut reachable = support_volume.first().cloned().unwrap_or_default();
+        for idx in 1..n {
+            if let Some(vol) = support_volume.get_mut(idx) {
+                if reachable.is_empty() || vol.is_empty() {
+                    vol.clear();
+                    reachable.clear();
+                } else {
+                    reachable = intersection(vol, &reachable)?;
+                    *vol = reachable.clone();
+                }
+            }
+        }
+    }
+
+    // Pass 4: Interface vs base splitting & hatching.
+    let iface = s.interface_layers as usize;
+    let mut bottom_contacts: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
+    if iface > 0 {
+        for j in 1..n {
+            let (Some(cur), Some(prev)) = (support_volume.get(j), support_volume.get(j - 1)) else {
+                continue;
+            };
+            if !cur.is_empty() {
+                let bc = difference(cur, prev)?;
+                if let Some(slot) = bottom_contacts.get_mut(j) {
+                    *slot = bc;
+                }
+            }
+        }
+    }
+
+    for idx in 0..n {
+        let Some(vol) = support_volume.get(idx) else {
+            continue;
+        };
+        if vol.is_empty() {
+            continue;
+        }
+        let h = raw_layers
+            .get(idx)
+            .map(|l| l.plane.height_mm)
+            .unwrap_or(config.process.layer_height_mm);
+
+        let interface_here = if iface > 0 {
+            let mut iface_sources: Vec<ExPolygon> = Vec::new();
+            let top_end = (idx + iface - 1).min(n.saturating_sub(1));
+            for j in idx..=top_end {
+                if let Some(co) = contact_overhangs.get(j) {
+                    iface_sources.extend(co.iter().cloned());
+                }
+            }
+            if idx >= 1 {
+                let bot_start = idx.saturating_sub(iface - 1).max(1);
+                for j in bot_start..=idx {
+                    if let Some(bc) = bottom_contacts.get(j) {
+                        iface_sources.extend(bc.iter().cloned());
+                    }
+                }
+            }
+            if iface_sources.is_empty() {
+                Vec::new()
+            } else {
+                intersection(vol, &union(&iface_sources)?)?
+            }
+        } else {
+            Vec::new()
+        };
+
+        let base_here = if interface_here.is_empty() {
+            vol.clone()
+        } else {
+            difference(vol, &interface_here)?
+        };
+
+        let mut layer_paths = Vec::new();
+        let base_speed = if idx == 0 {
+            s.speed_mm_s
+                .min(config.process.effective_first_layer_infill_speed_mm_s())
+        } else {
+            s.speed_mm_s
+        };
+        let iface_speed = if idx == 0 {
+            s.interface_speed_mm_s
+                .min(config.process.effective_first_layer_infill_speed_mm_s())
+        } else {
+            s.interface_speed_mm_s
+        };
+
+        if !base_here.is_empty() {
+            match s.style {
+                SupportStyle::Grid => {
+                    for angle in [0.0, FRAC_PI_2] {
+                        let hatched = generate_rectilinear_hatch(
+                            &base_here,
+                            angle,
+                            s.base_pattern_spacing_mm,
+                            0.0,
+                            false,
+                            ExtrusionRole::Support,
+                            s.line_width_mm,
+                            h,
+                            base_speed,
+                            1.0,
+                        )?;
+                        layer_paths.extend(hatched);
+                    }
+                }
+                SupportStyle::Snug => {
+                    let angle = if idx % 2 == 0 { 0.0 } else { FRAC_PI_2 };
+                    let hatched = generate_rectilinear_hatch(
+                        &base_here,
+                        angle,
+                        s.base_pattern_spacing_mm,
+                        0.0,
+                        false,
+                        ExtrusionRole::Support,
+                        s.line_width_mm,
+                        h,
+                        base_speed,
+                        1.0,
+                    )?;
+                    layer_paths.extend(hatched);
+                }
+            }
+        }
+
+        if !interface_here.is_empty() {
+            let dense_floor = stadium_spacing_mm(s.line_width_mm, h);
+            let iface_spacing = if s.interface_spacing_mm <= 1e-6 {
+                dense_floor
+            } else {
+                (s.line_width_mm + s.interface_spacing_mm).max(dense_floor)
+            };
+            let angle = if idx % 2 == 0 { FRAC_PI_4 } else { -FRAC_PI_4 };
+            let hatched = generate_rectilinear_hatch(
+                &interface_here,
+                angle,
+                iface_spacing,
+                0.0,
+                false,
+                ExtrusionRole::SupportInterface,
+                s.line_width_mm,
+                h,
+                iface_speed,
+                1.0,
+            )?;
+            layer_paths.extend(hatched);
+        }
+
+        if let Some(slot) = per_layer.get_mut(idx) {
+            *slot = layer_paths;
+        }
+    }
+
+    Ok(per_layer)
 }
 
 fn region_aabb(region: &[ExPolygon]) -> Option<Aabb2> {
@@ -1638,5 +1938,163 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn make_c_bracket_mesh(
+        width_mm: f64,
+        depth_mm: f64,
+        base_h: f64,
+        wall_w: f64,
+        gap_h: f64,
+        top_h: f64,
+    ) -> TriangleMesh {
+        let mut tris = make_box_mesh(width_mm, depth_mm, base_h).triangles;
+        let mut wall = make_box_mesh(wall_w, depth_mm, gap_h);
+        wall.translate(0.0, 0.0, base_h).unwrap();
+        tris.extend(wall.triangles);
+        let mut top = make_box_mesh(width_mm, depth_mm, top_h);
+        top.translate(0.0, 0.0, base_h + gap_h).unwrap();
+        tris.extend(top.triangles);
+        TriangleMesh::new(tris).unwrap()
+    }
+
+    #[test]
+    fn grid_support_on_bridge_arch_respects_z_and_xy_clearances() {
+        let mesh = make_bridge_arch_mesh(6.0, 18.0, 10.0, 6.0, 3.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Grid;
+        cfg.process.support.top_z_distance_mm = 0.2;
+        cfg.process.support.xy_distance_mm = 0.5;
+        cfg.process.support.interface_layers = 2;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let has_support = plate
+            .layers
+            .iter()
+            .any(|l| l.paths.iter().any(|p| p.role == ExtrusionRole::Support));
+        let has_iface = plate.layers.iter().any(|l| {
+            l.paths
+                .iter()
+                .any(|p| p.role == ExtrusionRole::SupportInterface)
+        });
+        assert!(has_support);
+        assert!(has_iface);
+
+        // Layer 29 (z_top = 6.0 mm, right below the deck at z=6.0..6.2 mm) must have NO support due to 0.2 mm top Z gap.
+        let gap_layer = &plate.layers[29];
+        assert!(gap_layer.paths.iter().all(|p| !matches!(
+            p.role,
+            ExtrusionRole::Support | ExtrusionRole::SupportInterface
+        )));
+
+        // Every support segment stays clear of pillars [110..116] and [134..140] by xy_distance_mm.
+        for layer in &plate.layers[..29] {
+            for p in layer.paths.iter().filter(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            }) {
+                for pt in &p.points {
+                    let (x, _) = pt.to_mm();
+                    assert!(
+                        x > 116.45 && x < 133.55,
+                        "support intruded into pillar XY clearance at x={x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snug_support_on_60deg_ramp_stays_under_overhang() {
+        let mesh = make_overhang_ramp_mesh(10.0, 12.0, 8.0, 60.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Snug;
+        cfg.process.support.threshold_angle_deg = 45.0;
+        cfg.process.support.interface_layers = 2;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mut max_support_x = f64::NEG_INFINITY;
+        let mut max_model_x = f64::NEG_INFINITY;
+        let mut saw_support = false;
+        let mut saw_iface = false;
+
+        for layer in &plate.layers {
+            for r in &layer.slice_regions {
+                if let Some(bb) = r.aabb() {
+                    max_model_x = max_model_x.max(bb.max.to_mm().0);
+                }
+            }
+            for p in &layer.paths {
+                if matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                ) {
+                    if p.role == ExtrusionRole::Support {
+                        saw_support = true;
+                    } else {
+                        saw_iface = true;
+                    }
+                    for pt in &p.points {
+                        max_support_x = max_support_x.max(pt.to_mm().0);
+                    }
+                }
+            }
+        }
+        assert!(saw_support);
+        assert!(saw_iface);
+        assert!(max_support_x <= max_model_x + 0.05);
+    }
+
+    #[test]
+    fn support_on_build_plate_only_filters_c_bracket() {
+        let mesh = make_c_bracket_mesh(20.0, 10.0, 3.0, 5.0, 6.0, 3.0);
+
+        let mut cfg_plate_only = PrintConfig::default();
+        cfg_plate_only.process.support.enabled = true;
+        cfg_plate_only.process.support.style = SupportStyle::Snug;
+        cfg_plate_only.process.support.on_build_plate_only = true;
+        let plate_filtered = slice_single_mesh(&mesh, &cfg_plate_only).unwrap();
+        let sup_count: usize = plate_filtered
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            })
+            .count();
+        assert_eq!(sup_count, 0);
+
+        let mut cfg_all = cfg_plate_only;
+        cfg_all.process.support.on_build_plate_only = false;
+        let plate_supported = slice_single_mesh(&mesh, &cfg_all).unwrap();
+        // Bottom arm occupies layers 0..15 (z <= 3.0), layer 15 (z=3.0..3.2) is bottom_z_distance gap.
+        let sup_in_gap = plate_supported.layers[..16].iter().any(|l| {
+            l.paths.iter().any(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            })
+        });
+        assert!(!sup_in_gap, "bottom Z gap above lower arm violated");
+        let sup_above_gap = plate_supported.layers[16..44].iter().any(|l| {
+            l.paths.iter().any(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            })
+        });
+        assert!(
+            sup_above_gap,
+            "expected supports between lower and upper C-arms"
+        );
     }
 }

@@ -1,0 +1,21 @@
+{
+  "name": "002-snug-support-overhang",
+  "description": "60 deg overhang ramp with Snug supports, 45 deg threshold & 2 interface layers",
+  "shape": {
+    "kind": "overhang_ramp",
+    "base_width_mm": 10.0,
+    "depth_mm": 12.0,
+    "height_mm": 8.0,
+    "overhang_deg": 60.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "snug",
+        "interface_layers": 2,
+        "threshold_angle_deg": 45.0
+      }
+    }
+  }
+}

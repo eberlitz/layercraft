@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use layercraft_config::{GcodeFlavor, InfillPattern, SeamPosition};
+use layercraft_config::{GcodeFlavor, InfillPattern, SeamPosition, SupportStyle};
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{SampleShape, inspect_mesh};
 use layercraft_slice::ExtrusionRole;
@@ -30,6 +30,7 @@ pub struct LayerCraftApp {
     single_layer_only: bool,
     show_ghost_mesh: bool,
     selected_sample: SampleShape,
+    selected_object_id: Option<u64>,
     #[cfg(not(target_arch = "wasm32"))]
     file_path_input: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -63,6 +64,7 @@ impl LayerCraftApp {
             single_layer_only: false,
             show_ghost_mesh: false,
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
+            selected_object_id: None,
             #[cfg(not(target_arch = "wasm32"))]
             file_path_input: String::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -97,10 +99,11 @@ impl LayerCraftApp {
         match execute(
             &mut self.session,
             cmd,
-            serde_json::json!({ "bytes": bytes }),
+            serde_json::json!({ "bytes": bytes, "name": name }),
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{name}`.");
                 self.frame_camera(CameraPreset::Isometric);
@@ -114,16 +117,45 @@ impl LayerCraftApp {
 
     /// Load a built-in sample primitive through `plate.add_sample_shape`.
     pub fn load_sample(&mut self, shape: SampleShape) {
+        self.load_sample_with_mode(shape, false);
+    }
+
+    /// Load or append a built-in sample primitive on the build plate.
+    pub fn load_sample_with_mode(&mut self, shape: SampleShape, append: bool) {
         self.selected_sample = shape;
         match execute(
             &mut self.session,
             "plate.add_sample_shape",
-            serde_json::json!({ "shape": shape }),
+            serde_json::json!({ "shape": shape, "append": append }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.view_mode = ViewMode::Prepare;
+                let verb = if append { "Added" } else { "Loaded" };
+                self.status_message = format!("{verb} sample `{}`.", shape.label());
+                self.frame_camera(CameraPreset::Isometric);
+                self.rebuild_scene();
+            }
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn auto_arrange_plate(&mut self) {
+        match execute(
+            &mut self.session,
+            "plate.auto_arrange",
+            serde_json::json!({ "spacing_mm": 6.0 }),
         ) {
             Ok(_) => {
                 self.last_error = None;
                 self.view_mode = ViewMode::Prepare;
-                self.status_message = format!("Loaded sample `{}`.", shape.label());
+                self.status_message = format!(
+                    "Arranged {} object(s) on plate.",
+                    self.session.objects.len()
+                );
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
             }
@@ -269,6 +301,7 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{path}`.");
                 self.frame_camera(CameraPreset::Isometric);
@@ -299,7 +332,13 @@ impl LayerCraftApp {
                         }
                     });
                 if ui.button("Load Sample").clicked() {
-                    self.load_sample(self.selected_sample);
+                    self.load_sample_with_mode(self.selected_sample, false);
+                }
+                if ui.button("Add Sample").clicked() {
+                    self.load_sample_with_mode(self.selected_sample, true);
+                }
+                if self.session.objects.len() > 1 && ui.button("Arrange").clicked() {
+                    self.auto_arrange_plate();
                 }
 
                 #[cfg(not(target_arch = "wasm32"))]
@@ -672,6 +711,216 @@ impl LayerCraftApp {
                                 });
                         });
 
+                    egui::CollapsingHeader::new("Supports")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let sup = &mut self.session.config.process.support;
+                            egui::Grid::new("supports_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Enable supports");
+                                    ui.checkbox(&mut sup.enabled, "");
+                                    ui.end_row();
+
+                                    ui.label("Support style");
+                                    egui::ComboBox::from_id_salt("support_style")
+                                        .selected_text(sup.style.label())
+                                        .show_ui(ui, |ui| {
+                                            for st in SupportStyle::ALL {
+                                                ui.selectable_value(&mut sup.style, st, st.label());
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("On build plate only");
+                                    ui.checkbox(&mut sup.on_build_plate_only, "");
+                                    ui.end_row();
+
+                                    ui.label("Threshold angle (deg)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut sup.threshold_angle_deg)
+                                            .speed(1.0)
+                                            .range(10.0..=85.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Top Z gap (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut sup.top_z_distance_mm)
+                                            .speed(0.05)
+                                            .range(0.0..=2.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("XY gap (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut sup.xy_distance_mm)
+                                            .speed(0.05)
+                                            .range(0.0..=5.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Pattern spacing (mm)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut sup.base_pattern_spacing_mm)
+                                            .speed(0.1)
+                                            .range(0.5..=20.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Interface layers");
+                                    ui.add(
+                                        egui::DragValue::new(&mut sup.interface_layers)
+                                            .range(0..=8),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+
+                    enum ObjAction {
+                        Remove(u64),
+                        Transform {
+                            id: u64,
+                            pos: [f64; 2],
+                            rot: [f64; 3],
+                            scale: [f64; 3],
+                        },
+                    }
+                    let mut obj_action: Option<ObjAction> = None;
+                    egui::CollapsingHeader::new("Plate Objects")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            if self.session.objects.is_empty() {
+                                ui.weak("No objects on plate.");
+                            } else {
+                                let entries: Vec<(u64, String, layercraft_mesh::ObjectTransform)> =
+                                    self.session
+                                        .objects
+                                        .iter()
+                                        .map(|o| (o.id, o.name.clone(), o.transform))
+                                        .collect();
+                                for (id, name, _) in &entries {
+                                    let selected = self.selected_object_id == Some(*id);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .selectable_label(selected, format!("#{id} {name}"))
+                                            .clicked()
+                                        {
+                                            self.selected_object_id = Some(*id);
+                                        }
+                                        if ui.small_button("x").clicked() {
+                                            obj_action = Some(ObjAction::Remove(*id));
+                                        }
+                                    });
+                                }
+                                if let Some(sel_id) = self.selected_object_id
+                                    && let Some((_, _, xf)) =
+                                        entries.iter().find(|(id, _, _)| *id == sel_id)
+                                {
+                                    let mut pos = xf.position_xy_mm;
+                                    let mut rot = xf.rotation_deg;
+                                    let mut uni_scale = xf.scale[0];
+                                    let mut changed = false;
+                                    let bw = self.session.config.machine.bed_width_mm;
+                                    let bd = self.session.config.machine.bed_depth_mm;
+
+                                    egui::Grid::new("obj_xf_grid")
+                                        .num_columns(2)
+                                        .spacing([8.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label("X (mm)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut pos[0])
+                                                        .speed(0.5)
+                                                        .range(1.0..=bw),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Y (mm)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut pos[1])
+                                                        .speed(0.5)
+                                                        .range(1.0..=bd),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Rot Z (deg)");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut rot[2])
+                                                        .speed(1.0)
+                                                        .range(-180.0..=180.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+
+                                            ui.label("Scale");
+                                            changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut uni_scale)
+                                                        .speed(0.02)
+                                                        .range(0.1..=5.0),
+                                                )
+                                                .changed();
+                                            ui.end_row();
+                                        });
+
+                                    if changed && obj_action.is_none() {
+                                        obj_action = Some(ObjAction::Transform {
+                                            id: sel_id,
+                                            pos,
+                                            rot,
+                                            scale: [uni_scale, uni_scale, uni_scale],
+                                        });
+                                    }
+                                }
+                            }
+                        });
+
+                    match obj_action {
+                        Some(ObjAction::Remove(id)) => match execute(
+                            &mut self.session,
+                            "plate.remove_object",
+                            serde_json::json!({ "id": id }),
+                        ) {
+                            Ok(_) => {
+                                self.last_error = None;
+                                self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                                self.view_mode = ViewMode::Prepare;
+                                self.rebuild_scene();
+                            }
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        },
+                        Some(ObjAction::Transform {
+                            id,
+                            pos,
+                            rot,
+                            scale,
+                        }) => match execute(
+                            &mut self.session,
+                            "plate.transform_object",
+                            serde_json::json!({
+                                "id": id,
+                                "position_xy_mm": pos,
+                                "rotation_deg": rot,
+                                "scale": scale,
+                            }),
+                        ) {
+                            Ok(_) => {
+                                self.last_error = None;
+                                self.view_mode = ViewMode::Prepare;
+                                self.rebuild_scene();
+                            }
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        },
+                        None => {}
+                    }
+
                     if let Some(mesh) = &self.session.prepared_mesh {
                         ui.separator();
                         ui.heading("Mesh Summary");
@@ -782,6 +1031,8 @@ impl LayerCraftApp {
                         ExtrusionRole::InternalSolidInfill,
                         ExtrusionRole::Bridge,
                         ExtrusionRole::SparseInfill,
+                        ExtrusionRole::Support,
+                        ExtrusionRole::SupportInterface,
                         ExtrusionRole::Skirt,
                         ExtrusionRole::Brim,
                     ] {

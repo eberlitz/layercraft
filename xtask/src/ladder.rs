@@ -5,15 +5,28 @@ use std::time::Instant;
 
 use layercraft_config::PrintConfig;
 use layercraft_gcode::{emit_gcode, evaluate_gcode};
-use layercraft_slice::slice_single_mesh;
+use layercraft_mesh::{ObjectTransform, auto_arrange_footprints, prepare_transformed_object};
+use layercraft_slice::{slice_meshes, slice_single_mesh};
 use layercraft_testkit::{ShapeSpec, build_shape};
 use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct LadderObjectSpec {
+    shape: ShapeSpec,
+    #[serde(default)]
+    transform: Option<ObjectTransform>,
+}
 
 #[derive(Debug, Deserialize)]
 struct LadderRecipe {
     name: String,
     description: String,
-    shape: ShapeSpec,
+    #[serde(default)]
+    shape: Option<ShapeSpec>,
+    #[serde(default)]
+    objects: Vec<LadderObjectSpec>,
+    #[serde(default)]
+    auto_arrange_spacing_mm: Option<f64>,
     config: PrintConfig,
 }
 
@@ -45,6 +58,14 @@ struct LadderExpected {
     require_bridge: bool,
     #[serde(default)]
     require_overhang_wall: bool,
+    #[serde(default)]
+    require_support: bool,
+    #[serde(default)]
+    require_support_interface: bool,
+    #[serde(default)]
+    forbid_support: bool,
+    #[serde(default)]
+    min_bbox_width_mm: Option<f64>,
     #[serde(default)]
     require_gcode_contains: Vec<String>,
 }
@@ -94,8 +115,58 @@ pub fn run(root: &Path) -> Result<(), String> {
                 .map_err(|e| format!("parsing expected.json: {e}"))?;
 
             let start = Instant::now();
-            let mesh = build_shape(&recipe.shape).map_err(|e| e.to_string())?;
-            let plate = slice_single_mesh(&mesh, &recipe.config).map_err(|e| e.to_string())?;
+            let plate = if !recipe.objects.is_empty() {
+                let mut transforms = Vec::with_capacity(recipe.objects.len());
+                let mut raw_meshes = Vec::with_capacity(recipe.objects.len());
+                let mut sizes_xy = Vec::with_capacity(recipe.objects.len());
+
+                for obj in &recipe.objects {
+                    let raw = build_shape(&obj.shape).map_err(|e| e.to_string())?;
+                    let xf = obj.transform.unwrap_or_else(|| ObjectTransform {
+                        position_xy_mm: [
+                            0.5 * recipe.config.machine.bed_width_mm,
+                            0.5 * recipe.config.machine.bed_depth_mm,
+                        ],
+                        ..ObjectTransform::default()
+                    });
+                    let pre = prepare_transformed_object(&raw, xf).map_err(|e| e.to_string())?;
+                    let sz = pre
+                        .aabb()
+                        .map(|bb| bb.size())
+                        .ok_or_else(|| "empty object mesh".to_owned())?;
+                    sizes_xy.push((sz.x.max(0.1), sz.y.max(0.1)));
+                    transforms.push(xf);
+                    raw_meshes.push(raw);
+                }
+
+                if let Some(spacing) = recipe.auto_arrange_spacing_mm {
+                    let centers = auto_arrange_footprints(
+                        &sizes_xy,
+                        recipe.config.machine.bed_width_mm,
+                        recipe.config.machine.bed_depth_mm,
+                        spacing,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    for (xf, pos) in transforms.iter_mut().zip(centers) {
+                        xf.position_xy_mm = pos;
+                    }
+                }
+
+                let mut prepared_meshes = Vec::with_capacity(raw_meshes.len());
+                for (raw, &xf) in raw_meshes.iter().zip(transforms.iter()) {
+                    prepared_meshes
+                        .push(prepare_transformed_object(raw, xf).map_err(|e| e.to_string())?);
+                }
+                slice_meshes(&prepared_meshes, &recipe.config).map_err(|e| e.to_string())?
+            } else if let Some(shape) = &recipe.shape {
+                let mesh = build_shape(shape).map_err(|e| e.to_string())?;
+                slice_single_mesh(&mesh, &recipe.config).map_err(|e| e.to_string())?
+            } else {
+                return Err(format!(
+                    "{tier_name}/{}: recipe must specify `shape` or `objects`",
+                    recipe.name
+                ));
+            };
             let out = emit_gcode(&plate, &recipe.config).map_err(|e| e.to_string())?;
             let (rep, segs) = evaluate_gcode(
                 &out.gcode,
@@ -203,9 +274,26 @@ pub fn run(root: &Path) -> Result<(), String> {
             for (required, feat) in [
                 (exp.require_bridge, "Bridge"),
                 (exp.require_overhang_wall, "Overhang wall"),
+                (exp.require_support, "Support"),
+                (exp.require_support_interface, "Support interface"),
             ] {
                 if required && rep.feature_volumes_mm3.get(feat).copied().unwrap_or(0.0) <= 0.0 {
                     errs.push(format!("missing {feat} extrusions"));
+                }
+            }
+            if exp.forbid_support {
+                for feat in ["Support", "Support interface"] {
+                    if rep.feature_volumes_mm3.get(feat).copied().unwrap_or(0.0) > 0.0 {
+                        errs.push(format!("unexpected {feat} extrusions"));
+                    }
+                }
+            }
+            if let Some(min_w) = exp.min_bbox_width_mm {
+                let got_w = rep.extrusion_bbox_xy.map(|b| b[2] - b[0]).unwrap_or(0.0);
+                if got_w < min_w {
+                    errs.push(format!(
+                        "extrusion bbox width {got_w:.2} mm < {min_w:.2} mm"
+                    ));
                 }
             }
             for needle in &exp.require_gcode_contains {

@@ -228,6 +228,8 @@ pub fn role_color(role: ExtrusionRole) -> [f32; 4] {
         ExtrusionRole::InternalSolidInfill => [0.62, 0.36, 0.85, 1.0],
         ExtrusionRole::Bridge => [0.20, 0.56, 0.98, 1.0],
         ExtrusionRole::SparseInfill => [0.26, 0.78, 0.44, 1.0],
+        ExtrusionRole::Support => [0.22, 0.80, 0.62, 1.0],
+        ExtrusionRole::SupportInterface => [0.12, 0.56, 0.44, 1.0],
         ExtrusionRole::Skirt => [0.35, 0.84, 0.74, 1.0],
         ExtrusionRole::Brim => [0.40, 0.65, 0.96, 1.0],
     }

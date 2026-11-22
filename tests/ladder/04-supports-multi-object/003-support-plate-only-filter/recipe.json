@@ -1,0 +1,22 @@
+{
+  "name": "003-support-plate-only-filter",
+  "description": "C-bracket verifying on_build_plate_only suppresses internal support above lower arm",
+  "shape": {
+    "kind": "c_bracket",
+    "width_mm": 20.0,
+    "depth_mm": 10.0,
+    "base_height_mm": 3.0,
+    "wall_width_mm": 5.0,
+    "gap_height_mm": 6.0,
+    "top_height_mm": 3.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "snug",
+        "on_build_plate_only": true
+      }
+    }
+  }
+}

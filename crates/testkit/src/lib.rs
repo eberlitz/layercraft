@@ -61,6 +61,14 @@ pub enum ShapeSpec {
         height_mm: f64,
         overhang_deg: f64,
     },
+    CBracket {
+        width_mm: f64,
+        depth_mm: f64,
+        base_height_mm: f64,
+        wall_width_mm: f64,
+        gap_height_mm: f64,
+        top_height_mm: f64,
+    },
 }
 
 fn default_segments() -> usize {
@@ -134,6 +142,21 @@ pub fn build_shape(spec: &ShapeSpec) -> Result<TriangleMesh, TestkitError> {
             depth_mm,
             height_mm,
             overhang_deg,
+        )?),
+        ShapeSpec::CBracket {
+            width_mm,
+            depth_mm,
+            base_height_mm,
+            wall_width_mm,
+            gap_height_mm,
+            top_height_mm,
+        } => Ok(make_c_bracket(
+            width_mm,
+            depth_mm,
+            base_height_mm,
+            wall_width_mm,
+            gap_height_mm,
+            top_height_mm,
         )?),
     }
 }
@@ -291,6 +314,25 @@ pub fn make_overhang_ramp(
     push_quad(&mut tris, p010, p011, p111, p110);
     push_quad(&mut tris, p000, p001, p011, p010);
     push_quad(&mut tris, p100, p110, p111, p101);
+    TriangleMesh::new(tris)
+}
+
+/// Watertight C-bracket with lower arm, back vertical wall, and overhanging upper arm.
+pub fn make_c_bracket(
+    width_mm: f64,
+    depth_mm: f64,
+    base_height_mm: f64,
+    wall_width_mm: f64,
+    gap_height_mm: f64,
+    top_height_mm: f64,
+) -> Result<TriangleMesh, GeomError> {
+    let mut tris = make_box(width_mm, depth_mm, base_height_mm)?.triangles;
+    let mut wall = make_box(wall_width_mm, depth_mm, gap_height_mm)?;
+    wall.translate(0.0, 0.0, base_height_mm)?;
+    tris.extend(wall.triangles);
+    let mut top = make_box(width_mm, depth_mm, top_height_mm)?;
+    top.translate(0.0, 0.0, base_height_mm + gap_height_mm)?;
+    tris.extend(top.triangles);
     TriangleMesh::new(tris)
 }
 

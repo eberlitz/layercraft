@@ -1,0 +1,7 @@
+{
+  "layer_count": 45,
+  "max_z_mm": 9.0,
+  "require_outer_wall": true,
+  "require_support": true,
+  "require_support_interface": true
+}

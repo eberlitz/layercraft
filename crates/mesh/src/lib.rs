@@ -118,6 +118,141 @@ pub fn prepare_for_plate(
     Ok(clean)
 }
 
+/// Placement transform for a single object on the build plate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ObjectTransform {
+    /// Desired XY center position on the build plate in millimeters.
+    pub position_xy_mm: [f64; 2],
+    /// Euler XYZ rotation in degrees.
+    pub rotation_deg: [f64; 3],
+    /// Positive XYZ scale factors.
+    pub scale: [f64; 3],
+}
+
+impl Default for ObjectTransform {
+    fn default() -> Self {
+        Self {
+            position_xy_mm: [125.0, 125.0],
+            rotation_deg: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// Clean degenerate triangles and apply scale -> rotation -> ground & XY placement.
+pub fn prepare_transformed_object(
+    mesh: &TriangleMesh,
+    transform: ObjectTransform,
+) -> Result<TriangleMesh, MeshError> {
+    if !transform.position_xy_mm.iter().all(|v| v.is_finite())
+        || !transform.rotation_deg.iter().all(|v| v.is_finite())
+        || !transform.scale.iter().all(|v| v.is_finite() && *v > 0.0)
+    {
+        return Err(MeshError::InvalidSchedule(
+            "object transform must be finite with positive scale",
+        ));
+    }
+    let valid: Vec<Triangle> = mesh
+        .triangles
+        .iter()
+        .copied()
+        .filter(|t| t.is_finite() && t.area_mm2() > 1e-12)
+        .collect();
+    let mut clean = TriangleMesh::new(valid)?;
+    clean.scale(transform.scale[0], transform.scale[1], transform.scale[2])?;
+    clean.rotate_euler_deg(
+        transform.rotation_deg[0],
+        transform.rotation_deg[1],
+        transform.rotation_deg[2],
+    )?;
+    clean.ground_and_center(transform.position_xy_mm[0], transform.position_xy_mm[1])?;
+    Ok(clean)
+}
+
+/// Pack axis-aligned 2D footprints `(width_mm, depth_mm)` onto the build plate using FFDH shelf packing,
+/// centered as a group on `(bed_width / 2, bed_depth / 2)`.
+pub fn auto_arrange_footprints(
+    sizes_xy: &[(f64, f64)],
+    bed_width_mm: f64,
+    bed_depth_mm: f64,
+    spacing_mm: f64,
+) -> Result<Vec<[f64; 2]>, MeshError> {
+    if !bed_width_mm.is_finite()
+        || !bed_depth_mm.is_finite()
+        || bed_width_mm <= 4.0
+        || bed_depth_mm <= 4.0
+    {
+        return Err(MeshError::InvalidSchedule(
+            "bed dimensions must be finite and > 4 mm",
+        ));
+    }
+    if !spacing_mm.is_finite() || spacing_mm < 0.0 {
+        return Err(MeshError::InvalidSchedule(
+            "spacing must be finite and >= 0",
+        ));
+    }
+    if sizes_xy.is_empty() {
+        return Ok(Vec::new());
+    }
+    for &(w, d) in sizes_xy {
+        if !w.is_finite() || !d.is_finite() || w <= 0.0 || d <= 0.0 {
+            return Err(MeshError::InvalidSchedule(
+                "object footprint dimensions must be finite and > 0",
+            ));
+        }
+    }
+
+    let usable_w = bed_width_mm - 4.0;
+    let mut order: Vec<usize> = (0..sizes_xy.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (wa, da) = sizes_xy.get(a).copied().unwrap_or((0.0, 0.0));
+        let (wb, db) = sizes_xy.get(b).copied().unwrap_or((0.0, 0.0));
+        db.total_cmp(&da)
+            .then_with(|| wb.total_cmp(&wa))
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut placed = vec![[0.0, 0.0]; sizes_xy.len()];
+    let mut cur_x = 0.0_f64;
+    let mut cur_y = 0.0_f64;
+    let mut shelf_h = 0.0_f64;
+    let mut used_w = 0.0_f64;
+
+    for idx in order {
+        let (w, d) = sizes_xy.get(idx).copied().unwrap_or((0.0, 0.0));
+        if cur_x > 0.0 && cur_x + w > usable_w {
+            cur_y += shelf_h + spacing_mm;
+            cur_x = 0.0;
+            shelf_h = 0.0;
+        }
+        let cx = cur_x + 0.5 * w;
+        let cy = cur_y + 0.5 * d;
+        if let Some(slot) = placed.get_mut(idx) {
+            *slot = [cx, cy];
+        }
+        used_w = used_w.max(cur_x + w);
+        cur_x += w + spacing_mm;
+        shelf_h = shelf_h.max(d);
+    }
+
+    let used_d = cur_y + shelf_h;
+    if used_w > bed_width_mm - 2.0 || used_d > bed_depth_mm - 2.0 {
+        return Err(MeshError::InvalidSchedule(
+            "objects do not fit on build plate",
+        ));
+    }
+
+    let shift_x = 0.5 * (bed_width_mm - used_w);
+    let shift_y = 0.5 * (bed_depth_mm - used_d);
+    for pos in &mut placed {
+        pos[0] += shift_x;
+        pos[1] += shift_y;
+    }
+
+    Ok(placed)
+}
+
 /// A single layer Z slice definition.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LayerPlane {
@@ -542,5 +677,56 @@ mod tests {
             assert!((layer.regions[0].area_mm2() - 400.0).abs() < 1e-4);
             assert!(layer.regions[0].outer.is_ccw());
         }
+    }
+
+    #[test]
+    fn transformed_object_and_auto_arrange_pack_without_overlap() {
+        let base = unit_cube(20.0);
+        let xf = ObjectTransform {
+            position_xy_mm: [80.0, 90.0],
+            rotation_deg: [0.0, 0.0, 45.0],
+            scale: [1.5, 1.0, 0.5],
+        };
+        let placed = prepare_transformed_object(&base, xf).unwrap();
+        let aabb = placed.aabb().unwrap();
+        assert!((aabb.min.z - 0.0).abs() < 1e-6);
+        assert!((aabb.max.z - 10.0).abs() < 1e-6);
+        assert!((aabb.center().x - 80.0).abs() < 1e-4);
+        assert!((aabb.center().y - 90.0).abs() < 1e-4);
+
+        let two =
+            auto_arrange_footprints(&[(20.0, 20.0), (30.0, 15.0)], 250.0, 250.0, 8.0).unwrap();
+        assert_eq!(two.len(), 2);
+        let dx = (two[0][0] - two[1][0]).abs();
+        assert!(dx >= 0.5 * 20.0 + 0.5 * 30.0 + 8.0 - 1e-6);
+
+        let four_sizes = [(40.0, 50.0), (60.0, 30.0), (50.0, 40.0), (80.0, 45.0)];
+        let four = auto_arrange_footprints(&four_sizes, 180.0, 180.0, 10.0).unwrap();
+        for i in 0..four.len() {
+            let (wi, di) = four_sizes[i];
+            assert!(four[i][0] - 0.5 * wi >= 0.0 && four[i][0] + 0.5 * wi <= 180.0);
+            assert!(four[i][1] - 0.5 * di >= 0.0 && four[i][1] + 0.5 * di <= 180.0);
+            for j in (i + 1)..four.len() {
+                let (wj, dj) = four_sizes[j];
+                let gap_x = (four[i][0] - four[j][0]).abs() - 0.5 * (wi + wj);
+                let gap_y = (four[i][1] - four[j][1]).abs() - 0.5 * (di + dj);
+                assert!(
+                    gap_x >= 10.0 - 1e-6 || gap_y >= 10.0 - 1e-6,
+                    "footprints {i} and {j} overlap or violate spacing: gap_x={gap_x}, gap_y={gap_y}"
+                );
+            }
+        }
+
+        assert!(auto_arrange_footprints(&[(300.0, 20.0)], 250.0, 250.0, 6.0).is_err());
+        assert!(
+            prepare_transformed_object(
+                &base,
+                ObjectTransform {
+                    scale: [0.0, 1.0, 1.0],
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
     }
 }

@@ -3700,6 +3700,7 @@ dependencies = [
  "layercraft-config",
  "layercraft-gcode",
  "layercraft-geom",
+ "layercraft-mesh",
  "layercraft-slice",
  "layercraft-testkit",
  "serde",

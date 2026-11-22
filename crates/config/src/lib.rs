@@ -207,8 +207,70 @@ pub struct ProcessConfig {
     pub overhang_threshold_deg: f64,
     pub overhang_speed_mm_s: f64,
     pub monotonic_solid_infill: bool,
+    pub support: SupportConfig,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
+}
+
+/// Support structure style dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportStyle {
+    #[default]
+    Grid,
+    Snug,
+}
+
+impl SupportStyle {
+    /// All supported support styles.
+    pub const ALL: [Self; 2] = [Self::Grid, Self::Snug];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grid => "Grid",
+            Self::Snug => "Snug",
+        }
+    }
+}
+
+/// Automatic support structure configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SupportConfig {
+    pub enabled: bool,
+    pub style: SupportStyle,
+    pub on_build_plate_only: bool,
+    pub threshold_angle_deg: f64,
+    pub top_z_distance_mm: f64,
+    pub bottom_z_distance_mm: f64,
+    pub xy_distance_mm: f64,
+    pub base_pattern_spacing_mm: f64,
+    pub interface_layers: u16,
+    pub interface_spacing_mm: f64,
+    pub line_width_mm: f64,
+    pub speed_mm_s: f64,
+    pub interface_speed_mm_s: f64,
+}
+
+impl Default for SupportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            style: SupportStyle::Grid,
+            on_build_plate_only: false,
+            threshold_angle_deg: 45.0,
+            top_z_distance_mm: 0.2,
+            bottom_z_distance_mm: 0.2,
+            xy_distance_mm: 0.35,
+            base_pattern_spacing_mm: 2.5,
+            interface_layers: 2,
+            interface_spacing_mm: 0.2,
+            line_width_mm: 0.42,
+            speed_mm_s: 80.0,
+            interface_speed_mm_s: 50.0,
+        }
+    }
 }
 
 impl Default for ProcessConfig {
@@ -240,6 +302,7 @@ impl Default for ProcessConfig {
             overhang_threshold_deg: 45.0,
             overhang_speed_mm_s: 25.0,
             monotonic_solid_infill: true,
+            support: SupportConfig::default(),
             skirt_loops: 0,
             brim_width_mm: 0.0,
         }
@@ -454,6 +517,58 @@ impl PrintConfig {
             "process.overhang_speed_mm_s",
             self.process.overhang_speed_mm_s,
         )?;
+        let sup = &self.process.support;
+        for (field, val, min, max) in [
+            (
+                "process.support.threshold_angle_deg",
+                sup.threshold_angle_deg,
+                10.0,
+                85.0,
+            ),
+            (
+                "process.support.top_z_distance_mm",
+                sup.top_z_distance_mm,
+                0.0,
+                2.0,
+            ),
+            (
+                "process.support.bottom_z_distance_mm",
+                sup.bottom_z_distance_mm,
+                0.0,
+                2.0,
+            ),
+            (
+                "process.support.xy_distance_mm",
+                sup.xy_distance_mm,
+                0.0,
+                5.0,
+            ),
+            (
+                "process.support.base_pattern_spacing_mm",
+                sup.base_pattern_spacing_mm,
+                0.5,
+                20.0,
+            ),
+            (
+                "process.support.interface_spacing_mm",
+                sup.interface_spacing_mm,
+                0.0,
+                5.0,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+        check_pos("process.support.line_width_mm", sup.line_width_mm)?;
+        check_pos("process.support.speed_mm_s", sup.speed_mm_s)?;
+        check_pos(
+            "process.support.interface_speed_mm_s",
+            sup.interface_speed_mm_s,
+        )?;
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
         if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
@@ -569,5 +684,24 @@ mod tests {
         let mut cfg13 = PrintConfig::default();
         cfg13.process.overhang_speed_mm_s = -10.0;
         assert!(cfg13.validate().is_err());
+
+        let mut cfg14 = PrintConfig::default();
+        cfg14.process.support.threshold_angle_deg = 90.0;
+        assert!(cfg14.validate().is_err());
+        cfg14.process.support.threshold_angle_deg = 45.0;
+        cfg14.process.support.top_z_distance_mm = 3.0;
+        assert!(cfg14.validate().is_err());
+        cfg14.process.support.top_z_distance_mm = 0.2;
+        cfg14.process.support.xy_distance_mm = -0.1;
+        assert!(cfg14.validate().is_err());
+        cfg14.process.support.xy_distance_mm = 0.35;
+        cfg14.process.support.base_pattern_spacing_mm = 0.2;
+        assert!(cfg14.validate().is_err());
+        cfg14.process.support.base_pattern_spacing_mm = 2.5;
+        cfg14.process.support.line_width_mm = 0.0;
+        assert!(cfg14.validate().is_err());
+        cfg14.process.support.line_width_mm = 0.42;
+        cfg14.process.support.interface_speed_mm_s = f64::NAN;
+        assert!(cfg14.validate().is_err());
     }
 }

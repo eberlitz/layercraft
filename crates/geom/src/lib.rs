@@ -19,6 +19,9 @@ pub enum GeomError {
     /// A triangle mesh contained no valid triangles.
     #[error("triangle mesh is empty")]
     EmptyMesh,
+    /// An invalid mesh transform parameter was provided.
+    #[error("invalid transform parameter: {0}")]
+    InvalidTransform(&'static str),
 }
 
 /// Convert millimeters (`f64`) to fixed-point nanometers (`i64`).
@@ -456,6 +459,75 @@ impl TriangleMesh {
         let c = aabb.center();
         self.translate(bed_cx - c.x, bed_cy - c.y, -aabb.min.z)
     }
+
+    /// Scale every vertex by `(sx, sy, sz)` around `(aabb.center().x, aabb.center().y, aabb.min.z)`.
+    pub fn scale(&mut self, sx: f64, sy: f64, sz: f64) -> Result<(), GeomError> {
+        if !sx.is_finite() || sx <= 0.0 {
+            return Err(GeomError::InvalidTransform(
+                "scale.x must be finite and > 0",
+            ));
+        }
+        if !sy.is_finite() || sy <= 0.0 {
+            return Err(GeomError::InvalidTransform(
+                "scale.y must be finite and > 0",
+            ));
+        }
+        if !sz.is_finite() || sz <= 0.0 {
+            return Err(GeomError::InvalidTransform(
+                "scale.z must be finite and > 0",
+            ));
+        }
+        let aabb = self.aabb().ok_or(GeomError::EmptyMesh)?;
+        let c = aabb.center();
+        let pivot = Point3::new(c.x, c.y, aabb.min.z);
+        for tri in &mut self.triangles {
+            for p in [&mut tri.a, &mut tri.b, &mut tri.c] {
+                p.x = pivot.x + (p.x - pivot.x) * sx;
+                p.y = pivot.y + (p.y - pivot.y) * sy;
+                p.z = pivot.z + (p.z - pivot.z) * sz;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rotate every vertex around `aabb.center()` by Euler XYZ angles in degrees.
+    pub fn rotate_euler_deg(
+        &mut self,
+        rx_deg: f64,
+        ry_deg: f64,
+        rz_deg: f64,
+    ) -> Result<(), GeomError> {
+        if !rx_deg.is_finite() || !ry_deg.is_finite() || !rz_deg.is_finite() {
+            return Err(GeomError::InvalidTransform(
+                "rotation angles must be finite",
+            ));
+        }
+        let aabb = self.aabb().ok_or(GeomError::EmptyMesh)?;
+        let pivot = aabb.center().to_vec3();
+        let rot = glam::DQuat::from_euler(
+            glam::EulerRot::XYZ,
+            rx_deg.to_radians(),
+            ry_deg.to_radians(),
+            rz_deg.to_radians(),
+        );
+        for tri in &mut self.triangles {
+            for p in [&mut tri.a, &mut tri.b, &mut tri.c] {
+                let rel = p.to_vec3() - pivot;
+                *p = Point3::from_vec3(pivot + rot * rel);
+            }
+        }
+        Ok(())
+    }
+
+    /// Combine triangles from multiple meshes into a single mesh.
+    pub fn merge(meshes: &[TriangleMesh]) -> Result<TriangleMesh, GeomError> {
+        let total: usize = meshes.iter().map(|m| m.triangles.len()).sum();
+        let mut all = Vec::with_capacity(total);
+        for m in meshes {
+            all.extend_from_slice(&m.triangles);
+        }
+        TriangleMesh::new(all)
+    }
 }
 
 #[cfg(test)]
@@ -514,5 +586,61 @@ mod tests {
             TriangleMesh::new(vec![]),
             Err(GeomError::EmptyMesh)
         ));
+    }
+
+    #[test]
+    fn mesh_scale_rotate_and_merge_preserve_geometry() {
+        let make_box = |w: f64, d: f64, h: f64| {
+            let tris = [
+                ((0.0, 0.0, 0.0), (0.0, d, 0.0), (w, d, 0.0)),
+                ((0.0, 0.0, 0.0), (w, d, 0.0), (w, 0.0, 0.0)),
+                ((0.0, 0.0, h), (w, 0.0, h), (w, d, h)),
+                ((0.0, 0.0, h), (w, d, h), (0.0, d, h)),
+                ((0.0, 0.0, 0.0), (w, 0.0, 0.0), (w, 0.0, h)),
+                ((0.0, 0.0, 0.0), (w, 0.0, h), (0.0, 0.0, h)),
+                ((0.0, d, 0.0), (0.0, d, h), (w, d, h)),
+                ((0.0, d, 0.0), (w, d, h), (w, d, 0.0)),
+                ((0.0, 0.0, 0.0), (0.0, 0.0, h), (0.0, d, h)),
+                ((0.0, 0.0, 0.0), (0.0, d, h), (0.0, d, 0.0)),
+                ((w, 0.0, 0.0), (w, d, 0.0), (w, d, h)),
+                ((w, 0.0, 0.0), (w, d, h), (w, 0.0, h)),
+            ]
+            .into_iter()
+            .map(|(a, b, c)| {
+                Triangle::new(
+                    Point3::new(a.0, a.1, a.2),
+                    Point3::new(b.0, b.1, b.2),
+                    Point3::new(c.0, c.1, c.2),
+                )
+            })
+            .collect();
+            TriangleMesh::new(tris).unwrap()
+        };
+
+        let mut m = make_box(20.0, 10.0, 5.0);
+        let orig_vol = m.signed_volume_mm3();
+        assert!((orig_vol - 1000.0).abs() < 1e-4);
+
+        m.scale(2.0, 1.5, 3.0).unwrap();
+        assert!((m.signed_volume_mm3() - orig_vol * 9.0).abs() < 1e-3);
+        let sz_before = m.aabb().unwrap().size();
+        assert!((sz_before.x - 40.0).abs() < 1e-4);
+        assert!((sz_before.y - 15.0).abs() < 1e-4);
+
+        m.rotate_euler_deg(0.0, 0.0, 90.0).unwrap();
+        assert!((m.signed_volume_mm3() - orig_vol * 9.0).abs() < 1e-3);
+        let sz_after = m.aabb().unwrap().size();
+        assert!((sz_after.x - 15.0).abs() < 1e-4);
+        assert!((sz_after.y - 40.0).abs() < 1e-4);
+
+        let b2 = make_box(10.0, 10.0, 10.0);
+        let merged = TriangleMesh::merge(&[m.clone(), b2]).unwrap();
+        assert_eq!(merged.triangles.len(), 24);
+        assert!(TriangleMesh::merge(&[]).is_err());
+
+        assert!(m.scale(0.0, 1.0, 1.0).is_err());
+        assert!(m.scale(-1.0, 1.0, 1.0).is_err());
+        assert!(m.scale(f64::NAN, 1.0, 1.0).is_err());
+        assert!(m.rotate_euler_deg(f64::INFINITY, 0.0, 0.0).is_err());
     }
 }

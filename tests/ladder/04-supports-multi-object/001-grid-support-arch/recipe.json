@@ -1,0 +1,22 @@
+{
+  "name": "001-grid-support-arch",
+  "description": "Bridge arch with Grid supports, 0.2 mm top Z gap & 2 dense support interface layers",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 6.0,
+    "span_mm": 18.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 6.0,
+    "deck_height_mm": 3.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "grid",
+        "interface_layers": 2,
+        "top_z_distance_mm": 0.2
+      }
+    }
+  }
+}

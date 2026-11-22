@@ -14,6 +14,7 @@ clap.workspace = true
 layercraft-config.workspace = true
 layercraft-gcode.workspace = true
 layercraft-geom.workspace = true
+layercraft-mesh.workspace = true
 layercraft-slice.workspace = true
 layercraft-testkit.workspace = true
 serde.workspace = true
