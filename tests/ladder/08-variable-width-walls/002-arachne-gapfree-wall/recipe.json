@@ -1,0 +1,20 @@
+{
+  "name": "002-arachne-gapfree-wall",
+  "description": "Intermediate 1.05 mm wall widens two-pass Arachne outer loop to ~0.55 mm to eliminate center air gaps",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 1.05,
+    "height_mm": 4.0
+  },
+  "config": {
+    "process": {
+      "layer_height_mm": 0.2,
+      "first_layer_height_mm": 0.2,
+      "wall_loops": 2,
+      "outer_wall_width_mm": 0.42,
+      "inner_wall_width_mm": 0.45,
+      "wall_generator": "arachne"
+    }
+  }
+}

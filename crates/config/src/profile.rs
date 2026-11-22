@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::{
     ConfigError, GcodeFlavor, InfillPattern, IroningType, PrintConfig, SeamPosition, SupportStyle,
+    WallGenerator,
 };
 
 /// Maximum inheritance chain length allowed when resolving profiles.
@@ -1597,6 +1598,71 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["wall_generator"])
+        && !is_nil_value(v)
+    {
+        let raw = parse_string_val(k, v)?;
+        cfg.process.wall_generator = match raw.trim().to_ascii_lowercase().as_str() {
+            "classic" => WallGenerator::Classic,
+            "arachne" => WallGenerator::Arachne,
+            _ => {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    format!("wall_generator `{raw}` approximated using `classic`"),
+                );
+                WallGenerator::Classic
+            }
+        };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["min_bead_width"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arachne.min_bead_width_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["min_feature_size"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arachne.min_feature_size_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["wall_distribution_count"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arachne.wall_distribution_count = parse_u16_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["wall_transition_length"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arachne.transition_length_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &["wall_transition_angle", "wall_transition_threshold_angle"],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.arachne.transition_threshold_angle_deg = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["wall_transition_filter_deviation"])
+        && !is_nil_value(v)
+    {
+        cfg.process.arachne.transition_filter_deviation_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    ctx.mark_recognized_if_present(s, &["min_length_factor", "wall_transition_filter_margin"]);
+
     if let Some((k, v)) = ctx.get_primary(s, &["top_shell_layers", "top_solid_layers"])
         && !is_nil_value(v)
     {
@@ -2942,5 +3008,41 @@ mod tests {
         assert!(!res.config.process.scarf_seam.entire_loop);
         assert!(res.config.process.arc_fitting);
         assert!((res.config.process.arc_tolerance_mm - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arachne_profile_keys_map_without_warnings() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"{
+                "type": "process",
+                "name": "arachne_020",
+                "layer_height": "0.2",
+                "wall_generator": "arachne",
+                "min_bead_width": "85%",
+                "min_feature_size": "25%",
+                "wall_distribution_count": "2",
+                "wall_transition_length": "100%",
+                "wall_transition_angle": "12",
+                "wall_transition_filter_deviation": "25%",
+                "min_length_factor": "1",
+                "wall_transition_filter_margin": "25%"
+            }"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(&PrintConfig::default(), None, None, Some("arachne_020"))
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert_eq!(res.config.process.wall_generator, WallGenerator::Arachne);
+        assert!((res.config.process.arachne.min_bead_width_ratio - 0.85).abs() < 1e-9);
+        assert!((res.config.process.arachne.min_feature_size_ratio - 0.25).abs() < 1e-9);
+        assert_eq!(res.config.process.arachne.wall_distribution_count, 2);
+        assert!((res.config.process.arachne.transition_length_ratio - 1.0).abs() < 1e-9);
+        assert!((res.config.process.arachne.transition_threshold_angle_deg - 12.0).abs() < 1e-9);
+        assert!((res.config.process.arachne.transition_filter_deviation_ratio - 0.25).abs() < 1e-9);
     }
 }

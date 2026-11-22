@@ -1,0 +1,18 @@
+{
+  "name": "004-arachne-profile-02mm-nozzle",
+  "description": "Thin 0.30 mm hollow cylinder sliced with built-in 0.2 mm HF nozzle presets and Arachne + G2/G3 arc fitting profile",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 8.0,
+    "inner_radius_mm": 7.70,
+    "height_mm": 3.0,
+    "segments": 64
+  },
+  "profile_bundle": {
+    "use_builtins": true,
+    "dir": "profiles",
+    "machine": "LayerCraft CORE One+ HF 0.2mm",
+    "filament": "LayerCraft PLA (0.2mm HF Nozzle)",
+    "process": "arachne_02"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_sparse_infill": true,
+  "min_bbox_width_mm": 22.8,
+  "min_wall_width_variation_ratio": 1.30
+}

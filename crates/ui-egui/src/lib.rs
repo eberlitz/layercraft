@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use layercraft_config::{
     GcodeFlavor, InfillPattern, IroningType, ProfileApplyResult, ProfileKind, ProfileSummary,
-    SeamPosition, SupportStyle,
+    SeamPosition, SupportStyle, WallGenerator,
 };
 use layercraft_engine::{Session, execute};
 use layercraft_mesh::{SampleShape, inspect_mesh};
@@ -761,6 +761,70 @@ impl LayerCraftApp {
                             ui.label("Wall loops");
                             ui.add(egui::DragValue::new(&mut p.wall_loops).range(0..=12));
                             ui.end_row();
+
+                            ui.label("Wall generator");
+                            egui::ComboBox::from_id_salt("wall_gen")
+                                .selected_text(p.wall_generator.label())
+                                .show_ui(ui, |ui| {
+                                    for wg in WallGenerator::ALL {
+                                        ui.selectable_value(&mut p.wall_generator, wg, wg.label());
+                                    }
+                                });
+                            ui.end_row();
+
+                            if p.wall_generator == WallGenerator::Arachne {
+                                let mut min_pct = p.arachne.min_bead_width_ratio * 100.0;
+                                ui.label("Min bead width (%)");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut min_pct)
+                                            .speed(1.0)
+                                            .range(20.0..=100.0),
+                                    )
+                                    .changed()
+                                {
+                                    p.arachne.min_bead_width_ratio =
+                                        (min_pct / 100.0).clamp(0.20, 1.00);
+                                }
+                                ui.end_row();
+
+                                let mut max_pct = p.arachne.max_bead_width_ratio * 100.0;
+                                ui.label("Max bead width (%)");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut max_pct)
+                                            .speed(1.0)
+                                            .range(100.0..=300.0),
+                                    )
+                                    .changed()
+                                {
+                                    p.arachne.max_bead_width_ratio =
+                                        (max_pct / 100.0).clamp(1.00, 3.00);
+                                }
+                                ui.end_row();
+
+                                let mut feat_pct = p.arachne.min_feature_size_ratio * 100.0;
+                                ui.label("Min feature size (%)");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut feat_pct)
+                                            .speed(1.0)
+                                            .range(5.0..=100.0),
+                                    )
+                                    .changed()
+                                {
+                                    p.arachne.min_feature_size_ratio =
+                                        (feat_pct / 100.0).clamp(0.05, 1.00);
+                                }
+                                ui.end_row();
+
+                                ui.label("Wall dist count");
+                                ui.add(
+                                    egui::DragValue::new(&mut p.arachne.wall_distribution_count)
+                                        .range(1..=8),
+                                );
+                                ui.end_row();
+                            }
 
                             ui.label("Top shell layers");
                             ui.add(egui::DragValue::new(&mut p.top_shell_layers).range(0..=20));

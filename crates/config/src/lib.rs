@@ -209,6 +209,62 @@ impl FilamentConfig {
     }
 }
 
+/// Strategy for generating perimeter walls around slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WallGenerator {
+    #[default]
+    Classic,
+    Arachne,
+}
+
+impl WallGenerator {
+    /// All supported perimeter wall generators.
+    pub const ALL: [Self; 2] = [Self::Classic, Self::Arachne];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Arachne => "Arachne",
+        }
+    }
+}
+
+/// Variable-width perimeter wall (Arachne) configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ArachneConfig {
+    /// Minimum extrusion bead width expressed as a fraction of nominal wall width (`0.20..=1.00`).
+    pub min_bead_width_ratio: f64,
+    /// Maximum extrusion bead width expressed as a fraction of nominal wall width (`1.00..=3.00`).
+    pub max_bead_width_ratio: f64,
+    /// Minimum thin feature thickness expressed as a fraction of nominal outer wall width (`0.05..=1.00`).
+    pub min_feature_size_ratio: f64,
+    /// Number of innermost wall loops across which extra width deficit/surplus is distributed (`1..=8`).
+    pub wall_distribution_count: u16,
+    /// Wall transition length expressed as a fraction of nominal line width (`0.10..=5.00`).
+    pub transition_length_ratio: f64,
+    /// Threshold wall angle (degrees) for width transition placement (`0.0..=60.0`).
+    pub transition_threshold_angle_deg: f64,
+    /// Maximum deviation filter ratio during transition cleanup (`0.0..=1.0`).
+    pub transition_filter_deviation_ratio: f64,
+}
+
+impl Default for ArachneConfig {
+    fn default() -> Self {
+        Self {
+            min_bead_width_ratio: 0.85,
+            max_bead_width_ratio: 2.00,
+            min_feature_size_ratio: 0.25,
+            wall_distribution_count: 1,
+            transition_length_ratio: 1.00,
+            transition_threshold_angle_deg: 10.0,
+            transition_filter_deviation_ratio: 0.25,
+        }
+    }
+}
+
 /// Slicing process parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -216,6 +272,8 @@ pub struct ProcessConfig {
     pub layer_height_mm: f64,
     pub first_layer_height_mm: f64,
     pub wall_loops: u16,
+    pub wall_generator: WallGenerator,
+    pub arachne: ArachneConfig,
     pub top_shell_layers: u16,
     pub bottom_shell_layers: u16,
     /// Fraction in `0.0..=1.0` (e.g. `0.20` for 20%).
@@ -397,6 +455,8 @@ impl Default for ProcessConfig {
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             wall_loops: 2,
+            wall_generator: WallGenerator::Classic,
+            arachne: ArachneConfig::default(),
             top_shell_layers: 3,
             bottom_shell_layers: 3,
             sparse_infill_density: 0.20,
@@ -777,6 +837,65 @@ impl PrintConfig {
             });
         }
 
+        let ar = &self.process.arachne;
+        for (field, val, min, max) in [
+            (
+                "process.arachne.min_bead_width_ratio",
+                ar.min_bead_width_ratio,
+                0.20,
+                1.00,
+            ),
+            (
+                "process.arachne.max_bead_width_ratio",
+                ar.max_bead_width_ratio,
+                1.00,
+                3.00,
+            ),
+            (
+                "process.arachne.min_feature_size_ratio",
+                ar.min_feature_size_ratio,
+                0.05,
+                1.00,
+            ),
+            (
+                "process.arachne.transition_length_ratio",
+                ar.transition_length_ratio,
+                0.10,
+                5.00,
+            ),
+            (
+                "process.arachne.transition_threshold_angle_deg",
+                ar.transition_threshold_angle_deg,
+                0.0,
+                60.0,
+            ),
+            (
+                "process.arachne.transition_filter_deviation_ratio",
+                ar.transition_filter_deviation_ratio,
+                0.0,
+                1.0,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+        if ar.min_bead_width_ratio > ar.max_bead_width_ratio {
+            return Err(ConfigError::Invalid {
+                field: "process.arachne.min_bead_width_ratio",
+                reason: "must be <= max_bead_width_ratio",
+            });
+        }
+        if !(1..=8).contains(&ar.wall_distribution_count) {
+            return Err(ConfigError::Invalid {
+                field: "process.arachne.wall_distribution_count",
+                reason: "must be within 1..=8",
+            });
+        }
+
         for (field, opt_accel) in [
             (
                 "process.default_acceleration_mm_s2",
@@ -975,5 +1094,27 @@ mod tests {
         bad_scarf.process.scarf_seam.start_height_ratio = 0.10;
         bad_scarf.process.arc_tolerance_mm = 0.0001;
         assert!(bad_scarf.validate().is_err());
+
+        let mut arachne_ok = PrintConfig::default();
+        arachne_ok.process.wall_generator = WallGenerator::Arachne;
+        assert!(arachne_ok.validate().is_ok());
+        assert_eq!(arachne_ok.process.wall_generator.label(), "Arachne");
+
+        let mut bad_ar = PrintConfig::default();
+        bad_ar.process.arachne.min_bead_width_ratio = f64::NAN;
+        assert!(bad_ar.validate().is_err());
+        bad_ar.process.arachne.min_bead_width_ratio = 0.0;
+        assert!(bad_ar.validate().is_err());
+        bad_ar.process.arachne.min_bead_width_ratio = 0.85;
+        bad_ar.process.arachne.max_bead_width_ratio = 0.50;
+        assert!(bad_ar.validate().is_err());
+        bad_ar.process.arachne.max_bead_width_ratio = 2.00;
+        bad_ar.process.arachne.min_feature_size_ratio = 0.01;
+        assert!(bad_ar.validate().is_err());
+        bad_ar.process.arachne.min_feature_size_ratio = 0.25;
+        bad_ar.process.arachne.wall_distribution_count = 0;
+        assert!(bad_ar.validate().is_err());
+        bad_ar.process.arachne.wall_distribution_count = 9;
+        assert!(bad_ar.validate().is_err());
     }
 }

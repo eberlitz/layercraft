@@ -392,16 +392,22 @@ pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeom
                 continue;
             }
             let color = path_color(path, mode, layer_idx, total_layers);
-            let hw = (0.5 * path.width_mm) as f32;
             let seg_count = if path.closed { n } else { n - 1 };
 
             for i in 0..seg_count {
                 let Some(&pa) = path.points.get(i) else {
                     continue;
                 };
-                let Some(&pb) = path.points.get((i + 1) % n) else {
+                let next_idx = if path.closed {
+                    (i + 1) % n
+                } else {
+                    (i + 1).min(n - 1)
+                };
+                let Some(&pb) = path.points.get(next_idx) else {
                     continue;
                 };
+                let hwa = (0.5 * path.vertex_width_mm(i)) as f32;
+                let hwb = (0.5 * path.vertex_width_mm(next_idx)) as f32;
                 let (ax, ay) = pa.to_mm();
                 let (bx, by) = pb.to_mm();
                 let ax = ax as f32;
@@ -416,18 +422,20 @@ pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeom
                 }
                 let nx = -dy / len;
                 let ny = dx / len;
-                let ox = nx * hw;
-                let oy = ny * hw;
+                let oxa = nx * hwa;
+                let oya = ny * hwa;
+                let oxb = nx * hwb;
+                let oyb = ny * hwb;
 
-                let al_t = [ax + ox, ay + oy, z_top];
-                let ar_t = [ax - ox, ay - oy, z_top];
-                let bl_t = [bx + ox, by + oy, z_top];
-                let br_t = [bx - ox, by - oy, z_top];
+                let al_t = [ax + oxa, ay + oya, z_top];
+                let ar_t = [ax - oxa, ay - oya, z_top];
+                let bl_t = [bx + oxb, by + oyb, z_top];
+                let br_t = [bx - oxb, by - oyb, z_top];
 
-                let al_b = [ax + ox, ay + oy, z_bot];
-                let ar_b = [ax - ox, ay - oy, z_bot];
-                let bl_b = [bx + ox, by + oy, z_bot];
-                let br_b = [bx - ox, by - oy, z_bot];
+                let al_b = [ax + oxa, ay + oya, z_bot];
+                let ar_b = [ax - oxa, ay - oya, z_bot];
+                let bl_b = [bx + oxb, by + oyb, z_bot];
+                let br_b = [bx - oxb, by - oyb, z_bot];
 
                 // Top face (+Z)
                 push_tri(&mut vertices, ar_t, br_t, bl_t, [0.0, 0.0, 1.0], color);

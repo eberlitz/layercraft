@@ -1,0 +1,19 @@
+{
+  "name": "001-arachne-thin-rib",
+  "description": "Thin 0.50 mm rib sliced with Arachne emits a single variable-width outer wall medial bead instead of collapsing or double-passing",
+  "shape": {
+    "kind": "box",
+    "width_mm": 20.0,
+    "depth_mm": 0.50,
+    "height_mm": 4.0
+  },
+  "config": {
+    "process": {
+      "layer_height_mm": 0.2,
+      "first_layer_height_mm": 0.2,
+      "wall_loops": 2,
+      "outer_wall_width_mm": 0.42,
+      "wall_generator": "arachne"
+    }
+  }
+}

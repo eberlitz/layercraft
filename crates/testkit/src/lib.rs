@@ -69,6 +69,12 @@ pub enum ShapeSpec {
         gap_height_mm: f64,
         top_height_mm: f64,
     },
+    TaperedWedge {
+        length_mm: f64,
+        wide_width_mm: f64,
+        narrow_width_mm: f64,
+        height_mm: f64,
+    },
 }
 
 fn default_segments() -> usize {
@@ -157,6 +163,17 @@ pub fn build_shape(spec: &ShapeSpec) -> Result<TriangleMesh, TestkitError> {
             wall_width_mm,
             gap_height_mm,
             top_height_mm,
+        )?),
+        ShapeSpec::TaperedWedge {
+            length_mm,
+            wide_width_mm,
+            narrow_width_mm,
+            height_mm,
+        } => Ok(make_tapered_wedge(
+            length_mm,
+            wide_width_mm,
+            narrow_width_mm,
+            height_mm,
         )?),
     }
 }
@@ -333,6 +350,35 @@ pub fn make_c_bracket(
     let mut top = make_box(width_mm, depth_mm, top_height_mm)?;
     top.translate(0.0, 0.0, base_height_mm + gap_height_mm)?;
     tris.extend(top.triangles);
+    TriangleMesh::new(tris)
+}
+
+/// Watertight trapezoidal wedge tapering linearly in Y from `wide_width_mm` at `x = 0`
+/// to `narrow_width_mm` at `x = length_mm`, spanning `z = 0..height_mm`.
+pub fn make_tapered_wedge(
+    length_mm: f64,
+    wide_width_mm: f64,
+    narrow_width_mm: f64,
+    height_mm: f64,
+) -> Result<TriangleMesh, GeomError> {
+    let hw0 = 0.5 * wide_width_mm;
+    let hw1 = 0.5 * narrow_width_mm;
+    let p000 = Point3::new(0.0, -hw0, 0.0);
+    let p100 = Point3::new(length_mm, -hw1, 0.0);
+    let p110 = Point3::new(length_mm, hw1, 0.0);
+    let p010 = Point3::new(0.0, hw0, 0.0);
+    let p001 = Point3::new(0.0, -hw0, height_mm);
+    let p101 = Point3::new(length_mm, -hw1, height_mm);
+    let p111 = Point3::new(length_mm, hw1, height_mm);
+    let p011 = Point3::new(0.0, hw0, height_mm);
+
+    let mut tris = Vec::with_capacity(12);
+    push_quad(&mut tris, p000, p010, p110, p100);
+    push_quad(&mut tris, p001, p101, p111, p011);
+    push_quad(&mut tris, p000, p100, p101, p001);
+    push_quad(&mut tris, p010, p011, p111, p110);
+    push_quad(&mut tris, p000, p001, p011, p010);
+    push_quad(&mut tris, p100, p110, p111, p101);
     TriangleMesh::new(tris)
 }
 

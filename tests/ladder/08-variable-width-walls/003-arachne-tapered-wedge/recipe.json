@@ -1,0 +1,20 @@
+{
+  "name": "003-arachne-tapered-wedge",
+  "description": "Tapered wedge (4.0 mm to 0.25 mm) transitions smoothly across infill, 4/3/2 walls, and a single tapered outer tip bead",
+  "shape": {
+    "kind": "tapered_wedge",
+    "length_mm": 24.0,
+    "wide_width_mm": 4.0,
+    "narrow_width_mm": 0.25,
+    "height_mm": 4.0
+  },
+  "config": {
+    "process": {
+      "layer_height_mm": 0.2,
+      "first_layer_height_mm": 0.2,
+      "wall_loops": 2,
+      "sparse_infill_density": 0.20,
+      "wall_generator": "arachne"
+    }
+  }
+}

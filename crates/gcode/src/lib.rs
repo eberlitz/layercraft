@@ -396,7 +396,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 continue;
             }
 
-            let ordered = orient_path_with_seam(
+            let (ordered, ordered_widths) = orient_path_with_seam(
                 path,
                 layer.index,
                 path_idx,
@@ -421,6 +421,19 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             if !has_nonzero_segment(first_pt, &iter_pts) {
                 continue;
             }
+
+            let widths_mm = if !ordered_widths.is_empty() && ordered_widths.len() == ordered.len() {
+                let mut w = Vec::with_capacity(ordered_widths.len() + usize::from(path.closed));
+                w.extend_from_slice(&ordered_widths);
+                if path.closed
+                    && let Some(&fw) = ordered_widths.first()
+                {
+                    w.push(fw);
+                }
+                w
+            } else {
+                Vec::new()
+            };
 
             if current_role != Some(path.role) {
                 writeln!(out, ";TYPE:{}", path.role.label())
@@ -557,6 +570,12 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 pts_mm.push(pt.to_mm());
             }
 
+            let is_varying_w = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
+                let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
+                let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
+                max_w - min_w > 1e-4
+            };
+
             let total_loop_len: f64 = pts_mm
                 .windows(2)
                 .filter_map(|w| Some((w.first()?, w.get(1)?)))
@@ -567,6 +586,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 && layer.index > 0
                 && path.closed
                 && path.role == ExtrusionRole::OuterWall
+                && !is_varying_w
                 && total_loop_len >= scarf.min_length_mm;
 
             let mut emit_ctx = PathEmitCtx {
@@ -586,6 +606,8 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 width_mm: path.width_mm,
                 height_mm: path.height_mm,
                 base_flow: eff_flow,
+                base_speed_mm_s: path.speed_mm_s,
+                max_vol_flow: config.filament.max_volumetric_speed_mm3_s,
                 feed,
                 actual_speed,
             };
@@ -664,7 +686,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             }
 
             if !scarf_done {
-                emit_ctx.emit_xy_sequence(&pts_mm, config)?;
+                emit_ctx.emit_xy_sequence_variable(&pts_mm, &widths_mm, config)?;
             }
 
             last_path_trail = path_trail;
@@ -772,17 +794,44 @@ struct PathEmitCtx<'a> {
     width_mm: f64,
     height_mm: f64,
     base_flow: f64,
+    base_speed_mm_s: f64,
+    max_vol_flow: f64,
     feed: f64,
     actual_speed: f64,
 }
 
 impl PathEmitCtx<'_> {
+    fn compute_segment_feed(&self, width_mm: f64) -> (f64, f64) {
+        let area = bead_area_mm2(width_mm, self.height_mm) * self.base_flow;
+        let eff_speed =
+            if area > 1e-9 && self.max_vol_flow.is_finite() && self.max_vol_flow > 0.0 {
+                self.base_speed_mm_s.min(self.max_vol_flow / area)
+            } else {
+                self.base_speed_mm_s
+            }
+            .max(1e-3);
+        let feed = (eff_speed * 60.0).floor().max(1.0);
+        (feed, feed / 60.0)
+    }
+
     fn account_segment(&mut self, len_mm: f64, flow_mult: f64) -> f64 {
-        let de = extrusion_delta_mm(len_mm, self.width_mm, self.height_mm, self.fil_diam)
+        let width_mm = self.width_mm;
+        let actual_speed = self.actual_speed;
+        self.account_segment_with_width(len_mm, width_mm, actual_speed, flow_mult)
+    }
+
+    fn account_segment_with_width(
+        &mut self,
+        len_mm: f64,
+        width_mm: f64,
+        speed_mm_s: f64,
+        flow_mult: f64,
+    ) -> f64 {
+        let de = extrusion_delta_mm(len_mm, width_mm, self.height_mm, self.fil_diam)
             * self.base_flow
             * flow_mult;
         let vol = de * self.fil_area;
-        let dt = len_mm / self.actual_speed;
+        let dt = len_mm / speed_mm_s.max(1e-6);
         *self.total_e_mm += de;
         *self.total_time_s += dt;
         self.f_entry.volume_mm3 += vol;
@@ -799,20 +848,37 @@ impl PathEmitCtx<'_> {
         z_override: Option<f64>,
         flow_mult: f64,
     ) -> Result<(), GcodeError> {
-        let de = self.account_segment(len_mm, flow_mult);
+        let width_mm = self.width_mm;
+        let feed = self.feed;
+        let speed = self.actual_speed;
+        self.emit_linear_with_width(to, len_mm, width_mm, feed, speed, z_override, flow_mult)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_linear_with_width(
+        &mut self,
+        to: (f64, f64),
+        len_mm: f64,
+        width_mm: f64,
+        feed: f64,
+        speed_mm_s: f64,
+        z_override: Option<f64>,
+        flow_mult: f64,
+    ) -> Result<(), GcodeError> {
+        let de = self.account_segment_with_width(len_mm, width_mm, speed_mm_s, flow_mult);
         let e_val = next_e_val(self.relative_e, self.cur_e, de);
         if let Some(z) = z_override {
             writeln!(
                 self.out,
                 "G1 X{:.3} Y{:.3} Z{z:.3} E{e_val:.5} F{:.0}",
-                to.0, to.1, self.feed
+                to.0, to.1, feed
             )
             .map_err(|_| GcodeError::FormatError)?;
         } else {
             writeln!(
                 self.out,
                 "G1 X{:.3} Y{:.3} E{e_val:.5} F{:.0}",
-                to.0, to.1, self.feed
+                to.0, to.1, feed
             )
             .map_err(|_| GcodeError::FormatError)?;
         }
@@ -847,6 +913,41 @@ impl PathEmitCtx<'_> {
         self.path_trail.extend(samples);
         *self.cur_x = to.0;
         *self.cur_y = to.1;
+        Ok(())
+    }
+
+    fn emit_xy_sequence_variable(
+        &mut self,
+        pts_mm: &[(f64, f64)],
+        widths_mm: &[f64],
+        config: &PrintConfig,
+    ) -> Result<(), GcodeError> {
+        let is_varying = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
+            let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
+            max_w - min_w > 1e-4
+        };
+        if !is_varying {
+            return self.emit_xy_sequence(pts_mm, config);
+        }
+
+        for i in 0..pts_mm.len().saturating_sub(1) {
+            let (Some(&a), Some(&b), Some(&w0), Some(&w1)) = (
+                pts_mm.get(i),
+                pts_mm.get(i + 1),
+                widths_mm.get(i),
+                widths_mm.get(i + 1),
+            ) else {
+                continue;
+            };
+            let seg_len = (b.0 - a.0).hypot(b.1 - a.1);
+            if seg_len <= 1e-6 {
+                continue;
+            }
+            let seg_w = 0.5 * (w0 + w1);
+            let (feed, spd) = self.compute_segment_feed(seg_w);
+            self.emit_linear_with_width(b, seg_len, seg_w, feed, spd, None, 1.0)?;
+        }
         Ok(())
     }
 
@@ -1140,34 +1241,57 @@ fn perform_retract(
     Ok(())
 }
 
-fn rotate_closed_points(points: &[Point2], start_idx: usize) -> Vec<Point2> {
-    let n = points.len();
+fn rotate_closed_slice<T: Copy>(items: &[T], start_idx: usize) -> Vec<T> {
+    let n = items.len();
     let mut rotated = Vec::with_capacity(n);
-    rotated.extend(points.iter().skip(start_idx).copied());
-    rotated.extend(points.iter().take(start_idx).copied());
+    rotated.extend(items.iter().skip(start_idx).copied());
+    rotated.extend(items.iter().take(start_idx).copied());
     rotated
 }
 
-fn orient_path_nearest(path: &ExtrusionPath, cur_x: f64, cur_y: f64) -> Vec<Point2> {
+fn orient_path_nearest(path: &ExtrusionPath, cur_x: f64, cur_y: f64) -> (Vec<Point2>, Vec<f64>) {
     let n = path.points.len();
+    let var_w = path.has_variable_width();
     if n <= 1 {
-        return path.points.clone();
+        let ws = if var_w {
+            path.point_widths_mm.clone()
+        } else {
+            Vec::new()
+        };
+        return (path.points.clone(), ws);
     }
     if path.closed {
         let best_idx = closest_vertex_index(&path.points, cur_x, cur_y);
-        rotate_closed_points(&path.points, best_idx)
+        let pts = rotate_closed_slice(&path.points, best_idx);
+        let ws = if var_w {
+            rotate_closed_slice(&path.point_widths_mm, best_idx)
+        } else {
+            Vec::new()
+        };
+        (pts, ws)
     } else {
         let (Some(first), Some(last)) = (path.points.first(), path.points.last()) else {
-            return path.points.clone();
+            return (path.points.clone(), Vec::new());
         };
         let (fx, fy) = first.to_mm();
         let (lx, ly) = last.to_mm();
         let df = (fx - cur_x).powi(2) + (fy - cur_y).powi(2);
         let dl = (lx - cur_x).powi(2) + (ly - cur_y).powi(2);
         if dl < df {
-            path.points.iter().rev().copied().collect()
+            let pts = path.points.iter().rev().copied().collect();
+            let ws = if var_w {
+                path.point_widths_mm.iter().rev().copied().collect()
+            } else {
+                Vec::new()
+            };
+            (pts, ws)
         } else {
-            path.points.clone()
+            let ws = if var_w {
+                path.point_widths_mm.clone()
+            } else {
+                Vec::new()
+            };
+            (path.points.clone(), ws)
         }
     }
 }
@@ -1368,7 +1492,7 @@ fn orient_path_with_seam(
     cur_y: f64,
     prev_layer_seams: &[(f64, f64)],
     config: &PrintConfig,
-) -> Vec<Point2> {
+) -> (Vec<Point2>, Vec<f64>) {
     let is_wall = matches!(
         path.role,
         ExtrusionRole::OuterWall | ExtrusionRole::InnerWall
@@ -1387,7 +1511,13 @@ fn orient_path_with_seam(
         SeamPosition::Aligned => aligned_seam_index(&path.points, prev_layer_seams, config),
         SeamPosition::Random => random_seam_index(&path.points, layer_idx, path_idx),
     };
-    rotate_closed_points(&path.points, start_idx)
+    let pts = rotate_closed_slice(&path.points, start_idx);
+    let ws = if path.has_variable_width() {
+        rotate_closed_slice(&path.point_widths_mm, start_idx)
+    } else {
+        Vec::new()
+    };
+    (pts, ws)
 }
 
 /// An extruded 2D XY segment parsed from G-code.
@@ -1456,6 +1586,97 @@ pub struct GcodeReport {
     pub arc_moves_count: usize,
     #[serde(default)]
     pub scarf_ramp_moves_count: usize,
+    #[serde(default = "default_wall_variation_ratio")]
+    pub wall_width_variation_ratio: f64,
+}
+
+fn default_wall_variation_ratio() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WallAreaTracker {
+    min: f64,
+    max: f64,
+}
+
+impl Default for WallAreaTracker {
+    fn default() -> Self {
+        Self {
+            min: f64::INFINITY,
+            max: 0.0,
+        }
+    }
+}
+
+impl WallAreaTracker {
+    fn observe(&mut self, area: f64) {
+        if area > 1e-9 && area.is_finite() {
+            self.min = self.min.min(area);
+            self.max = self.max.max(area);
+        }
+    }
+
+    fn ratio_and_reset(&mut self) -> f64 {
+        let r = if self.min.is_finite() && self.min > 1e-9 && self.max > self.min {
+            self.max / self.min
+        } else {
+            1.0
+        };
+        *self = Self::default();
+        r
+    }
+}
+
+#[derive(Debug, Default)]
+struct WallVariationState {
+    last_wall_z: Option<f64>,
+    outer: WallAreaTracker,
+    inner: WallAreaTracker,
+    max_ratio: f64,
+}
+
+impl WallVariationState {
+    fn new() -> Self {
+        Self {
+            max_ratio: 1.0,
+            ..Self::default()
+        }
+    }
+
+    fn observe_move(
+        &mut self,
+        feature: &str,
+        in_scarf: bool,
+        move_len: f64,
+        vol: f64,
+        record_z: f64,
+    ) {
+        if in_scarf || move_len < 0.35 || (feature != "Outer wall" && feature != "Inner wall") {
+            return;
+        }
+        if self
+            .last_wall_z
+            .is_some_and(|lz| (record_z - lz).abs() > 1e-3)
+        {
+            self.flush_layer();
+        }
+        self.last_wall_z = Some(record_z);
+        let area = vol / move_len;
+        if feature == "Outer wall" {
+            self.outer.observe(area);
+        } else {
+            self.inner.observe(area);
+        }
+    }
+
+    fn flush_layer(&mut self) -> f64 {
+        self.max_ratio = self
+            .max_ratio
+            .max(self.outer.ratio_and_reset())
+            .max(self.inner.ratio_and_reset());
+        self.max_ratio
+    }
 }
 
 /// Evaluate physical invariants from any Marlin/Klipper G-code file (LayerCraft or external oracle).
@@ -1480,9 +1701,12 @@ pub fn evaluate_gcode(
     let mut has_xy = false;
 
     let mut current_feature = "Unknown".to_owned();
+    let mut in_scarf = false;
     let mut layer_change_count = 0usize;
     let mut retraction_debt_mm = 0.0;
     let mut max_retraction_imbalance_mm = 0.0f64;
+
+    let mut wall_variation = WallVariationState::new();
 
     let mut total_e_mm = 0.0;
     let mut total_travel_mm = 0.0;
@@ -1517,6 +1741,14 @@ pub fn evaluate_gcode(
     for raw_line in gcode.lines() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == ";SCARF_START" {
+            in_scarf = true;
+            continue;
+        }
+        if trimmed == ";SCARF_END" {
+            in_scarf = false;
             continue;
         }
         if trimmed == ";LAYER_CHANGE" {
@@ -1727,6 +1959,13 @@ pub fn evaluate_gcode(
                         }
 
                         let record_z = current_declared_layer_z.unwrap_or(tz);
+                        wall_variation.observe_move(
+                            &current_feature,
+                            in_scarf,
+                            xy_dist,
+                            vol,
+                            record_z,
+                        );
                         if record_z > 0.0 {
                             max_active_z = max_active_z.max(tz).max(record_z);
                             let already = layer_z_mm
@@ -1889,6 +2128,13 @@ pub fn evaluate_gcode(
                         }
 
                         let record_z = current_declared_layer_z.unwrap_or(tz);
+                        wall_variation.observe_move(
+                            &current_feature,
+                            in_scarf,
+                            arc_len,
+                            vol,
+                            record_z,
+                        );
                         if record_z > 0.0 {
                             max_active_z = max_active_z.max(tz).max(record_z);
                             let already = layer_z_mm
@@ -1955,6 +2201,7 @@ pub fn evaluate_gcode(
     }
 
     safety.max_retraction_imbalance_mm = max_retraction_imbalance_mm;
+    let max_wall_variation = wall_variation.flush_layer();
 
     let report = GcodeReport {
         active_layer_count: layer_z_mm.len(),
@@ -1981,6 +2228,7 @@ pub fn evaluate_gcode(
         pressure_advance_commands_count,
         arc_moves_count,
         scarf_ramp_moves_count,
+        wall_width_variation_ratio: max_wall_variation,
     };
 
     Ok((report, segments))
@@ -2579,6 +2827,153 @@ mod tests {
         assert!(
             rel_vol_diff < 0.02,
             "scarf volume diff {rel_vol_diff:.4} too large"
+        );
+    }
+
+    #[test]
+    fn variable_width_emission_caps_volumetric_flow_and_tracks_variation() {
+        use layercraft_geom::{ExPolygon, Point2, Polygon};
+        use layercraft_slice::SlicedLayer;
+
+        let mut cfg = PrintConfig::default();
+        cfg.machine.relative_extrusion = true;
+        cfg.filament.max_volumetric_speed_mm3_s = 5.0;
+
+        let pts = vec![
+            Point2::from_mm(50.0, 50.0).unwrap(),
+            Point2::from_mm(60.0, 50.0).unwrap(),
+            Point2::from_mm(70.0, 50.0).unwrap(),
+            Point2::from_mm(80.0, 50.0).unwrap(),
+        ];
+        let widths = vec![0.30, 0.45, 0.65, 0.85];
+        let plate = SlicedPlate {
+            layers: vec![SlicedLayer {
+                index: 0,
+                z_top_mm: 0.2,
+                height_mm: 0.2,
+                slice_regions: vec![ExPolygon::new(
+                    Polygon::new(vec![
+                        Point2::from_mm(49.0, 49.0).unwrap(),
+                        Point2::from_mm(81.0, 49.0).unwrap(),
+                        Point2::from_mm(81.0, 51.0).unwrap(),
+                        Point2::from_mm(49.0, 51.0).unwrap(),
+                    ]),
+                    vec![],
+                )],
+                paths: vec![ExtrusionPath {
+                    role: ExtrusionRole::OuterWall,
+                    width_mm: 0.56,
+                    point_widths_mm: widths,
+                    height_mm: 0.2,
+                    speed_mm_s: 120.0,
+                    flow_ratio: 1.0,
+                    points: pts,
+                    closed: false,
+                }],
+                fan_percent: 0,
+                estimated_time_s: 1.0,
+            }],
+        };
+
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        let (rep, segs) = evaluate_gcode(&out.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert!(
+            rep.max_volumetric_flow_mm3_s <= cfg.filament.max_volumetric_speed_mm3_s + 0.05,
+            "flow {} exceeded cap {}",
+            rep.max_volumetric_flow_mm3_s,
+            cfg.filament.max_volumetric_speed_mm3_s
+        );
+        assert!(
+            rep.wall_width_variation_ratio > 1.4,
+            "variation ratio {} <= 1.4",
+            rep.wall_width_variation_ratio
+        );
+        assert_eq!(segs.len(), 3);
+        let area0 = segs[0].volume_mm3 / 10.0;
+        let area1 = segs[1].volume_mm3 / 10.0;
+        let area2 = segs[2].volume_mm3 / 10.0;
+        assert!((area0 - bead_area_mm2(0.375, 0.2)).abs() < 1e-3);
+        assert!((area1 - bead_area_mm2(0.55, 0.2)).abs() < 1e-3);
+        assert!((area2 - bead_area_mm2(0.75, 0.2)).abs() < 1e-3);
+
+        // Uniform classic box stays < 1.05 even with a thicker first layer height.
+        let mut cfg_box = PrintConfig::default();
+        cfg_box.process.first_layer_height_mm = 0.28;
+        cfg_box.process.layer_height_mm = 0.20;
+        let box_plate = slice_single_mesh(&make_box(16.0, 16.0, 1.2), &cfg_box).unwrap();
+        let box_out = emit_gcode(&box_plate, &cfg_box).unwrap();
+        let (box_rep, _) = evaluate_gcode(&box_out.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(
+            box_rep.wall_width_variation_ratio < 1.05,
+            "uniform box reported false variation {}",
+            box_rep.wall_width_variation_ratio
+        );
+    }
+
+    #[test]
+    fn arachne_02mm_hollow_cylinder_and_arcs() {
+        use layercraft_config::{ProfileLibrary, WallGenerator};
+        use layercraft_geom::{Point3, Triangle, TriangleMesh};
+
+        let n = 64usize;
+        let outer_r = 8.0;
+        let inner_r = 7.70;
+        let height = 3.0;
+        let mut tris = Vec::with_capacity(n * 8);
+        let mut push_q = |a: Point3, b: Point3, c: Point3, d: Point3| {
+            tris.push(Triangle::new(a, b, c));
+            tris.push(Triangle::new(a, c, d));
+        };
+        for i in 0..n {
+            let a0 = TAU * (i as f64) / (n as f64);
+            let a1 = TAU * (((i + 1) % n) as f64) / (n as f64);
+            let ob0 = Point3::new(outer_r * a0.cos(), outer_r * a0.sin(), 0.0);
+            let ob1 = Point3::new(outer_r * a1.cos(), outer_r * a1.sin(), 0.0);
+            let ot0 = Point3::new(outer_r * a0.cos(), outer_r * a0.sin(), height);
+            let ot1 = Point3::new(outer_r * a1.cos(), outer_r * a1.sin(), height);
+            let ib0 = Point3::new(inner_r * a0.cos(), inner_r * a0.sin(), 0.0);
+            let ib1 = Point3::new(inner_r * a1.cos(), inner_r * a1.sin(), 0.0);
+            let it0 = Point3::new(inner_r * a0.cos(), inner_r * a0.sin(), height);
+            let it1 = Point3::new(inner_r * a1.cos(), inner_r * a1.sin(), height);
+            push_q(ob0, ob1, ot1, ot0);
+            push_q(ib1, ib0, it0, it1);
+            push_q(ib0, ib1, ob1, ob0);
+            push_q(ot0, ot1, it1, it0);
+        }
+        let mesh = TriangleMesh::new(tris).unwrap();
+
+        let lib = ProfileLibrary::with_builtin_presets();
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.2mm"),
+                Some("LayerCraft PLA (0.2mm HF Nozzle)"),
+                Some("LayerCraft 0.10mm Fine (0.2mm Nozzle)"),
+            )
+            .unwrap();
+        let mut cfg = res.config;
+        cfg.process.first_layer_height_mm = 0.10;
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.arc_fitting = true;
+        cfg.process.arc_tolerance_mm = 0.025;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert_eq!(rep.active_layer_count, 30);
+        assert!(rep.arc_moves_count > 10);
+        assert!(
+            (36.0..=46.0).contains(&rep.total_filament_volume_mm3),
+            "unexpected filament volume {}",
+            rep.total_filament_volume_mm3
         );
     }
 }

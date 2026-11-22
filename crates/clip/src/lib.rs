@@ -1,8 +1,11 @@
-//! 2D polygon boolean, offsetting, line-clipping, and simplification seam.
+//! 2D polygon boolean, offsetting, line-clipping, medial-axis, and simplification seam.
 //!
 //! `layercraft-clip` is the sole crate in the workspace allowed to depend on
-//! the underlying 2D clipping kernel (`clipper2-rust`), isolating upper layers
-//! behind [`layercraft_geom`] types.
+//! the underlying 2D clipping/Voronoi kernels (`clipper2-rust`, `boostvoronoi`),
+//! isolating upper layers behind [`layercraft_geom`] types.
+
+pub mod medial;
+pub use medial::{MedialAxis, MedialEdge, MedialSample, medial_axis};
 
 use clipper2_rust::{
     ClipType, Clipper64, ClipperOffset, EndType, FillRule, JoinType as C2JoinType, Path64, Paths64,

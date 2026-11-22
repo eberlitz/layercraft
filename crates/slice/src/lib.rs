@@ -1,12 +1,14 @@
 //! Deterministic FDM slicing pipeline: slice -> perimeters -> skins -> infill -> adhesion.
 
+mod arachne;
+
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};
 
 use layercraft_clip::{
     ClipError, JoinType, clip_lines, clip_polylines, clip_polylines_difference, difference,
     intersection, offset, union,
 };
-use layercraft_config::{InfillPattern, IroningType, PrintConfig, SupportStyle};
+use layercraft_config::{InfillPattern, IroningType, PrintConfig, SupportStyle, WallGenerator};
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
 use layercraft_mesh::{MeshError, RawSliceLayer, prepare_for_plate, slice_mesh};
 use schemars::JsonSchema;
@@ -76,12 +78,73 @@ fn default_flow_ratio() -> f64 {
 pub struct ExtrusionPath {
     pub role: ExtrusionRole,
     pub width_mm: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub point_widths_mm: Vec<f64>,
     pub height_mm: f64,
     pub speed_mm_s: f64,
     #[serde(default = "default_flow_ratio")]
     pub flow_ratio: f64,
     pub points: Vec<Point2>,
     pub closed: bool,
+}
+
+impl ExtrusionPath {
+    /// True if per-vertex extrusion widths are populated and aligned with [`Self::points`].
+    #[inline]
+    pub fn has_variable_width(&self) -> bool {
+        !self.point_widths_mm.is_empty() && self.point_widths_mm.len() == self.points.len()
+    }
+
+    /// Extrusion width (mm) at vertex `idx` (falls back to nominal [`Self::width_mm`]).
+    #[inline]
+    pub fn vertex_width_mm(&self, idx: usize) -> f64 {
+        if self.has_variable_width() {
+            self.point_widths_mm
+                .get(idx)
+                .copied()
+                .unwrap_or(self.width_mm)
+        } else {
+            self.width_mm
+        }
+    }
+
+    /// Mean extrusion width (mm) across segment `seg_idx -> next`.
+    #[inline]
+    pub fn segment_width_mm(&self, seg_idx: usize) -> f64 {
+        let n = self.points.len();
+        if n == 0 || !self.has_variable_width() {
+            return self.width_mm;
+        }
+        let w0 = self.vertex_width_mm(seg_idx);
+        let next_idx = if self.closed {
+            (seg_idx + 1) % n
+        } else {
+            (seg_idx + 1).min(n - 1)
+        };
+        let w1 = self.vertex_width_mm(next_idx);
+        0.5 * (w0 + w1)
+    }
+
+    /// Minimum vertex width along this path (mm).
+    pub fn min_width_mm(&self) -> f64 {
+        if self.has_variable_width() {
+            self.point_widths_mm
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            self.width_mm
+        }
+    }
+
+    /// Maximum vertex width along this path (mm).
+    pub fn max_width_mm(&self) -> f64 {
+        if self.has_variable_width() {
+            self.point_widths_mm.iter().copied().fold(0.0, f64::max)
+        } else {
+            self.width_mm
+        }
+    }
 }
 
 /// One sliced layer with cross-section regions and generated extrusion paths.
@@ -545,13 +608,38 @@ fn apply_flow_and_cooling(
         ) {
             has_bridge_or_overhang = true;
         }
-        let eff_area = bead_area_mm2(path.width_mm, path.height_mm) * path.flow_ratio.max(0.001);
+        let min_w = path.min_width_mm();
+        let eff_area = bead_area_mm2(min_w, path.height_mm) * path.flow_ratio.max(0.001);
         if eff_area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
             path.speed_mm_s = path.speed_mm_s.min(max_vol_flow / eff_area);
         }
         let len = path_length_mm(path);
         path_lengths.push(len);
-        extrusion_time_s += len / path.speed_mm_s.max(1e-6);
+        if path.has_variable_width() && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
+            let n = path.points.len();
+            let segs = if path.closed { n } else { n.saturating_sub(1) };
+            let flow = path.flow_ratio.max(0.001);
+            for si in 0..segs {
+                let (Some(&a), Some(&b)) = (path.points.get(si), path.points.get((si + 1) % n))
+                else {
+                    continue;
+                };
+                let slen = a.distance_mm(b);
+                if slen <= 1e-9 {
+                    continue;
+                }
+                let sw = path.segment_width_mm(si);
+                let sarea = bead_area_mm2(sw, path.height_mm) * flow;
+                let sspd = if sarea > 1e-9 {
+                    path.speed_mm_s.min(max_vol_flow / sarea)
+                } else {
+                    path.speed_mm_s
+                };
+                extrusion_time_s += slen / sspd.max(1e-6);
+            }
+        } else {
+            extrusion_time_s += len / path.speed_mm_s.max(1e-6);
+        }
 
         if let Some(&start) = path.points.first() {
             if let Some(prev) = prev_end {
@@ -648,8 +736,10 @@ fn split_overhang_wall_paths(
         }
 
         let n = path.points.len();
+        let has_var_w = path.has_variable_width();
         let mut active_role: Option<(ExtrusionRole, f64)> = None;
         let mut active_pts: Vec<Point2> = Vec::new();
+        let mut active_widths: Vec<f64> = Vec::new();
 
         for i in 0..n {
             let (Some(&a), Some(&b)) = (path.points.get(i), path.points.get((i + 1) % n)) else {
@@ -658,6 +748,8 @@ fn split_overhang_wall_paths(
             if a == b {
                 continue;
             }
+            let wa = path.vertex_width_mm(i);
+            let wb = path.vertex_width_mm((i + 1) % n);
             let edge = vec![a, b];
             let (ax, ay) = a.to_mm();
             let (bx, by) = b.to_mm();
@@ -671,7 +763,8 @@ fn split_overhang_wall_paths(
             let supported_segs = clip_polylines(std::slice::from_ref(&edge), &support_mask)?;
             let overhang_segs = clip_polylines_difference(&[edge], &support_mask)?;
 
-            let mut edge_pieces: Vec<(f64, ExtrusionRole, f64, Point2, Point2)> = Vec::new();
+            let mut edge_pieces: Vec<(f64, ExtrusionRole, f64, Point2, f64, Point2, f64)> =
+                Vec::new();
             for (segs, role, speed) in [
                 (supported_segs, ExtrusionRole::OuterWall, path.speed_mm_s),
                 (
@@ -689,19 +782,21 @@ fn split_overhang_wall_paths(
                     }
                     let (p0x, p0y) = sp0.to_mm();
                     let (p1x, p1y) = sp1.to_mm();
-                    let t0 = ((p0x - ax) * edx + (p0y - ay) * edy) / elen2;
-                    let t1 = ((p1x - ax) * edx + (p1y - ay) * edy) / elen2;
-                    let (ta, pa, pb) = if t1 < t0 {
-                        (t1, sp1, sp0)
+                    let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let w0 = wa + t0 * (wb - wa);
+                    let w1 = wa + t1 * (wb - wa);
+                    let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
+                        (t1, sp1, w1, sp0, w0)
                     } else {
-                        (t0, sp0, sp1)
+                        (t0, sp0, w0, sp1, w1)
                     };
-                    edge_pieces.push((ta, role, speed, pa, pb));
+                    edge_pieces.push((ta, role, speed, pa, w_pa, pb, w_pb));
                 }
             }
             edge_pieces.sort_by(|x, y| x.0.total_cmp(&y.0));
 
-            for (_, role, speed, p0, p1) in edge_pieces {
+            for (_, role, speed, p0, w0, p1, w1) in edge_pieces {
                 let can_extend = active_role.is_some_and(|(r, _)| r == role)
                     && active_pts
                         .last()
@@ -712,24 +807,42 @@ fn split_overhang_wall_paths(
                         .is_none_or(|&lp| lp.distance_mm(p0) > 1e-6)
                     {
                         active_pts.push(p0);
+                        active_widths.push(w0);
                     }
                     active_pts.push(p1);
+                    active_widths.push(w1);
                 } else {
                     if let Some((prev_role, prev_speed)) = active_role
                         && active_pts.len() >= 2
                     {
+                        let pts = std::mem::take(&mut active_pts);
+                        let ws = std::mem::take(&mut active_widths);
+                        let mean_w = if has_var_w && !ws.is_empty() {
+                            ws.iter().sum::<f64>() / (ws.len() as f64)
+                        } else {
+                            path.width_mm
+                        };
+                        let pw = if has_var_w && ws.len() == pts.len() {
+                            ws
+                        } else {
+                            Vec::new()
+                        };
                         out.push(ExtrusionPath {
                             role: prev_role,
-                            width_mm: path.width_mm,
+                            width_mm: mean_w,
+                            point_widths_mm: pw,
                             height_mm: path.height_mm,
                             speed_mm_s: prev_speed,
                             flow_ratio: 1.0,
-                            points: std::mem::take(&mut active_pts),
+                            points: pts,
                             closed: false,
                         });
+                    } else {
+                        active_widths.clear();
                     }
                     active_role = Some((role, speed));
                     active_pts = vec![p0, p1];
+                    active_widths = vec![w0, w1];
                 }
             }
         }
@@ -737,9 +850,20 @@ fn split_overhang_wall_paths(
         if let Some((prev_role, prev_speed)) = active_role
             && active_pts.len() >= 2
         {
+            let mean_w = if has_var_w && !active_widths.is_empty() {
+                active_widths.iter().sum::<f64>() / (active_widths.len() as f64)
+            } else {
+                path.width_mm
+            };
+            let pw = if has_var_w && active_widths.len() == active_pts.len() {
+                active_widths
+            } else {
+                Vec::new()
+            };
             out.push(ExtrusionPath {
                 role: prev_role,
-                width_mm: path.width_mm,
+                width_mm: mean_w,
+                point_widths_mm: pw,
                 height_mm: path.height_mm,
                 speed_mm_s: prev_speed,
                 flow_ratio: 1.0,
@@ -1212,6 +1336,7 @@ fn generate_gyroid_infill(
         paths.push(ExtrusionPath {
             role: ExtrusionRole::SparseInfill,
             width_mm,
+            point_widths_mm: Vec::new(),
             height_mm,
             speed_mm_s,
             flow_ratio: 1.0,
@@ -1223,6 +1348,22 @@ fn generate_gyroid_infill(
 }
 
 fn build_perimeters(
+    regions: &[ExPolygon],
+    layer_idx: usize,
+    layer_height_mm: f64,
+    config: &PrintConfig,
+) -> Result<(Vec<ExtrusionPath>, Vec<ExPolygon>), SliceError> {
+    match config.process.wall_generator {
+        WallGenerator::Classic => {
+            build_perimeters_classic(regions, layer_idx, layer_height_mm, config)
+        }
+        WallGenerator::Arachne => {
+            arachne::build_perimeters_arachne(regions, layer_idx, layer_height_mm, config)
+        }
+    }
+}
+
+pub(crate) fn build_perimeters_classic(
     regions: &[ExPolygon],
     layer_idx: usize,
     layer_height_mm: f64,
@@ -1328,6 +1469,7 @@ fn push_closed_poly(
         out.push(ExtrusionPath {
             role,
             width_mm,
+            point_widths_mm: Vec::new(),
             height_mm,
             speed_mm_s,
             flow_ratio: 1.0,
@@ -1393,6 +1535,7 @@ fn flush_hatch_pts(
         paths.push(ExtrusionPath {
             role,
             width_mm,
+            point_widths_mm: Vec::new(),
             height_mm,
             speed_mm_s,
             flow_ratio,
@@ -2187,5 +2330,259 @@ mod tests {
             .unwrap()
             .flow_ratio;
         assert!(sample_flow > 0.005 && sample_flow < 0.05);
+    }
+
+    fn make_tapered_wedge_mesh(
+        length: f64,
+        wide_w: f64,
+        narrow_w: f64,
+        height: f64,
+    ) -> TriangleMesh {
+        let hw0 = 0.5 * wide_w;
+        let hw1 = 0.5 * narrow_w;
+        let p000 = Point3::new(0.0, -hw0, 0.0);
+        let p100 = Point3::new(length, -hw1, 0.0);
+        let p110 = Point3::new(length, hw1, 0.0);
+        let p010 = Point3::new(0.0, hw0, 0.0);
+        let p001 = Point3::new(0.0, -hw0, height);
+        let p101 = Point3::new(length, -hw1, height);
+        let p111 = Point3::new(length, hw1, height);
+        let p011 = Point3::new(0.0, hw0, height);
+
+        let mut tris = Vec::with_capacity(12);
+        let mut push_q = |a: Point3, b: Point3, c: Point3, d: Point3| {
+            tris.push(Triangle::new(a, b, c));
+            tris.push(Triangle::new(a, c, d));
+        };
+        push_q(p000, p010, p110, p100);
+        push_q(p001, p101, p111, p011);
+        push_q(p000, p100, p101, p001);
+        push_q(p010, p011, p111, p110);
+        push_q(p000, p001, p011, p010);
+        push_q(p100, p110, p111, p101);
+        TriangleMesh::new(tris).unwrap()
+    }
+
+    fn make_hollow_cyl_mesh(
+        outer_r: f64,
+        inner_r: f64,
+        height: f64,
+        segments: usize,
+    ) -> TriangleMesh {
+        let mut tris = Vec::with_capacity(segments * 8);
+        let mut push_q = |a: Point3, b: Point3, c: Point3, d: Point3| {
+            tris.push(Triangle::new(a, b, c));
+            tris.push(Triangle::new(a, c, d));
+        };
+        for i in 0..segments {
+            let a0 = TAU * (i as f64) / (segments as f64);
+            let a1 = TAU * (((i + 1) % segments) as f64) / (segments as f64);
+            let ob0 = Point3::new(outer_r * a0.cos(), outer_r * a0.sin(), 0.0);
+            let ob1 = Point3::new(outer_r * a1.cos(), outer_r * a1.sin(), 0.0);
+            let ot0 = Point3::new(outer_r * a0.cos(), outer_r * a0.sin(), height);
+            let ot1 = Point3::new(outer_r * a1.cos(), outer_r * a1.sin(), height);
+            let ib0 = Point3::new(inner_r * a0.cos(), inner_r * a0.sin(), 0.0);
+            let ib1 = Point3::new(inner_r * a1.cos(), inner_r * a1.sin(), 0.0);
+            let it0 = Point3::new(inner_r * a0.cos(), inner_r * a0.sin(), height);
+            let it1 = Point3::new(inner_r * a1.cos(), inner_r * a1.sin(), height);
+            push_q(ob0, ob1, ot1, ot0);
+            push_q(ib1, ib0, it0, it1);
+            push_q(ib0, ib1, ob1, ob0);
+            push_q(ot0, ot1, it1, it0);
+        }
+        TriangleMesh::new(tris).unwrap()
+    }
+
+    #[test]
+    fn arachne_standard_cube_matches_classic_walls_and_infill() {
+        let mesh = make_box_mesh(20.0, 20.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.wall_loops = 2;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mid = &plate.layers[10];
+        let outer: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OuterWall)
+            .collect();
+        let inner: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::InnerWall)
+            .collect();
+        let infill: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::SparseInfill)
+            .collect();
+        assert_eq!(outer.len(), 1);
+        assert_eq!(inner.len(), 1);
+        assert!(!infill.is_empty());
+        assert!(outer[0].closed && inner[0].closed);
+        assert!((outer[0].width_mm - cfg.process.outer_wall_width_mm).abs() < 0.01);
+        assert!((inner[0].width_mm - cfg.process.inner_wall_width_mm).abs() < 0.01);
+        assert!(outer[0].points.len() <= 6 && inner[0].points.len() <= 6);
+    }
+
+    #[test]
+    fn arachne_thin_rib_prints_single_medial_bead() {
+        let mesh = make_box_mesh(20.0, 0.50, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.wall_loops = 2;
+        cfg.process.outer_wall_width_mm = 0.42;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mid = &plate.layers[5];
+        let outer: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OuterWall)
+            .collect();
+        let inner_count = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::InnerWall)
+            .count();
+        assert_eq!(
+            outer.len(),
+            1,
+            "expected 1 medial bead path, got {:?}",
+            outer
+        );
+        assert_eq!(inner_count, 0);
+        assert!(!outer[0].closed);
+        assert!(
+            (outer[0].width_mm - 0.50).abs() < 0.03,
+            "width = {}",
+            outer[0].width_mm
+        );
+    }
+
+    #[test]
+    fn arachne_gapfree_intermediate_wall() {
+        let mesh = make_box_mesh(20.0, 1.05, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.wall_loops = 2;
+        cfg.process.outer_wall_width_mm = 0.42;
+        cfg.process.inner_wall_width_mm = 0.45;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mid = &plate.layers[5];
+        let outer: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OuterWall)
+            .collect();
+        let inner_count = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::InnerWall)
+            .count();
+        let infill_count = mid
+            .paths
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::SparseInfill
+                        | ExtrusionRole::BottomSurface
+                        | ExtrusionRole::TopSurface
+                )
+            })
+            .count();
+        assert_eq!(outer.len(), 1);
+        assert!(outer[0].closed);
+        assert_eq!(inner_count, 0);
+        assert_eq!(infill_count, 0);
+        assert!(
+            (outer[0].width_mm - 0.546).abs() < 0.03,
+            "outer width = {}",
+            outer[0].width_mm
+        );
+    }
+
+    #[test]
+    fn arachne_tapered_wedge_modulates_width_and_prints_tip() {
+        let mesh = make_tapered_wedge_mesh(24.0, 4.0, 0.25, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.wall_loops = 2;
+        cfg.process.sparse_infill_density = 0.20;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mid = &plate.layers[5];
+        let walls: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall))
+            .collect();
+        assert!(!walls.is_empty());
+
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_w = f64::INFINITY;
+        let mut max_w = 0.0f64;
+        for w in &walls {
+            min_w = min_w.min(w.min_width_mm());
+            max_w = max_w.max(w.max_width_mm());
+            for pt in &w.points {
+                let px = pt.to_mm().0;
+                min_x = min_x.min(px);
+                max_x = max_x.max(px);
+            }
+        }
+        let x_span = max_x - min_x;
+        assert!(
+            x_span >= 22.8,
+            "x_span = {x_span:.3} (< 22.8 mm tip dropped)"
+        );
+        assert!(
+            max_w / min_w >= 1.35,
+            "width ratio {:.3} < 1.35 (min={min_w:.3}, max={max_w:.3})",
+            max_w / min_w
+        );
+    }
+
+    #[test]
+    fn arachne_thin_hollow_cylinder_prints_closed_medial_ring() {
+        let mesh = make_hollow_cyl_mesh(10.0, 9.4, 2.0, 64);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.wall_loops = 2;
+        cfg.process.outer_wall_width_mm = 0.42;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mid = &plate.layers[5];
+        let outer: Vec<_> = mid
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OuterWall)
+            .collect();
+        assert_eq!(outer.len(), 1, "expected single closed medial ring");
+        assert!(outer[0].closed, "expected closed ring on hollow cylinder");
+        assert!(
+            (outer[0].width_mm - 0.60).abs() < 0.05,
+            "ring width = {}",
+            outer[0].width_mm
+        );
+    }
+
+    #[test]
+    fn arachne_hostile_tiny_feature_never_panics() {
+        let mesh = make_box_mesh(10.0, 0.05, 1.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let wall_cnt: usize = plate
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall))
+            .count();
+        assert_eq!(wall_cnt, 0);
     }
 }

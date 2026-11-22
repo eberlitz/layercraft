@@ -100,6 +100,12 @@ struct LadderExpected {
     #[serde(default)]
     min_bbox_width_mm: Option<f64>,
     #[serde(default)]
+    min_volume_mm3: Option<f64>,
+    #[serde(default)]
+    max_volume_mm3: Option<f64>,
+    #[serde(default)]
+    min_wall_width_variation_ratio: Option<f64>,
+    #[serde(default)]
     require_gcode_contains: Vec<String>,
     #[serde(default)]
     forbid_gcode_contains: Vec<String>,
@@ -384,6 +390,30 @@ pub fn run(root: &Path) -> Result<(), String> {
                         "extrusion bbox width {got_w:.2} mm < {min_w:.2} mm"
                     ));
                 }
+            }
+            if let Some(min_v) = exp.min_volume_mm3
+                && rep.total_filament_volume_mm3 < min_v
+            {
+                errs.push(format!(
+                    "filament volume {:.2} mm3 < min {min_v:.2} mm3",
+                    rep.total_filament_volume_mm3
+                ));
+            }
+            if let Some(max_v) = exp.max_volume_mm3
+                && rep.total_filament_volume_mm3 > max_v
+            {
+                errs.push(format!(
+                    "filament volume {:.2} mm3 > max {max_v:.2} mm3",
+                    rep.total_filament_volume_mm3
+                ));
+            }
+            if let Some(min_ratio) = exp.min_wall_width_variation_ratio
+                && rep.wall_width_variation_ratio < min_ratio
+            {
+                errs.push(format!(
+                    "wall width variation ratio {:.3} < min {min_ratio:.3}",
+                    rep.wall_width_variation_ratio
+                ));
             }
             for needle in &exp.require_gcode_contains {
                 if !out.gcode.contains(needle) {

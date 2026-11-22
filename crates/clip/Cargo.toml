@@ -9,6 +9,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+boostvoronoi.workspace = true
 clipper2-rust.workspace = true
 layercraft-geom.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

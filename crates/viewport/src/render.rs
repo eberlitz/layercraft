@@ -200,11 +200,11 @@ fn render_layer_topdown(
             (col[2] * 255.0) as u8,
         ];
         let segs = if path.closed { n } else { n - 1 };
-        let radius = ((0.45 * path.width_mm * scale).round() as i32).clamp(1, 5);
         for i in 0..segs {
             let (Some(&pa), Some(&pb)) = (path.points.get(i), path.points.get((i + 1) % n)) else {
                 continue;
             };
+            let radius = ((0.45 * path.segment_width_mm(i) * scale).round() as i32).clamp(1, 8);
             let (ax, ay) = pa.to_mm();
             let (bx, by) = pb.to_mm();
             let (x0, y0) = to_px(ax, ay);
