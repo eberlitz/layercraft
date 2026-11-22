@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="LayerCraft">
+  <defs>
+    <linearGradient id="lc-tile-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1C222E" />
+      <stop offset="100%" stop-color="#12161F" />
+    </linearGradient>
+    <linearGradient id="lc-teal-top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2DD4BF" />
+      <stop offset="100%" stop-color="#14B8A6" />
+    </linearGradient>
+  </defs>
+  <!-- Dark slate precision tile -->
+  <rect x="4" y="4" width="88" height="88" rx="20" fill="url(#lc-tile-bg)" stroke="#2A3244" stroke-width="2" />
+  <!-- Build plate base diamond -->
+  <polygon points="48,78 18,62 48,46 78,62" fill="#232B3A" stroke="#38445B" stroke-width="1.5" stroke-linejoin="round" />
+  <line x1="27" y1="66.8" x2="69" y2="66.8" stroke="#14B8A6" stroke-width="1.5" stroke-linecap="round" opacity="0.65" />
+  <!-- Layer 1 (deep teal) -->
+  <polygon points="48,66 22,52 48,38 74,52" fill="#0F766E" stroke="#14B8A6" stroke-width="1.4" stroke-linejoin="round" />
+  <!-- Layer 2 (precision teal) -->
+  <polygon points="48,55 24,42 48,29 72,42" fill="#0D9488" stroke="#2DD4BF" stroke-width="1.4" stroke-linejoin="round" />
+  <!-- Top extruded perimeter cap (bright teal + nozzle highlight dot) -->
+  <polygon points="48,44 26,32 48,20 70,32" fill="url(#lc-teal-top)" stroke="#99F6E4" stroke-width="1.4" stroke-linejoin="round" />
+  <polygon points="48,37.5 36.5,31.5 48,25.5 59.5,31.5" fill="none" stroke="#12161F" stroke-width="1.8" stroke-linejoin="round" opacity="0.55" />
+  <!-- Extruder nozzle point -->
+  <path d="M44 13h8l-2.5 5h-3z" fill="#E2E8F0" />
+  <circle cx="48" cy="20" r="2" fill="#99F6E4" />
+</svg>
