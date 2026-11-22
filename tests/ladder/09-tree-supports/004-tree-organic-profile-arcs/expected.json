@@ -1,0 +1,9 @@
+{
+  "layer_count": 50,
+  "max_z_mm": 10.0,
+  "require_outer_wall": true,
+  "require_support": true,
+  "require_support_interface": true,
+  "require_arcs": true,
+  "max_profile_warnings": 0
+}

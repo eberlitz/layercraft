@@ -1933,12 +1933,7 @@ fn apply_process_settings_pass1(
         } else if norm == "grid" || norm == "default" || norm.starts_with("normal") {
             SupportStyle::Grid
         } else if norm.starts_with("tree") || norm == "organic" {
-            ctx.warn(
-                &process.name,
-                k,
-                format!("support style `{raw}` approximated using `snug` supports"),
-            );
-            SupportStyle::Snug
+            SupportStyle::Tree
         } else {
             ctx.warn(
                 &process.name,
@@ -2017,6 +2012,82 @@ fn apply_process_settings_pass1(
         cfg.process.support.interface_spacing_mm = parse_f64_val(k, v)?;
         ctx.mark_applied(k);
     }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "tree_support_branch_angle",
+            "tree_support_branch_angle_organic",
+        ],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.support.tree.max_branch_angle_deg = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["tree_support_tip_diameter"])
+        && !is_nil_value(v)
+    {
+        cfg.process.support.tree.tip_diameter_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "tree_support_branch_diameter",
+            "tree_support_branch_diameter_organic",
+        ],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.support.tree.branch_diameter_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["tree_support_branch_diameter_angle"])
+        && !is_nil_value(v)
+    {
+        cfg.process.support.tree.branch_diameter_angle_deg = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "tree_support_branch_distance",
+            "tree_support_branch_distance_organic",
+        ],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.support.tree.branch_distance_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["tree_support_wall_count"])
+        && !is_nil_value(v)
+    {
+        let walls = parse_u16_val(k, v)?;
+        if walls > 0 {
+            cfg.process.support.tree.branch_wall_loops = walls;
+        }
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["tree_support_brim_width"])
+        && !is_nil_value(v)
+    {
+        cfg.process.support.tree.trunk_base_flare_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    ctx.mark_recognized_if_present(
+        s,
+        &[
+            "tree_support_auto_brim",
+            "tree_support_adaptive_layer_height",
+            "tree_support_top_rate",
+        ],
+    );
 
     if let Some((k, v)) = ctx.get_primary(s, &["default_acceleration"])
         && !is_nil_value(v)
@@ -2804,7 +2875,7 @@ mod tests {
                 "type": "process",
                 "name": "tree_hc",
                 "sparse_infill_pattern": "honeycomb",
-                "support_style": "tree_auto",
+                "support_style": "custom_unknown",
                 "support_threshold_angle": "0",
                 "enable_support": "1"
               }
@@ -2819,7 +2890,7 @@ mod tests {
             res.config.process.sparse_infill_pattern,
             InfillPattern::Grid
         );
-        assert_eq!(res.config.process.support.style, SupportStyle::Snug);
+        assert_eq!(res.config.process.support.style, SupportStyle::Grid);
         assert!((res.config.process.support.threshold_angle_deg - 45.0).abs() < 1e-9);
         assert_eq!(res.warnings.len(), 4);
     }
@@ -3044,5 +3115,53 @@ mod tests {
         assert!((res.config.process.arachne.transition_length_ratio - 1.0).abs() < 1e-9);
         assert!((res.config.process.arachne.transition_threshold_angle_deg - 12.0).abs() < 1e-9);
         assert!((res.config.process.arachne.transition_filter_deviation_ratio - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tree_support_profile_keys_map_without_warnings() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"{
+                "type": "process",
+                "name": "tree_organic_020",
+                "layer_height": "0.2",
+                "enable_support": "1",
+                "support_style": "organic",
+                "support_on_build_plate_only": "1",
+                "tree_support_branch_angle": "48",
+                "tree_support_tip_diameter": "1.2",
+                "tree_support_branch_diameter": "2.4",
+                "tree_support_branch_diameter_angle": "6",
+                "tree_support_branch_distance": "3.2",
+                "tree_support_wall_count": "2",
+                "tree_support_brim_width": "1.5",
+                "tree_support_auto_brim": "1",
+                "tree_support_adaptive_layer_height": "1",
+                "tree_support_top_rate": "30%"
+            }"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                None,
+                None,
+                Some("tree_organic_020"),
+            )
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert!(res.config.process.support.enabled);
+        assert_eq!(res.config.process.support.style, SupportStyle::Tree);
+        assert!(res.config.process.support.on_build_plate_only);
+        assert!((res.config.process.support.tree.max_branch_angle_deg - 48.0).abs() < 1e-9);
+        assert!((res.config.process.support.tree.tip_diameter_mm - 1.2).abs() < 1e-9);
+        assert!((res.config.process.support.tree.branch_diameter_mm - 2.4).abs() < 1e-9);
+        assert!((res.config.process.support.tree.branch_diameter_angle_deg - 6.0).abs() < 1e-9);
+        assert!((res.config.process.support.tree.branch_distance_mm - 3.2).abs() < 1e-9);
+        assert_eq!(res.config.process.support.tree.branch_wall_loops, 2);
+        assert!((res.config.process.support.tree.trunk_base_flare_mm - 1.5).abs() < 1e-9);
     }
 }

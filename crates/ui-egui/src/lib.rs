@@ -1318,6 +1318,72 @@ impl LayerCraftApp {
                                             .range(0..=8),
                                     );
                                     ui.end_row();
+
+                                    if sup.style == SupportStyle::Tree {
+                                        let tr = &mut sup.tree;
+                                        ui.label("Max branch angle (deg)");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.max_branch_angle_deg)
+                                                .speed(1.0)
+                                                .range(10.0..=70.0),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("Tip diameter (mm)");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.tip_diameter_mm)
+                                                .speed(0.1)
+                                                .range(0.4..=tr.max_trunk_diameter_mm.min(10.0)),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("Branch diameter (mm)");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.branch_diameter_mm)
+                                                .speed(0.1)
+                                                .range(0.6..=tr.max_trunk_diameter_mm.min(20.0)),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("Max trunk diam (mm)");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut tr.max_trunk_diameter_mm)
+                                                    .speed(0.2)
+                                                    .range(1.0..=50.0),
+                                            )
+                                            .changed()
+                                        {
+                                            tr.tip_diameter_mm =
+                                                tr.tip_diameter_mm.min(tr.max_trunk_diameter_mm);
+                                            tr.branch_diameter_mm =
+                                                tr.branch_diameter_mm.min(tr.max_trunk_diameter_mm);
+                                        }
+                                        ui.end_row();
+
+                                        ui.label("Branch distance (mm)");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.branch_distance_mm)
+                                                .speed(0.2)
+                                                .range(0.8..=25.0),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("Branch walls");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.branch_wall_loops)
+                                                .range(1..=6),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("Trunk base flare (mm)");
+                                        ui.add(
+                                            egui::DragValue::new(&mut tr.trunk_base_flare_mm)
+                                                .speed(0.1)
+                                                .range(0.0..=10.0),
+                                        );
+                                        ui.end_row();
+                                    }
                                 });
                         });
 

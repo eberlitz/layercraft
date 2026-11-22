@@ -1,0 +1,17 @@
+{
+  "name": "004-tree-organic-profile-arcs",
+  "description": "Bridge arch sliced via JSON profile enabling organic tree supports, G2/G3 arc fitting on circular trunks, and build-plate-only routing",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 5.0,
+    "span_mm": 14.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 8.0,
+    "deck_height_mm": 2.0
+  },
+  "profile_bundle": {
+    "use_builtins": false,
+    "dir": "profiles",
+    "process": "organic_tree"
+  }
+}

@@ -1,6 +1,7 @@
 //! Deterministic FDM slicing pipeline: slice -> perimeters -> skins -> infill -> adhesion.
 
 mod arachne;
+mod tree_support;
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};
 
@@ -950,7 +951,7 @@ fn compute_bridge_angle(bridge: &ExPolygon, below: &[ExPolygon]) -> Result<f64, 
     Ok(best_angle)
 }
 
-fn bed_clamp_expolygon(config: &PrintConfig) -> Result<ExPolygon, SliceError> {
+pub(crate) fn bed_clamp_expolygon(config: &PrintConfig) -> Result<ExPolygon, SliceError> {
     let bw = config.machine.bed_width_mm;
     let bd = config.machine.bed_depth_mm;
     let pad = if bw > 2.0 && bd > 2.0 { 0.5 } else { 0.0 };
@@ -963,22 +964,14 @@ fn bed_clamp_expolygon(config: &PrintConfig) -> Result<ExPolygon, SliceError> {
     Ok(ExPolygon::new(outer, Vec::new()))
 }
 
-fn generate_support_paths(
+pub(crate) fn detect_contact_overhangs(
     raw_layers: &[RawSliceLayer],
+    bed_slice: &[ExPolygon],
     config: &PrintConfig,
-) -> Result<Vec<Vec<ExtrusionPath>>, SliceError> {
+) -> Result<Vec<Vec<ExPolygon>>, SliceError> {
     let n = raw_layers.len();
-    let mut per_layer = vec![Vec::new(); n];
     let s = &config.process.support;
-    if !s.enabled || n < 2 {
-        return Ok(per_layer);
-    }
-
     let join = JoinType::Miter { limit: 2.0 };
-    let bed_box = bed_clamp_expolygon(config)?;
-    let bed_slice = std::slice::from_ref(&bed_box);
-
-    // Pass 1: Overhang detection & top Z contact mapping.
     let top_gap_layers = (s.top_z_distance_mm / config.process.layer_height_mm)
         .round()
         .max(0.0) as usize;
@@ -1017,6 +1010,30 @@ fn generate_support_paths(
             *slot = union(slot)?;
         }
     }
+
+    Ok(contact_overhangs)
+}
+
+fn generate_support_paths(
+    raw_layers: &[RawSliceLayer],
+    config: &PrintConfig,
+) -> Result<Vec<Vec<ExtrusionPath>>, SliceError> {
+    let n = raw_layers.len();
+    let mut per_layer = vec![Vec::new(); n];
+    let s = &config.process.support;
+    if !s.enabled || n < 2 {
+        return Ok(per_layer);
+    }
+    if s.style == SupportStyle::Tree {
+        return tree_support::generate_tree_support_paths(raw_layers, config);
+    }
+
+    let join = JoinType::Miter { limit: 2.0 };
+    let bed_box = bed_clamp_expolygon(config)?;
+    let bed_slice = std::slice::from_ref(&bed_box);
+
+    // Pass 1: Overhang detection & top Z contact mapping.
+    let contact_overhangs = detect_contact_overhangs(raw_layers, bed_slice, config)?;
 
     // Pass 2: Top-down column projection with XY & bottom-Z model clearance.
     let bottom_gap_layers = (s.bottom_z_distance_mm / config.process.layer_height_mm)
@@ -1171,7 +1188,7 @@ fn generate_support_paths(
                         layer_paths.extend(hatched);
                     }
                 }
-                SupportStyle::Snug => {
+                SupportStyle::Snug | SupportStyle::Tree => {
                     let angle = if idx % 2 == 0 { 0.0 } else { FRAC_PI_2 };
                     let hatched = generate_rectilinear_hatch(
                         &base_here,
@@ -1457,7 +1474,7 @@ pub(crate) fn build_perimeters_classic(
     Ok((paths, infill_area))
 }
 
-fn push_closed_poly(
+pub(crate) fn push_closed_poly(
     poly: &Polygon,
     role: ExtrusionRole,
     width_mm: f64,
@@ -1576,7 +1593,7 @@ fn try_chain_hatch_segment(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate_rectilinear_hatch(
+pub(crate) fn generate_rectilinear_hatch(
     region: &[ExPolygon],
     angle_rad: f64,
     spacing_mm: f64,
@@ -2584,5 +2601,148 @@ mod tests {
             .filter(|p| matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall))
             .count();
         assert_eq!(wall_cnt, 0);
+    }
+
+    #[test]
+    fn tree_support_c_bracket_curves_around_lower_arm_to_build_plate() {
+        let mesh = make_c_bracket_mesh(20.0, 8.0, 3.0, 5.0, 8.0, 3.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Tree;
+        cfg.process.support.on_build_plate_only = true;
+        cfg.process.support.interface_layers = 2;
+        cfg.process.support.tree.max_branch_angle_deg = 45.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let has_layer0_sup = plate.layers[0]
+            .paths
+            .iter()
+            .any(|p| p.role == ExtrusionRole::Support);
+        assert!(
+            has_layer0_sup,
+            "expected tree trunk reaching build plate z=0"
+        );
+
+        let mut sup_count = 0usize;
+        let mut iface_count = 0usize;
+        for layer in &plate.layers {
+            for p in &layer.paths {
+                if p.role == ExtrusionRole::Support {
+                    sup_count += 1;
+                } else if p.role == ExtrusionRole::SupportInterface {
+                    iface_count += 1;
+                }
+                if matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                ) {
+                    for pt in &p.points {
+                        for reg in &layer.slice_regions {
+                            assert!(
+                                !reg.contains_point(*pt),
+                                "tree support collided with model at layer {} {:?}",
+                                layer.index,
+                                pt.to_mm()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(sup_count > 10, "expected Support paths across gap");
+        assert!(iface_count > 0, "expected SupportInterface paths");
+    }
+
+    #[test]
+    fn tree_support_bridge_arch_merges_branches_and_saves_filament() {
+        let mesh = make_bridge_arch_mesh(5.0, 16.0, 10.0, 10.0, 2.0);
+        let mut cfg_tree = PrintConfig::default();
+        cfg_tree.process.support.enabled = true;
+        cfg_tree.process.support.style = SupportStyle::Tree;
+        cfg_tree.process.support.interface_layers = 2;
+
+        let plate_tree = slice_single_mesh(&mesh, &cfg_tree).unwrap();
+        let mut cfg_grid = cfg_tree.clone();
+        cfg_grid.process.support.style = SupportStyle::Grid;
+        let plate_grid = slice_single_mesh(&mesh, &cfg_grid).unwrap();
+
+        let sup_len = |plate: &SlicedPlate| -> f64 {
+            plate
+                .layers
+                .iter()
+                .flat_map(|l| l.paths.iter())
+                .filter(|p| {
+                    matches!(
+                        p.role,
+                        ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                    )
+                })
+                .map(path_length_mm)
+                .sum()
+        };
+
+        let len_tree = sup_len(&plate_tree);
+        let len_grid = sup_len(&plate_grid);
+        assert!(len_tree > 0.0);
+        assert!(
+            len_tree < len_grid,
+            "tree length {len_tree:.1} mm not less than grid {len_grid:.1} mm"
+        );
+
+        let top_tip_count = plate_tree.layers[46]
+            .paths
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                )
+            })
+            .count();
+        let base_trunk_count = plate_tree.layers[1]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::Support && p.closed)
+            .count();
+        assert!(base_trunk_count >= 1);
+        assert!(
+            base_trunk_count < top_tip_count,
+            "expected branches to merge into fewer trunks: base={base_trunk_count} vs top={top_tip_count}"
+        );
+    }
+
+    #[test]
+    fn tree_support_overhang_ramp_supports_60deg_slope() {
+        let mesh = make_overhang_ramp_mesh(10.0, 12.0, 10.0, 60.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Tree;
+        cfg.process.support.threshold_angle_deg = 45.0;
+        cfg.process.support.interface_layers = 2;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let mut saw_sup = false;
+        let mut saw_iface = false;
+        for layer in &plate.layers {
+            for p in &layer.paths {
+                if p.role == ExtrusionRole::Support {
+                    saw_sup = true;
+                } else if p.role == ExtrusionRole::SupportInterface {
+                    saw_iface = true;
+                }
+                if matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                ) {
+                    for pt in &p.points {
+                        for reg in &layer.slice_regions {
+                            assert!(!reg.contains_point(*pt));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_sup, "expected Support paths on 60 deg overhang ramp");
+        assert!(saw_iface, "expected SupportInterface paths on ramp");
     }
 }

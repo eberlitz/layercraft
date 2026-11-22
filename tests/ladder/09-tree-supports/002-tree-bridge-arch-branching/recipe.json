@@ -1,0 +1,21 @@
+{
+  "name": "002-tree-bridge-arch-branching",
+  "description": "Bridge arch with branching hollow-trunk tree supports and dense tip interface caps",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 5.0,
+    "span_mm": 16.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 10.0,
+    "deck_height_mm": 2.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "tree",
+        "interface_layers": 2
+      }
+    }
+  }
+}

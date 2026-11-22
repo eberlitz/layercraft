@@ -395,17 +395,49 @@ pub enum SupportStyle {
     #[default]
     Grid,
     Snug,
+    #[serde(alias = "organic", alias = "tree_auto", alias = "tree_organic")]
+    Tree,
 }
 
 impl SupportStyle {
     /// All supported support styles.
-    pub const ALL: [Self; 2] = [Self::Grid, Self::Snug];
+    pub const ALL: [Self; 3] = [Self::Grid, Self::Snug, Self::Tree];
 
     /// Human-readable display label.
     pub fn label(self) -> &'static str {
         match self {
             Self::Grid => "Grid",
             Self::Snug => "Snug",
+            Self::Tree => "Tree (Organic)",
+        }
+    }
+}
+
+/// Organic / branching tree support parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct TreeSupportConfig {
+    pub max_branch_angle_deg: f64,
+    pub tip_diameter_mm: f64,
+    pub branch_diameter_mm: f64,
+    pub max_trunk_diameter_mm: f64,
+    pub branch_diameter_angle_deg: f64,
+    pub branch_distance_mm: f64,
+    pub branch_wall_loops: u16,
+    pub trunk_base_flare_mm: f64,
+}
+
+impl Default for TreeSupportConfig {
+    fn default() -> Self {
+        Self {
+            max_branch_angle_deg: 45.0,
+            tip_diameter_mm: 1.2,
+            branch_diameter_mm: 2.0,
+            max_trunk_diameter_mm: 8.0,
+            branch_diameter_angle_deg: 5.0,
+            branch_distance_mm: 3.0,
+            branch_wall_loops: 2,
+            trunk_base_flare_mm: 1.5,
         }
     }
 }
@@ -427,6 +459,7 @@ pub struct SupportConfig {
     pub line_width_mm: f64,
     pub speed_mm_s: f64,
     pub interface_speed_mm_s: f64,
+    pub tree: TreeSupportConfig,
 }
 
 impl Default for SupportConfig {
@@ -445,6 +478,7 @@ impl Default for SupportConfig {
             line_width_mm: 0.42,
             speed_mm_s: 80.0,
             interface_speed_mm_s: 50.0,
+            tree: TreeSupportConfig::default(),
         }
     }
 }
@@ -772,6 +806,76 @@ impl PrintConfig {
             "process.support.interface_speed_mm_s",
             sup.interface_speed_mm_s,
         )?;
+        let tree = &sup.tree;
+        for (field, val, min, max) in [
+            (
+                "process.support.tree.max_branch_angle_deg",
+                tree.max_branch_angle_deg,
+                10.0,
+                70.0,
+            ),
+            (
+                "process.support.tree.tip_diameter_mm",
+                tree.tip_diameter_mm,
+                0.4,
+                10.0,
+            ),
+            (
+                "process.support.tree.branch_diameter_mm",
+                tree.branch_diameter_mm,
+                0.6,
+                20.0,
+            ),
+            (
+                "process.support.tree.max_trunk_diameter_mm",
+                tree.max_trunk_diameter_mm,
+                1.0,
+                50.0,
+            ),
+            (
+                "process.support.tree.branch_diameter_angle_deg",
+                tree.branch_diameter_angle_deg,
+                0.0,
+                30.0,
+            ),
+            (
+                "process.support.tree.branch_distance_mm",
+                tree.branch_distance_mm,
+                0.8,
+                25.0,
+            ),
+            (
+                "process.support.tree.trunk_base_flare_mm",
+                tree.trunk_base_flare_mm,
+                0.0,
+                10.0,
+            ),
+        ] {
+            if !val.is_finite() || !(min..=max).contains(&val) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "out of valid range",
+                });
+            }
+        }
+        if tree.tip_diameter_mm > tree.max_trunk_diameter_mm {
+            return Err(ConfigError::Invalid {
+                field: "process.support.tree.tip_diameter_mm",
+                reason: "must be <= max_trunk_diameter_mm",
+            });
+        }
+        if tree.branch_diameter_mm > tree.max_trunk_diameter_mm {
+            return Err(ConfigError::Invalid {
+                field: "process.support.tree.branch_diameter_mm",
+                reason: "must be <= max_trunk_diameter_mm",
+            });
+        }
+        if !(1..=6).contains(&tree.branch_wall_loops) {
+            return Err(ConfigError::Invalid {
+                field: "process.support.tree.branch_wall_loops",
+                reason: "must be within 1..=6",
+            });
+        }
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
         let ir = &self.process.ironing;
@@ -1116,5 +1220,24 @@ mod tests {
         assert!(bad_ar.validate().is_err());
         bad_ar.process.arachne.wall_distribution_count = 9;
         assert!(bad_ar.validate().is_err());
+
+        let mut tree_ok = PrintConfig::default();
+        tree_ok.process.support.style = SupportStyle::Tree;
+        assert!(tree_ok.validate().is_ok());
+        assert_eq!(tree_ok.process.support.style.label(), "Tree (Organic)");
+
+        let mut bad_tree = PrintConfig::default();
+        bad_tree.process.support.tree.max_branch_angle_deg = f64::NAN;
+        assert!(bad_tree.validate().is_err());
+        bad_tree.process.support.tree.max_branch_angle_deg = 5.0;
+        assert!(bad_tree.validate().is_err());
+        bad_tree.process.support.tree.max_branch_angle_deg = 80.0;
+        assert!(bad_tree.validate().is_err());
+        bad_tree.process.support.tree.max_branch_angle_deg = 45.0;
+        bad_tree.process.support.tree.branch_wall_loops = 0;
+        assert!(bad_tree.validate().is_err());
+        bad_tree.process.support.tree.branch_wall_loops = 2;
+        bad_tree.process.support.tree.tip_diameter_mm = 9.0;
+        assert!(bad_tree.validate().is_err());
     }
 }

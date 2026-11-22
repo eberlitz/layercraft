@@ -1,0 +1,21 @@
+{
+  "name": "003-tree-overhang-ramp-60deg",
+  "description": "60-degree overhang ramp supported along its sloping underside by organic tree branches",
+  "shape": {
+    "kind": "overhang_ramp",
+    "base_width_mm": 10.0,
+    "depth_mm": 12.0,
+    "height_mm": 10.0,
+    "overhang_deg": 60.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "tree",
+        "threshold_angle_deg": 45.0,
+        "interface_layers": 2
+      }
+    }
+  }
+}

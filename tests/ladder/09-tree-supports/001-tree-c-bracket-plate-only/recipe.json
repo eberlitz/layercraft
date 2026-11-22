@@ -1,0 +1,26 @@
+{
+  "name": "001-tree-c-bracket-plate-only",
+  "description": "C-bracket with build-plate-only tree supports routing branches smoothly around the lower arm to z=0",
+  "shape": {
+    "kind": "c_bracket",
+    "width_mm": 20.0,
+    "depth_mm": 8.0,
+    "base_height_mm": 3.0,
+    "wall_width_mm": 5.0,
+    "gap_height_mm": 8.0,
+    "top_height_mm": 3.0
+  },
+  "config": {
+    "process": {
+      "support": {
+        "enabled": true,
+        "style": "tree",
+        "on_build_plate_only": true,
+        "interface_layers": 2,
+        "tree": {
+          "max_branch_angle_deg": 45.0
+        }
+      }
+    }
+  }
+}
