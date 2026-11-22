@@ -2558,6 +2558,58 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 )
             }),
         ),
+        doc_from_parts(
+            "LayerCraft CORE One+ HF 0.4mm",
+            ProfileKind::Machine,
+            true,
+            vec!["lc_machine_base".to_owned()],
+            json!({
+                "gcode_flavor": "marlin_buddy",
+                "printer_model": "COREONE",
+                "nozzle_diameter": ["0.4"],
+                "nozzle_high_flow": "1",
+                "printable_area": ["0x0", "250x0", "250x220", "0x220"],
+                "printable_height": "270",
+                "use_relative_e_distances": "1",
+                "retraction_length": ["0.7"],
+                "retraction_speed": ["35"],
+                "z_hop": ["0.2"],
+                "wipe": ["1"],
+                "wipe_distance": ["1.5"],
+                "travel_speed": "300",
+                "remaining_times": "1",
+                "machine_start_gcode": concat!(
+                    "M862.3 P \"[printer_model]\"\n",
+                    "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M555 X[first_layer_print_min_x] Y[first_layer_print_min_y] W[first_layer_print_size_x] H[first_layer_print_size_y]\n",
+                    "G90\n",
+                    "M83\n",
+                    "M104 S170\n",
+                    "M140 S[first_layer_bed_temperature]\n",
+                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{else}M141 S0{endif}\n",
+                    "M190 S[first_layer_bed_temperature]\n",
+                    "M109 S170\n",
+                    "G28\n",
+                    "G29\n",
+                    "G1 X5 Y5 Z10 F6000\n",
+                    "M109 S[first_layer_temperature]\n",
+                    "G1 Z0.2 F1200\n",
+                    "G1 X65 E3.0 F800\n",
+                    "G1 X75 E0.4 F800\n",
+                    "G92 E0"
+                ),
+                "machine_end_gcode": concat!(
+                    "G1 E-1.0 F2100\n",
+                    "M104 S0\n",
+                    "M140 S0\n",
+                    "M141 S0\n",
+                    "M107\n",
+                    "G1 Z{min(max_z + 15, bed_height)} F900\n",
+                    "G1 X{bed_width - 10} Y{bed_depth - 10} F9000\n",
+                    "M84"
+                )
+            }),
+        ),
         // Abstract Filament Base -> PLA, PETG, ABS
         doc_from_parts(
             "lc_filament_base",
@@ -2606,6 +2658,18 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
             }),
         ),
         doc_from_parts(
+            "LayerCraft PLA (0.4mm HF Nozzle)",
+            ProfileKind::Filament,
+            true,
+            vec!["LayerCraft Generic PLA".to_owned()],
+            json!({
+                "nozzle_temperature": ["220"],
+                "nozzle_temperature_initial_layer": ["225"],
+                "filament_max_volumetric_speed": ["24"],
+                "pressure_advance": ["0.03"]
+            }),
+        ),
+        doc_from_parts(
             "LayerCraft Generic PETG",
             ProfileKind::Filament,
             true,
@@ -2626,6 +2690,18 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "full_fan_speed_layer": ["5"],
                 "overhang_fan_speed": ["80"],
                 "filament_z_hop": ["0.4"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft PETG (0.4mm HF Nozzle)",
+            ProfileKind::Filament,
+            true,
+            vec!["LayerCraft Generic PETG".to_owned()],
+            json!({
+                "nozzle_temperature": ["245"],
+                "nozzle_temperature_initial_layer": ["250"],
+                "filament_max_volumetric_speed": ["18"],
+                "pressure_advance": ["0.04"]
             }),
         ),
         doc_from_parts(
@@ -2724,6 +2800,41 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
             }),
         ),
         doc_from_parts(
+            "LayerCraft 0.20mm Balanced (0.4mm HF)",
+            ProfileKind::Process,
+            true,
+            vec!["lc_process_base".to_owned()],
+            json!({
+                "layer_height": "0.20",
+                "initial_layer_print_height": "0.20",
+                "wall_loops": "2",
+                "top_shell_layers": "4",
+                "bottom_shell_layers": "3",
+                "top_shell_thickness": "0.8",
+                "bottom_shell_thickness": "0.6",
+                "sparse_infill_density": "15%",
+                "sparse_infill_pattern": "gyroid",
+                "outer_wall_line_width": "0.45",
+                "inner_wall_line_width": "0.45",
+                "internal_solid_infill_line_width": "0.45",
+                "sparse_infill_line_width": "0.45",
+                "support_line_width": "0.42",
+                "outer_wall_speed": "120",
+                "inner_wall_speed": "180",
+                "sparse_infill_speed": "200",
+                "top_surface_speed": "100",
+                "internal_solid_infill_speed": "180",
+                "initial_layer_speed": "40",
+                "bridge_speed": "35",
+                "overhang_3_4_speed": "30",
+                "default_acceleration": "4000",
+                "outer_wall_acceleration": "2500",
+                "inner_wall_acceleration": "3500",
+                "initial_layer_acceleration": "1000",
+                "travel_acceleration": "7000"
+            }),
+        ),
+        doc_from_parts(
             "lc_process_020_base",
             ProfileKind::Process,
             false,
@@ -2796,12 +2907,12 @@ mod tests {
         let filaments = lib.list(Some(ProfileKind::Filament), false);
         let processes = lib.list(Some(ProfileKind::Process), false);
 
-        assert_eq!(machines.len(), 3);
-        assert_eq!(filaments.len(), 4);
-        assert_eq!(processes.len(), 5);
+        assert_eq!(machines.len(), 4);
+        assert_eq!(filaments.len(), 6);
+        assert_eq!(processes.len(), 6);
 
         // Abstract bases excluded when include_abstract=false, included when true.
-        assert_eq!(lib.list(Some(ProfileKind::Machine), true).len(), 4);
+        assert_eq!(lib.list(Some(ProfileKind::Machine), true).len(), 5);
 
         let base = PrintConfig::default();
         for m in &machines {
@@ -3311,5 +3422,47 @@ mod tests {
         assert!((res.config.process.adaptive_layer_height.max_step_ratio - 1.6).abs() < 1e-9);
         assert_eq!(res.config.process.top_shell_thickness_mm, Some(0.8));
         assert_eq!(res.config.process.bottom_shell_thickness_mm, Some(0.6));
+    }
+
+    #[test]
+    fn core_one_hf_04mm_presets_resolve_with_expected_values() {
+        let lib = ProfileLibrary::with_builtin_presets();
+
+        let pla = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PLA (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap();
+        assert!(pla.config.validate().is_ok());
+        assert!(pla.warnings.is_empty(), "{:?}", pla.warnings);
+        assert!(pla.unmapped_keys.is_empty(), "{:?}", pla.unmapped_keys);
+        assert_eq!(pla.config.machine.flavor, GcodeFlavor::MarlinBuddy);
+        assert!((pla.config.machine.nozzle_diameter_mm - 0.4).abs() < 1e-9);
+        assert!(pla.config.machine.nozzle_high_flow);
+        assert!((pla.config.machine.bed_width_mm - 250.0).abs() < 1e-9);
+        assert!((pla.config.machine.bed_depth_mm - 220.0).abs() < 1e-9);
+        assert!((pla.config.machine.bed_height_mm - 270.0).abs() < 1e-9);
+        assert!((pla.config.process.layer_height_mm - 0.20).abs() < 1e-9);
+        assert!((pla.config.filament.max_volumetric_speed_mm3_s - 24.0).abs() < 1e-9);
+        assert_eq!(pla.config.process.top_shell_thickness_mm, Some(0.8));
+        assert_eq!(pla.config.process.bottom_shell_thickness_mm, Some(0.6));
+
+        let petg = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PETG (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap();
+        assert!(petg.config.validate().is_ok());
+        assert!(petg.warnings.is_empty(), "{:?}", petg.warnings);
+        assert!(petg.unmapped_keys.is_empty(), "{:?}", petg.unmapped_keys);
+        assert!((petg.config.filament.max_volumetric_speed_mm3_s - 18.0).abs() < 1e-9);
+        assert_eq!(petg.config.filament.nozzle_temp_c, 245);
+        assert_eq!(petg.config.filament.bed_temp_c, 80);
     }
 }

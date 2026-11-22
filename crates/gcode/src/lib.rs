@@ -3104,4 +3104,34 @@ mod tests {
             dome_rep.max_layer_height_mm
         );
     }
+
+    #[test]
+    fn core_one_hf_04mm_preset_emits_clean_buddy_gcode() {
+        let lib = layercraft_config::ProfileLibrary::with_builtin_presets();
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PLA (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap();
+        let cfg = res.config;
+        let plate = slice_single_mesh(&make_box(20.0, 20.0, 4.0), &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out.gcode.contains(r#"M862.3 P "COREONE""#));
+        assert!(out.gcode.contains("M862.1 P0.4 F1"));
+        assert!(out.gcode.contains("M555 "));
+        assert!(out.gcode.contains("M73 P"));
+
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert_eq!(rep.active_layer_count, 20);
+    }
 }
