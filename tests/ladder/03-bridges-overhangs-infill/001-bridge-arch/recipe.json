@@ -1,0 +1,23 @@
+{
+  "name": "001-bridge-arch",
+  "description": "Two 6x10x6 mm pillars with an 18 mm clear span under a 3 mm horizontal bridge deck",
+  "shape": {
+    "kind": "bridge_arch",
+    "pillar_width_mm": 6.0,
+    "span_mm": 18.0,
+    "depth_mm": 10.0,
+    "pillar_height_mm": 6.0,
+    "deck_height_mm": 3.0
+  },
+  "config": {
+    "filament": {
+      "fan_min_percent": 30,
+      "bridge_fan_percent": 100
+    },
+    "process": {
+      "detect_bridges": true,
+      "bridge_speed_mm_s": 30.0,
+      "bridge_flow_ratio": 0.95
+    }
+  }
+}

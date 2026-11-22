@@ -222,9 +222,11 @@ pub fn role_color(role: ExtrusionRole) -> [f32; 4] {
     match role {
         ExtrusionRole::OuterWall => [0.96, 0.45, 0.16, 1.0],
         ExtrusionRole::InnerWall => [0.95, 0.77, 0.22, 1.0],
+        ExtrusionRole::OverhangWall => [0.98, 0.22, 0.62, 1.0],
         ExtrusionRole::TopSurface => [0.92, 0.28, 0.30, 1.0],
         ExtrusionRole::BottomSurface => [0.22, 0.72, 0.88, 1.0],
         ExtrusionRole::InternalSolidInfill => [0.62, 0.36, 0.85, 1.0],
+        ExtrusionRole::Bridge => [0.20, 0.56, 0.98, 1.0],
         ExtrusionRole::SparseInfill => [0.26, 0.78, 0.44, 1.0],
         ExtrusionRole::Skirt => [0.35, 0.84, 0.74, 1.0],
         ExtrusionRole::Brim => [0.40, 0.65, 0.96, 1.0],

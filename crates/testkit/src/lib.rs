@@ -48,6 +48,19 @@ pub enum ShapeSpec {
         top_depth_mm: f64,
         top_height_mm: f64,
     },
+    BridgeArch {
+        pillar_width_mm: f64,
+        span_mm: f64,
+        depth_mm: f64,
+        pillar_height_mm: f64,
+        deck_height_mm: f64,
+    },
+    OverhangRamp {
+        base_width_mm: f64,
+        depth_mm: f64,
+        height_mm: f64,
+        overhang_deg: f64,
+    },
 }
 
 fn default_segments() -> usize {
@@ -97,6 +110,30 @@ pub fn build_shape(spec: &ShapeSpec) -> Result<TriangleMesh, TestkitError> {
             top_width_mm,
             top_depth_mm,
             top_height_mm,
+        )?),
+        ShapeSpec::BridgeArch {
+            pillar_width_mm,
+            span_mm,
+            depth_mm,
+            pillar_height_mm,
+            deck_height_mm,
+        } => Ok(make_bridge_arch(
+            pillar_width_mm,
+            span_mm,
+            depth_mm,
+            pillar_height_mm,
+            deck_height_mm,
+        )?),
+        ShapeSpec::OverhangRamp {
+            base_width_mm,
+            depth_mm,
+            height_mm,
+            overhang_deg,
+        } => Ok(make_overhang_ramp(
+            base_width_mm,
+            depth_mm,
+            height_mm,
+            overhang_deg,
         )?),
     }
 }
@@ -208,6 +245,52 @@ pub fn make_stepped_block(
     let mut top = make_box(tw, td, th)?;
     top.translate(0.5 * (bw - tw), 0.5 * (bd - td), bh)?;
     tris.extend(top.triangles);
+    TriangleMesh::new(tris)
+}
+
+/// Watertight bridge arch: two vertical pillars separated by `span_mm` under a horizontal deck.
+pub fn make_bridge_arch(
+    pillar_w: f64,
+    span_mm: f64,
+    depth_mm: f64,
+    pillar_h: f64,
+    deck_h: f64,
+) -> Result<TriangleMesh, GeomError> {
+    let mut tris = make_box(pillar_w, depth_mm, pillar_h)?.triangles;
+    let mut right = make_box(pillar_w, depth_mm, pillar_h)?;
+    right.translate(pillar_w + span_mm, 0.0, 0.0)?;
+    tris.extend(right.triangles);
+
+    let mut deck = make_box(2.0 * pillar_w + span_mm, depth_mm, deck_h)?;
+    deck.translate(0.0, 0.0, pillar_h)?;
+    tris.extend(deck.triangles);
+    TriangleMesh::new(tris)
+}
+
+/// Watertight sloped overhang ramp with right wall leaning outward at `overhang_deg` from vertical.
+pub fn make_overhang_ramp(
+    base_w: f64,
+    depth_mm: f64,
+    height_mm: f64,
+    overhang_deg: f64,
+) -> Result<TriangleMesh, GeomError> {
+    let top_w = base_w + height_mm * overhang_deg.to_radians().tan();
+    let p000 = Point3::new(0.0, 0.0, 0.0);
+    let p100 = Point3::new(base_w, 0.0, 0.0);
+    let p110 = Point3::new(base_w, depth_mm, 0.0);
+    let p010 = Point3::new(0.0, depth_mm, 0.0);
+    let p001 = Point3::new(0.0, 0.0, height_mm);
+    let p101 = Point3::new(top_w, 0.0, height_mm);
+    let p111 = Point3::new(top_w, depth_mm, height_mm);
+    let p011 = Point3::new(0.0, depth_mm, height_mm);
+
+    let mut tris = Vec::with_capacity(12);
+    push_quad(&mut tris, p000, p010, p110, p100);
+    push_quad(&mut tris, p001, p101, p111, p011);
+    push_quad(&mut tris, p000, p100, p101, p001);
+    push_quad(&mut tris, p010, p011, p111, p110);
+    push_quad(&mut tris, p000, p001, p011, p010);
+    push_quad(&mut tris, p100, p110, p111, p101);
     TriangleMesh::new(tris)
 }
 

@@ -1,0 +1,22 @@
+{
+  "name": "002-overhang-60deg",
+  "description": "Overhang ramp leaning at 60 deg from vertical verifying OverhangWall detection & cooling",
+  "shape": {
+    "kind": "overhang_ramp",
+    "base_width_mm": 10.0,
+    "depth_mm": 12.0,
+    "height_mm": 8.0,
+    "overhang_deg": 60.0
+  },
+  "config": {
+    "filament": {
+      "fan_min_percent": 30,
+      "bridge_fan_percent": 100
+    },
+    "process": {
+      "detect_overhangs": true,
+      "overhang_threshold_deg": 45.0,
+      "overhang_speed_mm_s": 25.0
+    }
+  }
+}

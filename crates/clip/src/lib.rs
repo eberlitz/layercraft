@@ -220,27 +220,28 @@ pub fn offset(
     Ok(polytree_to_expolygons(&tree))
 }
 
-/// Clip open line segments `(start, end)` against closed `region` polygons.
-pub fn clip_lines(
-    lines: &[(Point2, Point2)],
+fn clip_open_paths(
+    polylines: &[Vec<Point2>],
     region: &[ExPolygon],
+    clip_type: ClipType,
 ) -> Result<Vec<Vec<Point2>>, ClipError> {
-    if lines.is_empty() || region.is_empty() {
+    let valid_inputs: Vec<Vec<Point2>> =
+        polylines.iter().filter(|p| p.len() >= 2).cloned().collect();
+    if valid_inputs.is_empty() {
         return Ok(Vec::new());
     }
     let clip_paths = to_paths64(region);
     if clip_paths.is_empty() {
-        return Ok(Vec::new());
+        return match clip_type {
+            ClipType::Difference => Ok(valid_inputs),
+            _ => Ok(Vec::new()),
+        };
     }
 
-    let open_paths: Paths64 = lines
+    let open_paths: Paths64 = valid_inputs
         .iter()
-        .filter(|(a, b)| a != b)
-        .map(|(a, b)| vec![Point64::new(a.x, a.y), Point64::new(b.x, b.y)])
+        .map(|poly| poly.iter().map(|p| Point64::new(p.x, p.y)).collect())
         .collect();
-    if open_paths.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let mut clipper = Clipper64::new();
     clipper.add_open_subject(&open_paths);
@@ -249,7 +250,7 @@ pub fn clip_lines(
     let mut closed_out = Paths64::new();
     let mut open_out = Paths64::new();
     if !clipper.execute(
-        ClipType::Intersection,
+        clip_type,
         FillRule::NonZero,
         &mut closed_out,
         Some(&mut open_out),
@@ -264,6 +265,35 @@ pub fn clip_lines(
         }
     }
     Ok(result)
+}
+
+/// Clip open line segments `(start, end)` against closed `region` polygons.
+pub fn clip_lines(
+    lines: &[(Point2, Point2)],
+    region: &[ExPolygon],
+) -> Result<Vec<Vec<Point2>>, ClipError> {
+    let polylines: Vec<Vec<Point2>> = lines
+        .iter()
+        .filter(|(a, b)| a != b)
+        .map(|&(a, b)| vec![a, b])
+        .collect();
+    clip_open_paths(&polylines, region, ClipType::Intersection)
+}
+
+/// Intersect open polylines with closed `region` polygons (`polylines ∩ region`).
+pub fn clip_polylines(
+    polylines: &[Vec<Point2>],
+    region: &[ExPolygon],
+) -> Result<Vec<Vec<Point2>>, ClipError> {
+    clip_open_paths(polylines, region, ClipType::Intersection)
+}
+
+/// Subtract closed `region` polygons from open polylines (`polylines \ region`).
+pub fn clip_polylines_difference(
+    polylines: &[Vec<Point2>],
+    region: &[ExPolygon],
+) -> Result<Vec<Vec<Point2>>, ClipError> {
+    clip_open_paths(polylines, region, ClipType::Difference)
 }
 
 /// Simplify a closed polygon using Clipper2 collinear/epsilon pruning.
@@ -333,10 +363,44 @@ mod tests {
     }
 
     #[test]
+    fn clip_polylines_and_difference_handle_holed_square() {
+        let outer = rect(0.0, 0.0, 20.0, 20.0);
+        let mut hole = rect(8.0, 8.0, 12.0, 12.0);
+        hole.ensure_cw();
+        let region = vec![ExPolygon::new(outer, vec![hole])];
+
+        let wave = vec![
+            Point2::from_mm(-5.0, 10.0).unwrap(),
+            Point2::from_mm(10.0, 10.0).unwrap(),
+            Point2::from_mm(25.0, 10.0).unwrap(),
+        ];
+        let inside = clip_polylines(std::slice::from_ref(&wave), &region).unwrap();
+        assert_eq!(inside.len(), 2);
+        let inside_len: f64 = inside
+            .iter()
+            .map(|p| p.windows(2).map(|w| w[0].distance_mm(w[1])).sum::<f64>())
+            .sum();
+        assert!((inside_len - 16.0).abs() < 1e-4);
+
+        let outside = clip_polylines_difference(std::slice::from_ref(&wave), &region).unwrap();
+        assert_eq!(outside.len(), 3);
+        let outside_len: f64 = outside
+            .iter()
+            .map(|p| p.windows(2).map(|w| w[0].distance_mm(w[1])).sum::<f64>())
+            .sum();
+        assert!((outside_len - 14.0).abs() < 1e-4);
+
+        assert!(clip_polylines(&[], &region).unwrap().is_empty());
+        assert_eq!(clip_polylines_difference(&[wave], &[]).unwrap().len(), 1);
+    }
+
+    #[test]
     fn hostile_empty_and_invalid_params() {
         assert!(union(&[]).unwrap().is_empty());
         assert!(offset(&[], -100, JoinType::default()).unwrap().is_empty());
         assert!(clip_lines(&[], &[]).unwrap().is_empty());
+        assert!(clip_polylines(&[], &[]).unwrap().is_empty());
+        assert!(clip_polylines_difference(&[], &[]).unwrap().is_empty());
         let sq = vec![ExPolygon::new(rect(0.0, 0.0, 10.0, 10.0), vec![])];
         assert!(offset(&sq, -100, JoinType::Miter { limit: f64::NAN }).is_err());
     }

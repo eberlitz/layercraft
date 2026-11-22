@@ -464,7 +464,8 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 total_time_s += retract_len / config.machine.retraction_speed_mm_s;
             }
 
-            let bead_area = bead_area_mm2(path.width_mm, path.height_mm);
+            let eff_flow = path.flow_ratio.max(0.01);
+            let bead_area = bead_area_mm2(path.width_mm, path.height_mm) * eff_flow;
             let eff_speed = if bead_area > 1e-9 {
                 path.speed_mm_s
                     .min(config.filament.max_volumetric_speed_mm3_s / bead_area)
@@ -494,7 +495,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                     path.width_mm,
                     path.height_mm,
                     config.filament.diameter_mm,
-                );
+                ) * eff_flow;
                 let e_val = next_e_val(config.machine.relative_extrusion, &mut cur_e, de);
                 writeln!(out, "G1 X{nx:.3} Y{ny:.3} E{e_val:.5} F{feed:.0}")
                     .map_err(|_| GcodeError::FormatError)?;

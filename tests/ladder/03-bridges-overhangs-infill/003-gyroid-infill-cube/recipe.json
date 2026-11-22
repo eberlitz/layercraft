@@ -1,0 +1,16 @@
+{
+  "name": "003-gyroid-infill-cube",
+  "description": "24 x 24 x 10 mm block filled with 20% 3D Gyroid sparse infill",
+  "shape": {
+    "kind": "box",
+    "width_mm": 24.0,
+    "depth_mm": 24.0,
+    "height_mm": 10.0
+  },
+  "config": {
+    "process": {
+      "sparse_infill_density": 0.20,
+      "sparse_infill_pattern": "gyroid"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "004-cubic-infill-tube",
+  "description": "Hollow tube R16/R8 H10 mm with 20% 3D Cubic infill & monotonic top/bottom surfaces",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 16.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 10.0,
+    "segments": 48
+  },
+  "config": {
+    "process": {
+      "sparse_infill_density": 0.20,
+      "sparse_infill_pattern": "cubic",
+      "monotonic_solid_infill": true
+    }
+  }
+}

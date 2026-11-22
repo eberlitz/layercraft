@@ -42,6 +42,10 @@ struct LadderExpected {
     #[serde(default)]
     require_wipes: bool,
     #[serde(default)]
+    require_bridge: bool,
+    #[serde(default)]
+    require_overhang_wall: bool,
+    #[serde(default)]
     require_gcode_contains: Vec<String>,
 }
 
@@ -195,6 +199,14 @@ pub fn run(root: &Path) -> Result<(), String> {
             }
             if exp.require_wipes && rep.wipe_moves_count == 0 {
                 errs.push("missing wipe-on-retract moves".to_owned());
+            }
+            for (required, feat) in [
+                (exp.require_bridge, "Bridge"),
+                (exp.require_overhang_wall, "Overhang wall"),
+            ] {
+                if required && rep.feature_volumes_mm3.get(feat).copied().unwrap_or(0.0) <= 0.0 {
+                    errs.push(format!("missing {feat} extrusions"));
+                }
             }
             for needle in &exp.require_gcode_contains {
                 if !out.gcode.contains(needle) {

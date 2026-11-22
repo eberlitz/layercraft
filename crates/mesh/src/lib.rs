@@ -374,6 +374,7 @@ pub enum SampleShape {
     HollowTube,
     SteppedBlock,
     ThinRib,
+    BridgeArch,
 }
 
 impl SampleShape {
@@ -385,16 +386,18 @@ impl SampleShape {
             Self::HollowTube => "Hollow Tube R15/R8",
             Self::SteppedBlock => "Stepped Block",
             Self::ThinRib => "Thin Rib 30x1.6",
+            Self::BridgeArch => "Bridge Arch",
         }
     }
 
     /// All built-in sample variants.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Cube20,
         Self::Cylinder,
         Self::HollowTube,
         Self::SteppedBlock,
         Self::ThinRib,
+        Self::BridgeArch,
     ];
 }
 
@@ -428,6 +431,12 @@ pub fn build_sample_shape(shape: SampleShape) -> Result<TriangleMesh, MeshError>
     let tris = match shape {
         SampleShape::Cube20 => sample_box(20.0, 20.0, 20.0, 0.0, 0.0, 0.0),
         SampleShape::ThinRib => sample_box(30.0, 1.6, 10.0, 0.0, 0.0, 0.0),
+        SampleShape::BridgeArch => {
+            let mut t = sample_box(6.0, 10.0, 8.0, 0.0, 0.0, 0.0);
+            t.extend(sample_box(6.0, 10.0, 8.0, 24.0, 0.0, 0.0));
+            t.extend(sample_box(30.0, 10.0, 3.0, 0.0, 0.0, 8.0));
+            t
+        }
         SampleShape::SteppedBlock => {
             let mut t = sample_box(20.0, 20.0, 10.0, 0.0, 0.0, 0.0);
             t.extend(sample_box(10.0, 10.0, 10.0, 5.0, 5.0, 10.0));

@@ -24,13 +24,30 @@ pub enum GcodeFlavor {
     Marlin,
 }
 
-/// Supported sparse infill patterns for Tier 01 MVP.
+/// Supported sparse infill patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InfillPattern {
     Rectilinear,
     #[default]
     Grid,
+    Gyroid,
+    Cubic,
+}
+
+impl InfillPattern {
+    /// All supported sparse infill patterns.
+    pub const ALL: [Self; 4] = [Self::Rectilinear, Self::Grid, Self::Gyroid, Self::Cubic];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rectilinear => "Rectilinear",
+            Self::Grid => "Grid",
+            Self::Gyroid => "Gyroid",
+            Self::Cubic => "Cubic",
+        }
+    }
 }
 
 /// Strategy for choosing seam start locations on closed wall loops.
@@ -123,6 +140,7 @@ pub struct FilamentConfig {
     pub full_fan_speed_layer: u16,
     pub slow_down_layer_time_s: f64,
     pub slow_down_min_speed_mm_s: f64,
+    pub bridge_fan_percent: u8,
 }
 
 impl Default for FilamentConfig {
@@ -141,6 +159,7 @@ impl Default for FilamentConfig {
             full_fan_speed_layer: 4,
             slow_down_layer_time_s: 8.0,
             slow_down_min_speed_mm_s: 15.0,
+            bridge_fan_percent: 100,
         }
     }
 }
@@ -181,6 +200,13 @@ pub struct ProcessConfig {
     pub first_layer_infill_speed_mm_s: Option<f64>,
     pub top_surface_speed_mm_s: Option<f64>,
     pub solid_infill_speed_mm_s: Option<f64>,
+    pub detect_bridges: bool,
+    pub bridge_speed_mm_s: f64,
+    pub bridge_flow_ratio: f64,
+    pub detect_overhangs: bool,
+    pub overhang_threshold_deg: f64,
+    pub overhang_speed_mm_s: f64,
+    pub monotonic_solid_infill: bool,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
 }
@@ -207,6 +233,13 @@ impl Default for ProcessConfig {
             first_layer_infill_speed_mm_s: None,
             top_surface_speed_mm_s: None,
             solid_infill_speed_mm_s: None,
+            detect_bridges: true,
+            bridge_speed_mm_s: 30.0,
+            bridge_flow_ratio: 0.95,
+            detect_overhangs: true,
+            overhang_threshold_deg: 45.0,
+            overhang_speed_mm_s: 25.0,
+            monotonic_solid_infill: true,
             skirt_loops: 0,
             brim_width_mm: 0.0,
         }
@@ -333,6 +366,12 @@ impl PrintConfig {
             "filament.slow_down_min_speed_mm_s",
             self.filament.slow_down_min_speed_mm_s,
         )?;
+        if self.filament.bridge_fan_percent > 100 {
+            return Err(ConfigError::Invalid {
+                field: "filament.bridge_fan_percent",
+                reason: "must be <= 100",
+            });
+        }
 
         check_pos("process.layer_height_mm", self.process.layer_height_mm)?;
         check_pos(
@@ -394,6 +433,27 @@ impl PrintConfig {
                 check_pos(field, v)?;
             }
         }
+        check_pos("process.bridge_speed_mm_s", self.process.bridge_speed_mm_s)?;
+        if !self.process.bridge_flow_ratio.is_finite()
+            || !(0.1..=2.0).contains(&self.process.bridge_flow_ratio)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.bridge_flow_ratio",
+                reason: "must be within 0.1..=2.0",
+            });
+        }
+        if !self.process.overhang_threshold_deg.is_finite()
+            || !(10.0..=85.0).contains(&self.process.overhang_threshold_deg)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.overhang_threshold_deg",
+                reason: "must be within 10.0..=85.0",
+            });
+        }
+        check_pos(
+            "process.overhang_speed_mm_s",
+            self.process.overhang_speed_mm_s,
+        )?;
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
 
         if self.process.layer_height_mm > self.machine.nozzle_diameter_mm * 1.25 {
@@ -439,8 +499,12 @@ mod tests {
         assert_eq!(cfg.filament.max_volumetric_speed_mm3_s, 15.0);
         assert_eq!(cfg.filament.fan_min_percent, 35);
         assert_eq!(cfg.filament.fan_max_percent, 100);
+        assert_eq!(cfg.filament.bridge_fan_percent, 100);
         assert_eq!(cfg.machine.z_hop_mm, 0.0);
         assert_eq!(cfg.process.seam_position, SeamPosition::Aligned);
+        assert!(cfg.process.detect_bridges);
+        assert!(cfg.process.detect_overhangs);
+        assert!(cfg.process.monotonic_solid_infill);
     }
 
     #[test]
@@ -481,5 +545,29 @@ mod tests {
         let mut cfg8 = PrintConfig::default();
         cfg8.process.top_surface_speed_mm_s = Some(-5.0);
         assert!(cfg8.validate().is_err());
+
+        let mut cfg9 = PrintConfig::default();
+        cfg9.filament.bridge_fan_percent = 120;
+        assert!(cfg9.validate().is_err());
+
+        let mut cfg10 = PrintConfig::default();
+        cfg10.process.bridge_flow_ratio = 0.05;
+        assert!(cfg10.validate().is_err());
+        cfg10.process.bridge_flow_ratio = 2.5;
+        assert!(cfg10.validate().is_err());
+
+        let mut cfg11 = PrintConfig::default();
+        cfg11.process.overhang_threshold_deg = 5.0;
+        assert!(cfg11.validate().is_err());
+        cfg11.process.overhang_threshold_deg = 89.0;
+        assert!(cfg11.validate().is_err());
+
+        let mut cfg12 = PrintConfig::default();
+        cfg12.process.bridge_speed_mm_s = 0.0;
+        assert!(cfg12.validate().is_err());
+
+        let mut cfg13 = PrintConfig::default();
+        cfg13.process.overhang_speed_mm_s = -10.0;
+        assert!(cfg13.validate().is_err());
     }
 }

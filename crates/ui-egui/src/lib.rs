@@ -419,21 +419,15 @@ impl LayerCraftApp {
 
                             ui.label("Infill pattern");
                             egui::ComboBox::from_id_salt("infill_pat")
-                                .selected_text(match p.sparse_infill_pattern {
-                                    InfillPattern::Grid => "Grid",
-                                    InfillPattern::Rectilinear => "Rectilinear",
-                                })
+                                .selected_text(p.sparse_infill_pattern.label())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut p.sparse_infill_pattern,
-                                        InfillPattern::Grid,
-                                        "Grid",
-                                    );
-                                    ui.selectable_value(
-                                        &mut p.sparse_infill_pattern,
-                                        InfillPattern::Rectilinear,
-                                        "Rectilinear",
-                                    );
+                                    for pat in InfillPattern::ALL {
+                                        ui.selectable_value(
+                                            &mut p.sparse_infill_pattern,
+                                            pat,
+                                            pat.label(),
+                                        );
+                                    }
                                 });
                             ui.end_row();
 
@@ -617,6 +611,67 @@ impl LayerCraftApp {
                                 });
                         });
 
+                    egui::CollapsingHeader::new("Bridges & Overhangs")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let proc_cfg = &mut self.session.config.process;
+                            egui::Grid::new("bridge_overhang_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Detect bridges");
+                                    ui.checkbox(&mut proc_cfg.detect_bridges, "");
+                                    ui.end_row();
+
+                                    ui.label("Bridge speed (mm/s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.bridge_speed_mm_s)
+                                            .speed(1.0)
+                                            .range(5.0..=150.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Bridge flow ratio");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.bridge_flow_ratio)
+                                            .speed(0.02)
+                                            .range(0.5..=1.5),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Bridge fan (%)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut f.bridge_fan_percent)
+                                            .range(0..=100),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Detect overhangs");
+                                    ui.checkbox(&mut proc_cfg.detect_overhangs, "");
+                                    ui.end_row();
+
+                                    ui.label("Overhang angle (deg)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.overhang_threshold_deg)
+                                            .speed(1.0)
+                                            .range(10.0..=85.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Overhang speed (mm/s)");
+                                    ui.add(
+                                        egui::DragValue::new(&mut proc_cfg.overhang_speed_mm_s)
+                                            .speed(1.0)
+                                            .range(5.0..=150.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Monotonic top/bottom");
+                                    ui.checkbox(&mut proc_cfg.monotonic_solid_infill, "");
+                                    ui.end_row();
+                                });
+                        });
+
                     if let Some(mesh) = &self.session.prepared_mesh {
                         ui.separator();
                         ui.heading("Mesh Summary");
@@ -721,9 +776,11 @@ impl LayerCraftApp {
                     for role in [
                         ExtrusionRole::OuterWall,
                         ExtrusionRole::InnerWall,
+                        ExtrusionRole::OverhangWall,
                         ExtrusionRole::TopSurface,
                         ExtrusionRole::BottomSurface,
                         ExtrusionRole::InternalSolidInfill,
+                        ExtrusionRole::Bridge,
                         ExtrusionRole::SparseInfill,
                         ExtrusionRole::Skirt,
                         ExtrusionRole::Brim,
