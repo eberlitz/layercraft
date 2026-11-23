@@ -7,6 +7,7 @@ use std::ops::Range;
 
 use glam::{Mat4, Vec3, Vec4};
 use layercraft_config::PrintConfig;
+use layercraft_gcode::combing::CombingLayer;
 use layercraft_geom::{Aabb3, Point3, TriangleMesh};
 use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
 use schemars::JsonSchema;
@@ -530,15 +531,97 @@ pub fn build_mesh_vertices(mesh: &TriangleMesh, color: [f32; 4]) -> Vec<SceneVer
     verts
 }
 
-/// 3D extruded bead ribbon geometry indexed by layer range for O(1) layer scrubbing.
+/// Move classification stored per step inside a sliced layer for travel/scrubbing preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum MoveKind {
+    Extrusion(ExtrusionRole),
+    Travel,
+    CombedTravel,
+    ZHopTravel,
+}
+
+impl MoveKind {
+    /// Human-readable label displayed in the move scrubber readout and legend.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Extrusion(role) => role.label(),
+            Self::Travel => "Travel",
+            Self::CombedTravel => "Combed travel",
+            Self::ZHopTravel => "Z-hop travel",
+        }
+    }
+
+    /// Representative RGBA color matching the 3D viewport rendering.
+    pub fn color(self) -> [f32; 4] {
+        match self {
+            Self::Extrusion(role) => role_color(role),
+            Self::Travel => [0.28, 0.72, 0.98, 0.88],
+            Self::CombedTravel => [0.12, 0.92, 0.78, 0.94],
+            Self::ZHopTravel => [0.76, 0.44, 0.98, 0.94],
+        }
+    }
+}
+
+/// One sequential motion step within a layer, indexing into extruded bead and travel buffers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerMoveStep {
+    pub toolpath_vertex_end: u32,
+    pub travel_vertex_end: u32,
+    pub nozzle_pos: [f32; 3],
+    pub kind: MoveKind,
+    pub speed_mm_s: f32,
+    pub width_mm: f32,
+}
+
+/// 3D extruded bead ribbon and travel-line geometry indexed by layer and intra-layer step.
 #[derive(Debug, Clone, Default)]
 pub struct ToolpathGeometry {
     pub vertices: Vec<SceneVertex>,
     pub layer_ranges: Vec<Range<u32>>,
+    pub travel_lines: Vec<LineVertex>,
+    pub travel_layer_ranges: Vec<Range<u32>>,
+    pub layer_steps: Vec<Vec<LayerMoveStep>>,
 }
 
-/// Build 3D extruded bead ribbons (top cap + two side walls) for every layer in `plate`.
+/// Build 3D extruded bead ribbons (without combing travel hints) for every layer in `plate`.
 pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeometry {
+    build_toolpath_mesh_with_config(plate, mode, None)
+}
+
+fn push_travel_segment(
+    travel_lines: &mut Vec<LineVertex>,
+    steps: &mut Vec<LayerMoveStep>,
+    toolpath_vertex_end: u32,
+    endpoints: [[f32; 3]; 2],
+    nozzle_pos: [f32; 3],
+    kind: MoveKind,
+    speed_mm_s: f32,
+) {
+    let color = kind.color();
+    travel_lines.push(LineVertex {
+        pos: endpoints[0],
+        color,
+    });
+    travel_lines.push(LineVertex {
+        pos: endpoints[1],
+        color,
+    });
+    steps.push(LayerMoveStep {
+        toolpath_vertex_end,
+        travel_vertex_end: travel_lines.len() as u32,
+        nozzle_pos,
+        kind,
+        speed_mm_s,
+        width_mm: 0.0,
+    });
+}
+
+/// Build 3D extruded bead ribbons, combed/Z-hop travel lines, and per-step scrubbing indices.
+pub fn build_toolpath_mesh_with_config(
+    plate: &SlicedPlate,
+    mode: ColorMode,
+    config: Option<&PrintConfig>,
+) -> ToolpathGeometry {
     let total_layers = plate.layers.len();
     let height_range_mm = if mode == ColorMode::LayerHeight && !plate.layers.is_empty() {
         let mut min_h = f64::INFINITY;
@@ -555,19 +638,149 @@ pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeom
     } else {
         (0.04, 0.32)
     };
+
+    let travel_speed = config
+        .map(|c| c.machine.travel_speed_mm_s as f32)
+        .unwrap_or(180.0);
+    let min_retract_travel = config
+        .map(|c| c.machine.min_travel_for_retract_mm)
+        .unwrap_or(1.5);
+    let z_hop_mm = config.map(|c| c.machine.z_hop_mm).unwrap_or(0.0);
+    let enable_combing = config.is_some_and(|c| c.process.avoid_crossing_perimeters);
+    let outer_wall_w = config
+        .map(|c| c.process.outer_wall_width_mm)
+        .unwrap_or(0.42);
+    let max_detour_mm = config
+        .map(|c| c.process.avoid_crossing_perimeters_max_detour_mm)
+        .unwrap_or(50.0);
+
     let mut vertices = Vec::new();
     let mut layer_ranges = Vec::with_capacity(total_layers);
+    let mut travel_lines = Vec::new();
+    let mut travel_layer_ranges = Vec::with_capacity(total_layers);
+    let mut layer_steps = Vec::with_capacity(total_layers);
+    let mut prev_xy: Option<(f64, f64)> = None;
 
     for (layer_idx, layer) in plate.layers.iter().enumerate() {
         let start = vertices.len() as u32;
+        let travel_start = travel_lines.len() as u32;
+        let mut steps = Vec::new();
         let z_top = layer.z_top_mm as f32;
         let z_bot = (layer.z_top_mm - layer.height_mm) as f32;
+        let z_line = z_top + 0.03;
+
+        let combing = if enable_combing && !layer.slice_regions.is_empty() {
+            Some(CombingLayer::from_regions(
+                &layer.slice_regions,
+                outer_wall_w,
+            ))
+        } else {
+            None
+        };
 
         for path in &layer.paths {
             let n = path.points.len();
             if n < 2 {
                 continue;
             }
+            let Some(&first_pt) = path.points.first() else {
+                continue;
+            };
+            let (sx_f64, sy_f64) = first_pt.to_mm();
+
+            if let Some((px, py)) = prev_xy {
+                let dist = (sx_f64 - px).hypot(sy_f64 - py);
+                if dist > 1e-3 {
+                    let cur_v_end = vertices.len() as u32;
+                    let combed_pts = combing
+                        .as_ref()
+                        .and_then(|c| c.plan_travel((px, py), (sx_f64, sy_f64), max_detour_mm));
+                    let is_combed = combed_pts.is_some();
+                    let use_z_hop = z_hop_mm > 0.0 && dist > min_retract_travel;
+
+                    if use_z_hop && !is_combed {
+                        let z_hop_top = z_top + (z_hop_mm as f32);
+                        let p3 = [px as f32, py as f32, z_line];
+                        let p_up = [px as f32, py as f32, z_hop_top];
+                        let s_up = [sx_f64 as f32, sy_f64 as f32, z_hop_top];
+                        let s3 = [sx_f64 as f32, sy_f64 as f32, z_line];
+                        push_travel_segment(
+                            &mut travel_lines,
+                            &mut steps,
+                            cur_v_end,
+                            [p3, p_up],
+                            p_up,
+                            MoveKind::ZHopTravel,
+                            travel_speed,
+                        );
+                        push_travel_segment(
+                            &mut travel_lines,
+                            &mut steps,
+                            cur_v_end,
+                            [p_up, s_up],
+                            s_up,
+                            MoveKind::ZHopTravel,
+                            travel_speed,
+                        );
+                        push_travel_segment(
+                            &mut travel_lines,
+                            &mut steps,
+                            cur_v_end,
+                            [s_up, s3],
+                            [sx_f64 as f32, sy_f64 as f32, z_top],
+                            MoveKind::ZHopTravel,
+                            travel_speed,
+                        );
+                    } else if let Some(waypoints) = combed_pts {
+                        let mut wx_prev = px as f32;
+                        let mut wy_prev = py as f32;
+                        for (wx, wy) in waypoints {
+                            let wx_f = wx as f32;
+                            let wy_f = wy as f32;
+                            if (wx_f - wx_prev).hypot(wy_f - wy_prev) > 1e-3 {
+                                push_travel_segment(
+                                    &mut travel_lines,
+                                    &mut steps,
+                                    cur_v_end,
+                                    [[wx_prev, wy_prev, z_line], [wx_f, wy_f, z_line]],
+                                    [wx_f, wy_f, z_top],
+                                    MoveKind::CombedTravel,
+                                    travel_speed,
+                                );
+                                wx_prev = wx_f;
+                                wy_prev = wy_f;
+                            }
+                        }
+                        let sx_f = sx_f64 as f32;
+                        let sy_f = sy_f64 as f32;
+                        if (sx_f - wx_prev).hypot(sy_f - wy_prev) > 1e-3 {
+                            push_travel_segment(
+                                &mut travel_lines,
+                                &mut steps,
+                                cur_v_end,
+                                [[wx_prev, wy_prev, z_line], [sx_f, sy_f, z_line]],
+                                [sx_f, sy_f, z_top],
+                                MoveKind::CombedTravel,
+                                travel_speed,
+                            );
+                        }
+                    } else {
+                        push_travel_segment(
+                            &mut travel_lines,
+                            &mut steps,
+                            cur_v_end,
+                            [
+                                [px as f32, py as f32, z_line],
+                                [sx_f64 as f32, sy_f64 as f32, z_line],
+                            ],
+                            [sx_f64 as f32, sy_f64 as f32, z_top],
+                            MoveKind::Travel,
+                            travel_speed,
+                        );
+                    }
+                }
+            }
+
             let color =
                 path_color_with_height_range(path, mode, layer_idx, total_layers, height_range_mm);
             let seg_count = if path.closed { n } else { n - 1 };
@@ -626,16 +839,92 @@ pub fn build_toolpath_mesh(plate: &SlicedPlate, mode: ColorMode) -> ToolpathGeom
                 // Right side wall (-n)
                 push_tri(&mut vertices, br_b, ar_b, ar_t, [-nx, -ny, 0.0], color);
                 push_tri(&mut vertices, br_b, ar_t, br_t, [-nx, -ny, 0.0], color);
+
+                steps.push(LayerMoveStep {
+                    toolpath_vertex_end: vertices.len() as u32,
+                    travel_vertex_end: travel_lines.len() as u32,
+                    nozzle_pos: [bx, by, z_top],
+                    kind: MoveKind::Extrusion(path.role),
+                    speed_mm_s: path.speed_mm_s as f32,
+                    width_mm: path.segment_width_mm(i) as f32,
+                });
             }
+
+            let end_pt = if path.closed {
+                first_pt
+            } else {
+                path.points.last().copied().unwrap_or(first_pt)
+            };
+            prev_xy = Some(end_pt.to_mm());
         }
+
         let end = vertices.len() as u32;
+        let travel_end = travel_lines.len() as u32;
         layer_ranges.push(start..end);
+        travel_layer_ranges.push(travel_start..travel_end);
+        layer_steps.push(steps);
     }
 
     ToolpathGeometry {
         vertices,
         layer_ranges,
+        travel_lines,
+        travel_layer_ranges,
+        layer_steps,
     }
+}
+
+/// Build a 3D metallic nozzle head marker mesh pointing at `tip_pos`.
+pub fn build_nozzle_marker_mesh(tip_pos: [f32; 3], dark_mode: bool) -> Vec<SceneVertex> {
+    const SIDES: usize = 12;
+    let [tx, ty, base_z] = tip_pos;
+    let tz = base_z + 0.06;
+    let brass_col = if dark_mode {
+        [0.94, 0.74, 0.28, 1.0]
+    } else {
+        [0.84, 0.62, 0.18, 1.0]
+    };
+    let tip_col = [0.08, 0.84, 0.76, 1.0];
+    let collar_col = if dark_mode {
+        [0.52, 0.58, 0.68, 1.0]
+    } else {
+        [0.34, 0.39, 0.48, 1.0]
+    };
+
+    let mut out = Vec::with_capacity(SIDES * 18);
+    let tip = [tx, ty, tz];
+    let apex = [tx, ty, tz + 8.6];
+
+    let ring = |idx: usize, radius: f32, z: f32| -> ([f32; 3], [f32; 3]) {
+        let a = (idx as f32) * std::f32::consts::TAU / (SIDES as f32);
+        let (sa, ca) = a.sin_cos();
+        ([tx + ca * radius, ty + sa * radius, z], [ca, sa, 0.0])
+    };
+
+    for i in 0..SIDES {
+        let j = (i + 1) % SIDES;
+        // 1. Teal tip cone: tz -> tz + 1.5
+        let (p0, n0) = ring(i, 0.75, tz + 1.5);
+        let (p1, n1) = ring(j, 0.75, tz + 1.5);
+        let cn = [0.5 * (n0[0] + n1[0]), 0.5 * (n0[1] + n1[1]), -0.35];
+        push_tri(&mut out, tip, p1, p0, cn, tip_col);
+
+        // 2. Brass nozzle taper: tz + 1.5 (r=0.75) -> tz + 3.8 (r=2.1)
+        let (b0, _) = ring(i, 2.1, tz + 3.8);
+        let (b1, _) = ring(j, 2.1, tz + 3.8);
+        push_quad(&mut out, p0, p1, b1, b0, cn, brass_col);
+
+        // 3. Heater collar cylinder: tz + 3.8 -> tz + 7.6 (r=2.1)
+        let (u0, _) = ring(i, 2.1, tz + 7.6);
+        let (u1, _) = ring(j, 2.1, tz + 7.6);
+        let wall_n = [0.5 * (n0[0] + n1[0]), 0.5 * (n0[1] + n1[1]), 0.0];
+        push_quad(&mut out, b0, b1, u1, u0, wall_n, collar_col);
+
+        // 4. Top bevel cap: tz + 7.6 -> apex
+        push_tri(&mut out, u0, u1, apex, [0.0, 0.0, 1.0], collar_col);
+    }
+
+    out
 }
 
 fn push_tri(
@@ -764,5 +1053,40 @@ mod tests {
                 v.normal
             );
         }
+    }
+
+    #[test]
+    fn toolpath_mesh_builds_travels_combing_steps_and_nozzle_marker() {
+        let mut cfg = PrintConfig::default();
+        cfg.process.avoid_crossing_perimeters = true;
+        cfg.machine.z_hop_mm = 0.4;
+        let mesh = sample_cube();
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+
+        let geom = build_toolpath_mesh_with_config(&plate, ColorMode::Feature, Some(&cfg));
+        assert_eq!(geom.layer_ranges.len(), plate.layers.len());
+        assert_eq!(geom.travel_layer_ranges.len(), plate.layers.len());
+        assert_eq!(geom.layer_steps.len(), plate.layers.len());
+        assert!(!geom.travel_lines.is_empty());
+
+        let mut prev_v = 0u32;
+        let mut prev_t = 0u32;
+        let mut seen_combed_or_zhop = false;
+        for steps in &geom.layer_steps {
+            assert!(!steps.is_empty());
+            for step in steps {
+                assert!(step.toolpath_vertex_end >= prev_v);
+                assert!(step.travel_vertex_end >= prev_t);
+                prev_v = step.toolpath_vertex_end;
+                prev_t = step.travel_vertex_end;
+                if matches!(step.kind, MoveKind::CombedTravel | MoveKind::ZHopTravel) {
+                    seen_combed_or_zhop = true;
+                }
+            }
+        }
+        assert!(seen_combed_or_zhop);
+
+        let nozzle = build_nozzle_marker_mesh([125.0, 125.0, 10.0], true);
+        assert_eq!(nozzle.len(), 12 * 18);
     }
 }

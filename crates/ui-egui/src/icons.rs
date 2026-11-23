@@ -36,6 +36,9 @@ pub enum Icon {
     Layers,
     Ghost,
     Legend,
+    Travel,
+    Play,
+    Pause,
     #[cfg(not(target_arch = "wasm32"))]
     Import,
 }
@@ -325,6 +328,23 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.circle_filled(pt(dot, y), w * 1.1, color);
                 painter.line_segment([pt(0.36, y), pt(0.86, y)], stroke);
             }
+        }
+        Icon::Travel => {
+            painter.line_segment([pt(0.14, 0.78), pt(0.42, 0.34)], stroke);
+            painter.line_segment([pt(0.42, 0.34), pt(0.64, 0.62)], stroke);
+            painter.line_segment([pt(0.64, 0.62), pt(0.86, 0.22)], stroke);
+            painter.line_segment([pt(0.68, 0.22), pt(0.86, 0.22)], stroke);
+            painter.line_segment([pt(0.86, 0.22), pt(0.86, 0.40)], stroke);
+        }
+        Icon::Play => {
+            let tri = vec![pt(0.24, 0.16), pt(0.84, 0.50), pt(0.24, 0.84)];
+            painter.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+        }
+        Icon::Pause => {
+            let left = Rect::from_min_max(pt(0.22, 0.18), pt(0.40, 0.82));
+            let right = Rect::from_min_max(pt(0.60, 0.18), pt(0.78, 0.82));
+            painter.rect_filled(left, CornerRadius::same(1), color);
+            painter.rect_filled(right, CornerRadius::same(1), color);
         }
     }
 }

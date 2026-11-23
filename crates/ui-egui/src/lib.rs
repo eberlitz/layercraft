@@ -17,7 +17,7 @@ use layercraft_engine::{Session, execute};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
-    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh,
+    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh_with_config,
 };
 use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
@@ -46,6 +46,12 @@ pub struct LayerCraftApp {
     pub(crate) single_layer_only: bool,
     pub(crate) show_ghost_mesh: bool,
     pub(crate) show_bed_grid: bool,
+    pub(crate) show_travels: bool,
+    pub(crate) layer_move_step: usize,
+    pub(crate) playback_playing: bool,
+    pub(crate) playback_speed: f32,
+    pub(crate) playback_accum: f64,
+    pub(crate) last_playback_time_s: Option<f64>,
     pub(crate) selected_sample: SampleShape,
     pub(crate) selected_object_id: Option<u64>,
     pub(crate) selected_modifier_id: Option<u64>,
@@ -92,6 +98,12 @@ impl LayerCraftApp {
             single_layer_only: false,
             show_ghost_mesh: false,
             show_bed_grid: true,
+            show_travels: false,
+            layer_move_step: 0,
+            playback_playing: false,
+            playback_speed: 1.0,
+            playback_accum: 0.0,
+            last_playback_time_s: None,
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
             selected_object_id: None,
             selected_modifier_id: None,
@@ -163,6 +175,25 @@ impl LayerCraftApp {
         self.camera
     }
 
+    /// Total move steps available inside the active layer (`0` if unsliced or empty).
+    pub(crate) fn active_layer_step_count(&self) -> usize {
+        self.scene
+            .layer_steps
+            .get(self.max_layer)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// Select active preview layer and reset intra-layer move scrubber to 100% of that layer.
+    pub(crate) fn set_active_layer(&mut self, layer: usize) {
+        let total = self.scene.layer_ranges.len();
+        self.max_layer = if total == 0 { 0 } else { layer.min(total - 1) };
+        self.layer_move_step = self.active_layer_step_count();
+        self.playback_playing = false;
+        self.playback_accum = 0.0;
+        self.last_playback_time_s = None;
+    }
+
     /// Synchronize UI view state from an external controller (e.g. MCP `set_view` / `screenshot`).
     pub fn apply_view_sync(
         &mut self,
@@ -178,23 +209,17 @@ impl LayerCraftApp {
         if let Some(c) = camera {
             self.frame_camera(c);
         }
-        if let Some(layer) = max_layer {
-            let max_idx = self
-                .session
-                .sliced
-                .as_ref()
-                .map(|s| s.layers.len().saturating_sub(1))
-                .unwrap_or(0);
-            self.max_layer = layer.min(max_idx);
-        }
-        if let Some(single) = single_layer_only {
-            self.single_layer_only = single;
-        }
         if let Some(cm) = color_mode
             && self.color_mode != cm
         {
             self.color_mode = cm;
             self.rebuild_scene();
+        }
+        if let Some(layer) = max_layer {
+            self.set_active_layer(layer);
+        }
+        if let Some(single) = single_layer_only {
+            self.single_layer_only = single;
         }
     }
 
@@ -218,9 +243,14 @@ impl LayerCraftApp {
             self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
         }
 
+        let sliced_just_now = (command == "slice.run" || command == "plate.analyze_printability")
+            && self.session.sliced.is_some();
+
         if command == "plate.clear" {
             self.view_mode = ViewMode::Prepare;
             self.max_layer = 0;
+            self.layer_move_step = 0;
+            self.playback_playing = false;
             self.status_message = "Cleared plate via MCP.".to_owned();
         } else if command.starts_with("plate.add_") || command == "plate.auto_arrange" {
             if self.session.sliced.is_none() {
@@ -228,16 +258,13 @@ impl LayerCraftApp {
             }
             self.frame_camera(CameraPreset::Isometric);
             self.status_message = format!("Updated plate via MCP ({command}).");
-        } else if (command == "slice.run" || command == "plate.analyze_printability")
-            && self.session.sliced.is_some()
-        {
+        } else if sliced_just_now {
             let layers = self
                 .session
                 .sliced
                 .as_ref()
                 .map(|s| s.layers.len())
                 .unwrap_or(0);
-            self.max_layer = layers.saturating_sub(1);
             self.view_mode = ViewMode::Preview;
             self.status_message = format!("Sliced {layers} layers via MCP.");
         } else {
@@ -245,6 +272,10 @@ impl LayerCraftApp {
         }
 
         self.rebuild_scene();
+        if sliced_just_now {
+            let layers = self.scene.layer_ranges.len();
+            self.set_active_layer(layers.saturating_sub(1));
+        }
     }
 
     /// Load a mesh from raw STL or 3MF bytes via `layercraft-engine` commands.
@@ -594,11 +625,11 @@ impl LayerCraftApp {
             .as_ref()
             .map(|s| s.layers.len())
             .unwrap_or(0);
-        self.max_layer = layers.saturating_sub(1);
         self.view_mode = ViewMode::Preview;
         self.last_error = None;
         self.status_message = format!("Sliced {layers} layers in {elapsed_ms:.1} ms.");
         self.rebuild_scene();
+        self.set_active_layer(layers.saturating_sub(1));
     }
 
     pub(crate) fn frame_camera(&mut self, preset: CameraPreset) {
@@ -684,7 +715,9 @@ impl LayerCraftApp {
             .session
             .sliced
             .as_ref()
-            .map(|s| build_toolpath_mesh(s, self.color_mode))
+            .map(|s| {
+                build_toolpath_mesh_with_config(s, self.color_mode, Some(&self.session.config))
+            })
             .unwrap_or_default();
 
         self.scene = Arc::new(GpuSceneSnapshot::from_geometry(
@@ -696,6 +729,8 @@ impl LayerCraftApp {
             &ghost,
             &tp,
         ));
+        let max_steps = self.active_layer_step_count();
+        self.layer_move_step = self.layer_move_step.min(max_steps);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -965,27 +1000,115 @@ impl LayerCraftApp {
                     }
                 }
 
-                let (draw_mesh, draw_ghost, toolpath_range) = match self.view_mode {
-                    ViewMode::Prepare => (true, false, 0..0),
-                    ViewMode::Preview => {
-                        let n = self.scene.layer_ranges.len();
-                        if n == 0 {
-                            (true, false, 0..0)
+                if self.view_mode == ViewMode::Preview && self.playback_playing {
+                    let step_count = self.active_layer_step_count();
+                    let now = ui.input(|i| i.time);
+                    if step_count == 0 || self.layer_move_step >= step_count {
+                        self.playback_playing = false;
+                        self.last_playback_time_s = None;
+                    } else {
+                        if let Some(prev_t) = self.last_playback_time_s {
+                            let dt = (now - prev_t).clamp(0.0, 0.1);
+                            let rate = ((step_count as f64) / 6.0).clamp(12.0, 140.0)
+                                * f64::from(self.playback_speed);
+                            self.playback_accum += dt * rate;
+                            let advance = self.playback_accum.floor() as usize;
+                            if advance > 0 {
+                                self.playback_accum -= advance as f64;
+                                self.layer_move_step =
+                                    (self.layer_move_step + advance).min(step_count);
+                            }
+                        }
+                        self.last_playback_time_s = Some(now);
+                        if self.layer_move_step >= step_count {
+                            self.playback_playing = false;
+                            self.last_playback_time_s = None;
                         } else {
-                            let top = self.max_layer.min(n - 1);
-                            let start = if self.single_layer_only { top } else { 0 };
-                            let v_start = self
-                                .scene
-                                .layer_ranges
-                                .get(start)
-                                .map(|r| r.start)
-                                .unwrap_or(0);
-                            let v_end =
-                                self.scene.layer_ranges.get(top).map(|r| r.end).unwrap_or(0);
-                            (false, self.show_ghost_mesh, v_start..v_end)
+                            ui.ctx().request_repaint();
                         }
                     }
-                };
+                }
+
+                let (draw_mesh, draw_ghost, toolpath_range, travel_range, nozzle_pos) =
+                    match self.view_mode {
+                        ViewMode::Prepare => (true, false, 0..0, 0..0, None),
+                        ViewMode::Preview => {
+                            let n = self.scene.layer_ranges.len();
+                            if n == 0 {
+                                (true, false, 0..0, 0..0, None)
+                            } else {
+                                let top = self.max_layer.min(n - 1);
+                                let start_layer = if self.single_layer_only { top } else { 0 };
+                                let v_start = self
+                                    .scene
+                                    .layer_ranges
+                                    .get(start_layer)
+                                    .map(|r| r.start)
+                                    .unwrap_or(0);
+                                let top_layer_v_start = self
+                                    .scene
+                                    .layer_ranges
+                                    .get(top)
+                                    .map(|r| r.start)
+                                    .unwrap_or(0);
+                                let steps = self
+                                    .scene
+                                    .layer_steps
+                                    .get(top)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                let step_count = steps.len();
+                                let cur_step = self.layer_move_step.min(step_count);
+
+                                let v_end = if step_count == 0 {
+                                    self.scene.layer_ranges.get(top).map(|r| r.end).unwrap_or(0)
+                                } else if cur_step == 0 {
+                                    top_layer_v_start
+                                } else {
+                                    steps
+                                        .get(cur_step - 1)
+                                        .map(|s| s.toolpath_vertex_end)
+                                        .unwrap_or(top_layer_v_start)
+                                };
+
+                                let t_range = if self.show_travels && step_count > 0 {
+                                    let t_start = self
+                                        .scene
+                                        .travel_layer_ranges
+                                        .get(top)
+                                        .map(|r| r.start)
+                                        .unwrap_or(0);
+                                    let t_end = if cur_step == 0 {
+                                        t_start
+                                    } else {
+                                        steps
+                                            .get(cur_step - 1)
+                                            .map(|s| s.travel_vertex_end)
+                                            .unwrap_or(t_start)
+                                    };
+                                    t_start..t_end
+                                } else {
+                                    0..0
+                                };
+
+                                let show_nozzle = step_count > 0
+                                    && (cur_step < step_count
+                                        || self.playback_playing
+                                        || self.show_travels);
+                                let n_pos = if show_nozzle {
+                                    if cur_step == 0 {
+                                        steps.first().map(|s| s.nozzle_pos)
+                                    } else {
+                                        steps.get(cur_step - 1).map(|s| s.nozzle_pos)
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                (false, self.show_ghost_mesh, v_start..v_end, t_range, n_pos)
+                            }
+                        }
+                    };
 
                 let ppp = ui.ctx().pixels_per_point();
                 let viewport_size_px = [
@@ -1003,6 +1126,8 @@ impl LayerCraftApp {
                         draw_mesh,
                         draw_ghost,
                         toolpath_range,
+                        travel_range,
+                        nozzle_pos,
                     },
                 );
                 ui.painter().add(cb);
@@ -1034,8 +1159,54 @@ impl LayerCraftApp {
 
         self.handle_dropped_files(ui.ctx());
 
-        if !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::F)) {
-            self.frame_camera(CameraPreset::Isometric);
+        if !ui.ctx().egui_wants_keyboard_input() {
+            if ui.input(|i| i.key_pressed(egui::Key::F)) {
+                self.frame_camera(CameraPreset::Isometric);
+            }
+            if self.view_mode == ViewMode::Preview && !self.scene.layer_ranges.is_empty() {
+                if ui.input(|i| i.key_pressed(egui::Key::T)) {
+                    self.show_travels = !self.show_travels;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                    let max_steps = self.active_layer_step_count();
+                    if max_steps > 0 {
+                        if self.playback_playing {
+                            self.playback_playing = false;
+                            self.last_playback_time_s = None;
+                        } else {
+                            if self.layer_move_step >= max_steps {
+                                self.layer_move_step = 0;
+                            }
+                            self.playback_playing = true;
+                            self.playback_accum = 0.0;
+                            self.last_playback_time_s = None;
+                        }
+                    }
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && self.layer_move_step > 0 {
+                    self.layer_move_step -= 1;
+                    self.playback_playing = false;
+                    self.last_playback_time_s = None;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    let max_steps = self.active_layer_step_count();
+                    if self.layer_move_step < max_steps {
+                        self.layer_move_step += 1;
+                    }
+                    self.playback_playing = false;
+                    self.last_playback_time_s = None;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                    && self.max_layer + 1 < self.scene.layer_ranges.len()
+                {
+                    let next = self.max_layer + 1;
+                    self.set_active_layer(next);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && self.max_layer > 0 {
+                    let prev = self.max_layer - 1;
+                    self.set_active_layer(prev);
+                }
+            }
         }
 
         toolbar::draw_header_bar(self, ui, &palette);
@@ -1120,5 +1291,26 @@ mod tests {
         assert!(app.session.sliced.is_some());
         assert!(app.session.last_gcode.is_some());
         assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn layer_scrubber_travel_preview_and_playback_work_cleanly() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        app.run_slice();
+        let total_layers = app.scene.layer_ranges.len();
+        assert!(total_layers >= 10);
+        let top_steps = app.active_layer_step_count();
+        assert!(top_steps > 5);
+        assert_eq!(app.layer_move_step, top_steps);
+
+        app.show_travels = true;
+        app.layer_move_step = top_steps / 2;
+        assert_eq!(app.layer_move_step, top_steps / 2);
+
+        // Switching layers resets move step to 100% of the newly selected layer.
+        app.set_active_layer(3);
+        assert_eq!(app.max_layer, 3);
+        assert_eq!(app.layer_move_step, app.active_layer_step_count());
+        assert!(!app.playback_playing);
     }
 }

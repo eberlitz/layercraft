@@ -5,7 +5,7 @@ use egui::{
     Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use layercraft_slice::ExtrusionRole;
-use layercraft_viewport::{CameraPreset, ColorMode, role_color};
+use layercraft_viewport::{CameraPreset, ColorMode, MoveKind, role_color};
 
 use crate::icons::Icon;
 use crate::theme::ThemePalette;
@@ -33,6 +33,7 @@ pub fn draw_viewport_hud(
             draw_preview_summary_hud(app, ctx, viewport_rect, p);
         }
         draw_vertical_layer_scrubber(app, ctx, viewport_rect, p);
+        draw_horizontal_move_scrubber(app, ctx, viewport_rect, p);
     }
 
     if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -326,6 +327,36 @@ fn draw_preview_summary_hud(
                         }
                     }
                 }
+
+                if app.show_travels {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("TRAVEL MOVES")
+                            .size(10.0)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(2.0);
+                    for kind in [
+                        MoveKind::Travel,
+                        MoveKind::CombedTravel,
+                        MoveKind::ZHopTravel,
+                    ] {
+                        let c = kind.color();
+                        let col = Color32::from_rgb(
+                            (c[0] * 255.0) as u8,
+                            (c[1] * 255.0) as u8,
+                            (c[2] * 255.0) as u8,
+                        );
+                        ui.horizontal(|ui| {
+                            let (sw, _) = ui.allocate_exact_size(vec2(10.0, 3.0), Sense::hover());
+                            ui.painter().rect_filled(sw, CornerRadius::same(1), col);
+                            ui.label(RichText::new(kind.label()).size(11.0).color(p.text_primary));
+                        });
+                    }
+                }
             });
         });
 }
@@ -385,10 +416,12 @@ fn draw_vertical_layer_scrubber(
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
-    let Some(sliced) = &app.session.sliced else {
-        return;
-    };
-    let total = sliced.layers.len();
+    let total = app
+        .session
+        .sliced
+        .as_ref()
+        .map(|s| s.layers.len())
+        .unwrap_or(0);
     if total == 0 {
         return;
     }
@@ -413,10 +446,11 @@ fn draw_vertical_layer_scrubber(
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        if scrubber_step_button(ui, p, "+", "Next layer").clicked()
+                        if scrubber_step_button(ui, p, "+", "Next layer (Up Arrow)").clicked()
                             && app.max_layer + 1 < total
                         {
-                            app.max_layer += 1;
+                            let next = app.max_layer + 1;
+                            app.set_active_layer(next);
                         }
 
                         let (track_rect, track_resp) =
@@ -425,9 +459,11 @@ fn draw_vertical_layer_scrubber(
                         if track_resp.hovered() {
                             let wheel = ui.input(|i| i.smooth_scroll_delta.y);
                             if wheel > 4.0 && app.max_layer + 1 < total {
-                                app.max_layer += 1;
+                                let next = app.max_layer + 1;
+                                app.set_active_layer(next);
                             } else if wheel < -4.0 && app.max_layer > 0 {
-                                app.max_layer -= 1;
+                                let prev = app.max_layer - 1;
+                                app.set_active_layer(prev);
                             }
                         }
 
@@ -437,7 +473,10 @@ fn draw_vertical_layer_scrubber(
                             let frac = ((track_rect.bottom() - ptr.y) / track_rect.height())
                                 .clamp(0.0, 1.0);
                             let idx = (frac * (total.saturating_sub(1) as f32)).round() as usize;
-                            app.max_layer = idx.min(total - 1);
+                            let clamped = idx.min(total - 1);
+                            if clamped != app.max_layer {
+                                app.set_active_layer(clamped);
+                            }
                         }
 
                         let frac = if total <= 1 {
@@ -464,17 +503,20 @@ fn draw_vertical_layer_scrubber(
                         ui.painter()
                             .circle(knob, 7.0, p.text_primary, Stroke::new(2.0, p.accent));
 
-                        if scrubber_step_button(ui, p, "–", "Previous layer").clicked()
+                        if scrubber_step_button(ui, p, "–", "Previous layer (Down Arrow)").clicked()
                             && app.max_layer > 0
                         {
-                            app.max_layer -= 1;
+                            let prev = app.max_layer - 1;
+                            app.set_active_layer(prev);
                         }
                     });
                 });
         })
         .response;
 
-    if let Some(layer) = sliced.layers.get(app.max_layer) {
+    if let Some(sliced) = &app.session.sliced
+        && let Some(layer) = sliced.layers.get(app.max_layer)
+    {
         let scrubber_rect = area_resp.rect;
         let frac = if total <= 1 {
             1.0
@@ -524,6 +566,207 @@ fn draw_vertical_layer_scrubber(
     }
 }
 
+fn draw_horizontal_move_scrubber(
+    app: &mut LayerCraftApp,
+    ctx: &Context,
+    viewport_rect: Rect,
+    p: &ThemePalette,
+) {
+    let total_layers = app.scene.layer_ranges.len();
+    if total_layers == 0 {
+        return;
+    }
+    let layer_idx = app.max_layer.min(total_layers - 1);
+    let step_count = app
+        .scene
+        .layer_steps
+        .get(layer_idx)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if step_count == 0 {
+        return;
+    }
+    let cur_step = app.layer_move_step.min(step_count);
+    let active_step_info = if cur_step == 0 {
+        app.scene
+            .layer_steps
+            .get(layer_idx)
+            .and_then(|s| s.first())
+            .copied()
+    } else {
+        app.scene
+            .layer_steps
+            .get(layer_idx)
+            .and_then(|s| s.get(cur_step - 1))
+            .copied()
+    };
+
+    let track_w = (viewport_rect.width() * 0.34).clamp(130.0, 320.0);
+    Area::new(Id::unique("layercraft_hud_move_scrubber"))
+        .order(Order::Foreground)
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(
+            viewport_rect.center().x,
+            viewport_rect.bottom() - 54.0,
+        ))
+        .constrain_to(viewport_rect)
+        .show(ctx, |ui| {
+            hud_frame(p)
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let play_icon = if app.playback_playing {
+                            Icon::Pause
+                        } else {
+                            Icon::Play
+                        };
+                        let play_tip = if app.playback_playing {
+                            "Pause toolpath playback (Space)"
+                        } else {
+                            "Play layer toolpath moves (Space)"
+                        };
+                        if icon_button(ui, p, play_icon, play_tip, app.playback_playing).clicked() {
+                            if app.playback_playing {
+                                app.playback_playing = false;
+                                app.last_playback_time_s = None;
+                            } else {
+                                if app.layer_move_step >= step_count {
+                                    app.layer_move_step = 0;
+                                }
+                                app.playback_playing = true;
+                                app.playback_accum = 0.0;
+                                app.last_playback_time_s = None;
+                            }
+                        }
+
+                        let speed_label = format!("{}×", app.playback_speed as u32);
+                        let (sp_rect, sp_resp) =
+                            ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
+                        if ui.is_rect_visible(sp_rect) {
+                            let bg = if sp_resp.hovered() {
+                                p.bg_hover
+                            } else {
+                                p.bg_card
+                            };
+                            ui.painter().rect(
+                                sp_rect,
+                                CornerRadius::same(4),
+                                bg,
+                                Stroke::new(1.0, p.border_subtle),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                sp_rect.center(),
+                                Align2::CENTER_CENTER,
+                                &speed_label,
+                                egui::FontId::proportional(10.5),
+                                p.text_secondary,
+                            );
+                        }
+                        if sp_resp
+                            .on_hover_text("Cycle playback speed (1× / 2× / 5× / 10×)")
+                            .clicked()
+                        {
+                            app.playback_speed = if app.playback_speed < 1.5 {
+                                2.0
+                            } else if app.playback_speed < 3.5 {
+                                5.0
+                            } else if app.playback_speed < 8.0 {
+                                10.0
+                            } else {
+                                1.0
+                            };
+                        }
+
+                        if scrubber_step_button(ui, p, "<", "Previous move (Left Arrow)").clicked()
+                        {
+                            app.playback_playing = false;
+                            app.last_playback_time_s = None;
+                            if app.layer_move_step > 0 {
+                                app.layer_move_step -= 1;
+                            }
+                        }
+
+                        let (track_rect, track_resp) =
+                            ui.allocate_exact_size(vec2(track_w, 20.0), Sense::click_and_drag());
+
+                        if track_resp.hovered() {
+                            let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                            if wheel > 4.0 && app.layer_move_step < step_count {
+                                app.layer_move_step += 1;
+                            } else if wheel < -4.0 && app.layer_move_step > 0 {
+                                app.layer_move_step -= 1;
+                            }
+                        }
+
+                        if (track_resp.clicked() || track_resp.dragged())
+                            && let Some(ptr) = track_resp.interact_pointer_pos()
+                        {
+                            app.playback_playing = false;
+                            app.last_playback_time_s = None;
+                            let frac =
+                                ((ptr.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
+                            let next = (frac * (step_count as f32)).round() as usize;
+                            app.layer_move_step = next.min(step_count);
+                        }
+
+                        let frac = if step_count == 0 {
+                            1.0
+                        } else {
+                            (cur_step as f32) / (step_count as f32)
+                        };
+                        let rail = Rect::from_center_size(
+                            track_rect.center(),
+                            vec2(track_rect.width(), 5.0),
+                        );
+                        ui.painter()
+                            .rect_filled(rail, CornerRadius::same(3), p.bg_input);
+
+                        let thumb_x = track_rect.left() + frac * track_rect.width();
+                        let active_rail = Rect::from_min_max(
+                            pos2(rail.left(), rail.top()),
+                            pos2(thumb_x, rail.bottom()),
+                        );
+                        ui.painter()
+                            .rect_filled(active_rail, CornerRadius::same(3), p.accent);
+
+                        let knob = pos2(thumb_x, track_rect.center().y);
+                        ui.painter()
+                            .circle(knob, 6.5, p.text_primary, Stroke::new(2.0, p.accent));
+
+                        if scrubber_step_button(ui, p, ">", "Next move (Right Arrow)").clicked() {
+                            app.playback_playing = false;
+                            app.last_playback_time_s = None;
+                            if app.layer_move_step < step_count {
+                                app.layer_move_step += 1;
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        if let Some(step) = active_step_info {
+                            let c = step.kind.color();
+                            let dot_col = Color32::from_rgb(
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                            );
+                            let (dot_r, _) =
+                                ui.allocate_exact_size(vec2(8.0, 12.0), Sense::hover());
+                            ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
+
+                            let desc = if cur_step == 0 {
+                                format!("0/{step_count} · Start")
+                            } else {
+                                format!("{cur_step}/{step_count} · {}", step.kind.label())
+                            };
+                            ui.label(RichText::new(desc).size(11.0).color(p.text_primary));
+                        }
+                    });
+                });
+        });
+}
+
 fn draw_bottom_view_pill(
     app: &mut LayerCraftApp,
     ctx: &Context,
@@ -571,6 +814,11 @@ fn draw_bottom_view_pill(
                                 .clicked()
                             {
                                 app.single_layer_only = !app.single_layer_only;
+                            }
+                            if ribbon_button(ui, p, Icon::Travel, "Travels", app.show_travels)
+                                .clicked()
+                            {
+                                app.show_travels = !app.show_travels;
                             }
                             if ribbon_button(ui, p, Icon::Ghost, "Ghost", app.show_ghost_mesh)
                                 .clicked()

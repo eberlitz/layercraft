@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 glam.workspace = true
 layercraft-config.workspace = true
+layercraft-gcode.workspace = true
 layercraft-geom.workspace = true
 layercraft-slice.workspace = true
 png.workspace = true

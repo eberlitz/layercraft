@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use glam::Mat4;
-use layercraft_viewport::{LineVertex, SceneVertex, ToolpathGeometry};
+use layercraft_viewport::{
+    LayerMoveStep, LineVertex, SceneVertex, ToolpathGeometry, build_nozzle_marker_mesh,
+};
 use wgpu::util::DeviceExt as _;
 
 const MSAA_SAMPLES: u32 = 4;
@@ -20,6 +22,9 @@ pub struct GpuSceneSnapshot {
     pub ghost_verts: Vec<[f32; 10]>,
     pub toolpath_verts: Vec<[f32; 10]>,
     pub layer_ranges: Vec<Range<u32>>,
+    pub travel_lines: Vec<[f32; 7]>,
+    pub travel_layer_ranges: Vec<Range<u32>>,
+    pub layer_steps: Vec<Vec<LayerMoveStep>>,
 }
 
 impl GpuSceneSnapshot {
@@ -55,6 +60,14 @@ impl GpuSceneSnapshot {
                 .map(SceneVertex::to_packed)
                 .collect(),
             layer_ranges: toolpaths.layer_ranges.clone(),
+            travel_lines: toolpaths
+                .travel_lines
+                .iter()
+                .copied()
+                .map(LineVertex::to_packed)
+                .collect(),
+            travel_layer_ranges: toolpaths.travel_layer_ranges.clone(),
+            layer_steps: toolpaths.layer_steps.clone(),
         }
     }
 }
@@ -69,6 +82,8 @@ pub struct ViewportCallback {
     pub draw_mesh: bool,
     pub draw_ghost: bool,
     pub toolpath_range: Range<u32>,
+    pub travel_range: Range<u32>,
+    pub nozzle_pos: Option<[f32; 3]>,
 }
 
 struct OffscreenTarget {
@@ -91,6 +106,7 @@ struct UploadedBuffers {
     modifier_buf: Option<(wgpu::Buffer, u32)>,
     ghost_buf: Option<(wgpu::Buffer, u32)>,
     toolpath_buf: Option<(wgpu::Buffer, u32)>,
+    travel_buf: Option<(wgpu::Buffer, u32)>,
 }
 
 /// Persistent GPU pipelines and cached scene vertex buffers stored in `egui_wgpu` resources.
@@ -537,6 +553,7 @@ impl ViewportGpuRenderer {
         let modifier_buf = upload_slice(device, "layercraft_modifier_verts", &scene.modifier_verts);
         let ghost_buf = upload_slice(device, "layercraft_ghost_verts", &scene.ghost_verts);
         let toolpath_buf = upload_slice(device, "layercraft_toolpath_verts", &scene.toolpath_verts);
+        let travel_buf = upload_slice(device, "layercraft_travel_lines", &scene.travel_lines);
         self.uploaded = Some(UploadedBuffers {
             revision: scene.revision,
             bed_plate_buf,
@@ -545,6 +562,7 @@ impl ViewportGpuRenderer {
             modifier_buf,
             ghost_buf,
             toolpath_buf,
+            travel_buf,
         });
     }
 }
@@ -592,6 +610,13 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let Some(uploaded) = &renderer.uploaded else {
             return Vec::new();
         };
+        let nozzle_buf = self.nozzle_pos.and_then(|tip| {
+            let verts: Vec<[f32; 10]> = build_nozzle_marker_mesh(tip, self.dark_mode)
+                .into_iter()
+                .map(SceneVertex::to_packed)
+                .collect();
+            upload_slice(device, "layercraft_nozzle_marker", &verts)
+        });
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("layercraft_offscreen_3d"),
@@ -659,6 +684,26 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(start..end, 0..1);
             }
+        }
+
+        if !self.travel_range.is_empty()
+            && let Some((buf, count)) = &uploaded.travel_buf
+        {
+            let start = self.travel_range.start.min(*count);
+            let end = self.travel_range.end.min(*count);
+            if end > start {
+                pass.set_pipeline(&renderer.line_pipeline);
+                pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(start..end, 0..1);
+            }
+        }
+
+        if let Some((buf, count)) = &nozzle_buf {
+            pass.set_pipeline(&renderer.lit_pipeline);
+            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..*count, 0..1);
         }
 
         // 5. Translucent modifiers & ghost mesh (depth-tested, no depth write)
