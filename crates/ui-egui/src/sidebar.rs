@@ -3,7 +3,8 @@
 use egui::{Align, CornerRadius, Margin, RichText, Stroke, StrokeKind, pos2, vec2};
 use layercraft_config::{
     GcodeFlavor, HeightRangeModifier, InfillPattern, IroningType, ModifierOverrides, ModifierRole,
-    ProfileKind, SeamPosition, SupportStyle, WallGenerator,
+    ProfileKind, SeamPosition, SupportStyle, SurfacePattern, ThumbnailSize, WallGenerator,
+    WallOrder,
 };
 use layercraft_mesh::{ModifierPrimitive, ModifierTransform, inspect_mesh};
 
@@ -848,7 +849,47 @@ fn draw_quality_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
     });
 
     ui.add_space(6.0);
+    card(ui, p, Some("Dimensional Accuracy"), |ui| {
+        setting_row(ui, p, "Elephant foot comp", |ui| {
+            unit_drag(
+                ui,
+                &mut proc_cfg.elephant_foot_compensation_mm,
+                0.0..=2.0,
+                0.02,
+                "mm",
+            );
+        });
+        setting_row(ui, p, "XY contour comp", |ui| {
+            unit_drag(
+                ui,
+                &mut proc_cfg.xy_contour_compensation_mm,
+                -2.0..=2.0,
+                0.02,
+                "mm",
+            );
+        });
+        setting_row(ui, p, "XY hole comp", |ui| {
+            unit_drag(
+                ui,
+                &mut proc_cfg.xy_hole_compensation_mm,
+                -2.0..=2.0,
+                0.02,
+                "mm",
+            );
+        });
+    });
+
+    ui.add_space(6.0);
     card(ui, p, Some("Perimeter Walls & Seam"), |ui| {
+        setting_row(ui, p, "Wall order", |ui| {
+            egui::ComboBox::from_id_salt("wall_order")
+                .selected_text(proc_cfg.wall_order.label())
+                .show_ui(ui, |ui| {
+                    for wo in WallOrder::ALL {
+                        ui.selectable_value(&mut proc_cfg.wall_order, wo, wo.label());
+                    }
+                });
+        });
         setting_row(ui, p, "Wall generator", |ui| {
             egui::ComboBox::from_id_salt("wall_gen")
                 .selected_text(proc_cfg.wall_generator.label())
@@ -938,6 +979,42 @@ fn draw_strength_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalett
         });
         setting_row(ui, p, "Monotonic top/bottom", |ui| {
             toggle_switch(ui, p, &mut proc_cfg.monotonic_solid_infill);
+        });
+        setting_row(ui, p, "Top surface pattern", |ui| {
+            egui::ComboBox::from_id_salt("top_surface_pat")
+                .selected_text(proc_cfg.top_surface_pattern.label())
+                .show_ui(ui, |ui| {
+                    for pat in SurfacePattern::ALL {
+                        if ui
+                            .selectable_value(&mut proc_cfg.top_surface_pattern, pat, pat.label())
+                            .changed()
+                        {
+                            proc_cfg.monotonic_solid_infill = proc_cfg.top_surface_pattern
+                                == SurfacePattern::Monotonic
+                                || proc_cfg.bottom_surface_pattern == SurfacePattern::Monotonic;
+                        }
+                    }
+                });
+        });
+        setting_row(ui, p, "Bottom surface pattern", |ui| {
+            egui::ComboBox::from_id_salt("bot_surface_pat")
+                .selected_text(proc_cfg.bottom_surface_pattern.label())
+                .show_ui(ui, |ui| {
+                    for pat in SurfacePattern::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut proc_cfg.bottom_surface_pattern,
+                                pat,
+                                pat.label(),
+                            )
+                            .changed()
+                        {
+                            proc_cfg.monotonic_solid_infill = proc_cfg.top_surface_pattern
+                                == SurfacePattern::Monotonic
+                                || proc_cfg.bottom_surface_pattern == SurfacePattern::Monotonic;
+                        }
+                    }
+                });
         });
     });
 
@@ -1310,6 +1387,19 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         setting_row(ui, p, "Emit M73 progress", |ui| {
             toggle_switch(ui, p, &mut m.emit_progress_m73);
         });
+        let mut thumb_enabled = !m.thumbnails.is_empty();
+        setting_row(ui, p, "Embed PNG thumbnail", |ui| {
+            if toggle_switch(ui, p, &mut thumb_enabled).changed() {
+                if thumb_enabled {
+                    m.thumbnails = vec![ThumbnailSize {
+                        width: 160,
+                        height: 120,
+                    }];
+                } else {
+                    m.thumbnails.clear();
+                }
+            }
+        });
     });
 
     if bed_changed {
@@ -1340,19 +1430,37 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
     });
 
     ui.add_space(6.0);
-    card(ui, p, Some("Retraction & Wipe"), |ui| {
-        let m = &mut app.session.config.machine;
+    card(ui, p, Some("Travel, Retraction & Combing"), |ui| {
+        let cfg = &mut app.session.config;
         setting_row(ui, p, "Retract length", |ui| {
-            unit_drag(ui, &mut m.retraction_length_mm, 0.0..=15.0, 0.05, "mm");
+            unit_drag(
+                ui,
+                &mut cfg.machine.retraction_length_mm,
+                0.0..=15.0,
+                0.05,
+                "mm",
+            );
         });
         setting_row(ui, p, "Z-hop", |ui| {
-            unit_drag(ui, &mut m.z_hop_mm, 0.0..=5.0, 0.05, "mm");
+            unit_drag(ui, &mut cfg.machine.z_hop_mm, 0.0..=5.0, 0.05, "mm");
         });
         setting_row(ui, p, "Wipe on retract", |ui| {
-            toggle_switch(ui, p, &mut m.wipe_on_retract);
+            toggle_switch(ui, p, &mut cfg.machine.wipe_on_retract);
         });
         setting_row(ui, p, "Wipe distance", |ui| {
-            unit_drag(ui, &mut m.wipe_distance_mm, 0.0..=10.0, 0.1, "mm");
+            unit_drag(ui, &mut cfg.machine.wipe_distance_mm, 0.0..=10.0, 0.1, "mm");
+        });
+        setting_row(ui, p, "Avoid crossing walls", |ui| {
+            toggle_switch(ui, p, &mut cfg.process.avoid_crossing_perimeters);
+        });
+        setting_row(ui, p, "Max detour (0=∞)", |ui| {
+            unit_drag(
+                ui,
+                &mut cfg.process.avoid_crossing_perimeters_max_detour_mm,
+                0.0..=500.0,
+                1.0,
+                "mm",
+            );
         });
     });
 

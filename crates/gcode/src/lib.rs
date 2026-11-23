@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
 use std::fmt::Write as _;
 
+use base64::Engine as _;
+use combing::CombingLayer;
 use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition};
 use layercraft_geom::Point2;
 pub use layercraft_slice::bead_area_mm2;
@@ -12,9 +14,12 @@ use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use thumbnail::{format_thumbnail_block, render_gcode_thumbnail_png};
 
 pub mod arc;
+pub mod combing;
 pub mod template;
+pub mod thumbnail;
 pub use arc::MotionCmd;
 pub use template::{TemplateVars, expand_gcode_template};
 
@@ -248,6 +253,11 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     )
     .map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "; max_z_height: {max_z:.3}").map_err(|_| GcodeError::FormatError)?;
+    for thumb in &config.machine.thumbnails {
+        let png_bytes = render_gcode_thumbnail_png(plate, config, thumb.width, thumb.height)?;
+        let block = format_thumbnail_block(thumb.width, thumb.height, &png_bytes)?;
+        out.push_str(&block);
+    }
 
     writeln!(out, ";TYPE:Custom").map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "G21 ; millimeters").map_err(|_| GcodeError::FormatError)?;
@@ -322,6 +332,9 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     for layer in &plate.layers {
         last_path_trail.clear();
         let mut cur_layer_seams: Vec<(f64, f64)> = Vec::new();
+        let combing = config.process.avoid_crossing_perimeters.then(|| {
+            CombingLayer::from_regions(&layer.slice_regions, config.process.outer_wall_width_mm)
+        });
 
         writeln!(out, ";LAYER_CHANGE").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";Z:{:.3}", layer.z_top_mm).map_err(|_| GcodeError::FormatError)?;
@@ -517,12 +530,43 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             }
 
             if travel_dist > 1e-4 {
-                writeln!(out, "G0 X{sx:.3} Y{sy:.3} F{travel_f:.0}")
-                    .map_err(|_| GcodeError::FormatError)?;
-                total_travel_mm += travel_dist;
-                total_time_s += travel_dist / config.machine.travel_speed_mm_s;
-                cur_x = sx;
-                cur_y = sy;
+                if let Some(waypoints) = combing.as_ref().and_then(|c| {
+                    c.plan_travel(
+                        (cur_x, cur_y),
+                        (sx, sy),
+                        config.process.avoid_crossing_perimeters_max_detour_mm,
+                    )
+                }) {
+                    writeln!(out, ";COMBING_START").map_err(|_| GcodeError::FormatError)?;
+                    for (wx, wy) in waypoints {
+                        let step_d = (wx - cur_x).hypot(wy - cur_y);
+                        if step_d > 1e-4 {
+                            writeln!(out, "G0 X{wx:.3} Y{wy:.3} F{travel_f:.0}")
+                                .map_err(|_| GcodeError::FormatError)?;
+                            total_travel_mm += step_d;
+                            total_time_s += step_d / config.machine.travel_speed_mm_s;
+                            cur_x = wx;
+                            cur_y = wy;
+                        }
+                    }
+                    let rem_d = (sx - cur_x).hypot(sy - cur_y);
+                    if rem_d > 1e-4 {
+                        writeln!(out, "G0 X{sx:.3} Y{sy:.3} F{travel_f:.0}")
+                            .map_err(|_| GcodeError::FormatError)?;
+                        total_travel_mm += rem_d;
+                        total_time_s += rem_d / config.machine.travel_speed_mm_s;
+                        cur_x = sx;
+                        cur_y = sy;
+                    }
+                    writeln!(out, ";COMBING_END").map_err(|_| GcodeError::FormatError)?;
+                } else {
+                    writeln!(out, "G0 X{sx:.3} Y{sy:.3} F{travel_f:.0}")
+                        .map_err(|_| GcodeError::FormatError)?;
+                    total_travel_mm += travel_dist;
+                    total_time_s += travel_dist / config.machine.travel_speed_mm_s;
+                    cur_x = sx;
+                    cur_y = sy;
+                }
             }
 
             if z_hopped || (cur_z - layer.z_top_mm).abs() > 1e-4 {
@@ -1594,6 +1638,10 @@ pub struct GcodeReport {
     pub max_layer_height_mm: f64,
     #[serde(default = "default_layer_height_variation_ratio")]
     pub layer_height_variation_ratio: f64,
+    #[serde(default)]
+    pub combed_travel_moves_count: usize,
+    #[serde(default)]
+    pub thumbnail_count: usize,
 }
 
 fn default_wall_variation_ratio() -> f64 {
@@ -1689,6 +1737,48 @@ impl WallVariationState {
     }
 }
 
+struct PendingThumbnail {
+    width: u32,
+    height: u32,
+    declared_len: usize,
+    b64: String,
+}
+
+fn parse_thumbnail_header(rest: &str) -> Option<PendingThumbnail> {
+    let mut parts = rest.split_whitespace();
+    let dims = parts.next()?;
+    let len_str = parts.next()?;
+    let (w_str, h_str) = dims.split_once(['x', 'X'])?;
+    let width: u32 = w_str.parse().ok()?;
+    let height: u32 = h_str.parse().ok()?;
+    let declared_len: usize = len_str.parse().ok()?;
+    Some(PendingThumbnail {
+        width,
+        height,
+        declared_len,
+        b64: String::with_capacity(declared_len),
+    })
+}
+
+fn verify_pending_thumbnail(thumb: &PendingThumbnail) -> bool {
+    if thumb.b64.len() != thumb.declared_len {
+        return false;
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&thumb.b64) else {
+        return false;
+    };
+    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+        return false;
+    }
+    let Some(w_bytes) = bytes.get(16..20).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return false;
+    };
+    let Some(h_bytes) = bytes.get(20..24).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return false;
+    };
+    u32::from_be_bytes(w_bytes) == thumb.width && u32::from_be_bytes(h_bytes) == thumb.height
+}
+
 /// Evaluate physical invariants from any Marlin/Klipper G-code file (LayerCraft or external oracle).
 pub fn evaluate_gcode(
     gcode: &str,
@@ -1712,6 +1802,8 @@ pub fn evaluate_gcode(
 
     let mut current_feature = "Unknown".to_owned();
     let mut in_scarf = false;
+    let mut in_combing = false;
+    let mut pending_thumb: Option<PendingThumbnail> = None;
     let mut layer_change_count = 0usize;
     let mut retraction_debt_mm = 0.0;
     let mut max_retraction_imbalance_mm = 0.0f64;
@@ -1738,6 +1830,8 @@ pub fn evaluate_gcode(
     let mut pressure_advance_commands_count = 0usize;
     let mut arc_moves_count = 0usize;
     let mut scarf_ramp_moves_count = 0usize;
+    let mut combed_travel_moves_count = 0usize;
+    let mut thumbnail_count = 0usize;
 
     let mut min_ex_x = f64::INFINITY;
     let mut min_ex_y = f64::INFINITY;
@@ -1753,12 +1847,38 @@ pub fn evaluate_gcode(
         if trimmed.is_empty() {
             continue;
         }
+        if let Some(rest) = trimmed.strip_prefix("; thumbnail begin ") {
+            pending_thumb = parse_thumbnail_header(rest);
+            continue;
+        }
+        if trimmed == "; thumbnail end" {
+            if let Some(thumb) = pending_thumb.take()
+                && verify_pending_thumbnail(&thumb)
+            {
+                thumbnail_count += 1;
+            }
+            continue;
+        }
+        if let Some(thumb) = pending_thumb.as_mut() {
+            if let Some(chunk) = trimmed.strip_prefix(';') {
+                thumb.b64.push_str(chunk.trim());
+            }
+            continue;
+        }
         if trimmed == ";SCARF_START" {
             in_scarf = true;
             continue;
         }
         if trimmed == ";SCARF_END" {
             in_scarf = false;
+            continue;
+        }
+        if trimmed == ";COMBING_START" {
+            in_combing = true;
+            continue;
+        }
+        if trimmed == ";COMBING_END" {
+            in_combing = false;
             continue;
         }
         if trimmed == ";LAYER_CHANGE" {
@@ -2018,6 +2138,9 @@ pub fn evaluate_gcode(
                     }
                 } else if xy_dist > 1e-5 {
                     total_travel_mm += xy_dist;
+                    if in_combing && !is_custom {
+                        combed_travel_moves_count += 1;
+                    }
                 }
 
                 if next_x.is_some() || next_y.is_some() {
@@ -2266,9 +2389,175 @@ pub fn evaluate_gcode(
         min_layer_height_mm,
         max_layer_height_mm,
         layer_height_variation_ratio,
+        combed_travel_moves_count,
+        thumbnail_count,
     };
 
     Ok((report, segments))
+}
+
+fn dist_point_to_seg_2d(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 1e-12 {
+        return (p.0 - a.0).hypot(p.1 - a.1);
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+/// Return the minimum distance (mm) from any active-layer XY travel move (after first extrusion
+/// on that layer) to `(cx_mm, cy_mm)`, or `None` if no active travel moves exist.
+pub fn min_active_travel_distance_to_point(gcode: &str, cx_mm: f64, cy_mm: f64) -> Option<f64> {
+    let mut abs_xyz = true;
+    let mut abs_e = true;
+    let mut cur_x = 0.0;
+    let mut cur_y = 0.0;
+    let mut cur_e = 0.0;
+    let mut has_xy = false;
+    let mut current_feature = "Unknown".to_owned();
+    let mut in_layer_has_extruded = false;
+    let mut retraction_debt_mm = 0.0;
+    let mut min_dist: Option<f64> = None;
+
+    for raw_line in gcode.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == ";LAYER_CHANGE" {
+            in_layer_has_extruded = false;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(";TYPE:") {
+            current_feature = rest.trim().to_owned();
+            continue;
+        }
+        if trimmed.starts_with(';') {
+            continue;
+        }
+        let code_part = trimmed.split(';').next().unwrap_or("").trim();
+        if code_part.is_empty() {
+            continue;
+        }
+        let mut tokens = code_part.split_whitespace();
+        let Some(cmd) = tokens.next() else {
+            continue;
+        };
+        match cmd {
+            "G90" => abs_xyz = true,
+            "G91" => abs_xyz = false,
+            "M82" => abs_e = true,
+            "M83" => abs_e = false,
+            "G92" => {
+                for tok in tokens {
+                    if let Some(first) = tok.chars().next()
+                        && let Ok(v) = tok.get(first.len_utf8()..).unwrap_or("").parse::<f64>()
+                        && v.is_finite()
+                    {
+                        match first {
+                            'E' => cur_e = v,
+                            'X' => cur_x = v,
+                            'Y' => cur_y = v,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "G0" | "G1" | "G2" | "G3" => {
+                let mut next_x = None;
+                let mut next_y = None;
+                let mut next_e = None;
+                for tok in tokens {
+                    if let Some(first) = tok.chars().next()
+                        && let Ok(v) = tok.get(first.len_utf8()..).unwrap_or("").parse::<f64>()
+                        && v.is_finite()
+                    {
+                        match first {
+                            'X' => next_x = Some(if abs_xyz { v } else { cur_x + v }),
+                            'Y' => next_y = Some(if abs_xyz { v } else { cur_y + v }),
+                            'E' => next_e = Some(v),
+                            _ => {}
+                        }
+                    }
+                }
+                let tx = next_x.unwrap_or(cur_x);
+                let ty = next_y.unwrap_or(cur_y);
+                let de_raw = match next_e {
+                    Some(e_val) => {
+                        if abs_e {
+                            let d = e_val - cur_e;
+                            cur_e = e_val;
+                            d
+                        } else {
+                            e_val
+                        }
+                    }
+                    None => 0.0,
+                };
+                let xy_dist = if has_xy {
+                    (tx - cur_x).hypot(ty - cur_y)
+                } else {
+                    0.0
+                };
+                let is_custom = current_feature.eq_ignore_ascii_case("Custom");
+                if de_raw < -1e-7 {
+                    retraction_debt_mm += -de_raw;
+                } else if de_raw > 1e-7 {
+                    let net_de = if retraction_debt_mm > 0.0 {
+                        let pay = retraction_debt_mm.min(de_raw);
+                        retraction_debt_mm -= pay;
+                        de_raw - pay
+                    } else {
+                        de_raw
+                    };
+                    if net_de > 1e-7 && xy_dist > 1e-5 && !is_custom {
+                        in_layer_has_extruded = true;
+                    }
+                } else if (cmd == "G0" || cmd == "G1")
+                    && !is_custom
+                    && in_layer_has_extruded
+                    && xy_dist > 1e-5
+                {
+                    let d = dist_point_to_seg_2d((cx_mm, cy_mm), (cur_x, cur_y), (tx, ty));
+                    min_dist = Some(min_dist.map_or(d, |prev| prev.min(d)));
+                }
+                if next_x.is_some() || next_y.is_some() {
+                    has_xy = true;
+                }
+                cur_x = tx;
+                cur_y = ty;
+            }
+            _ => {}
+        }
+    }
+
+    min_dist
+}
+
+/// Return deduplicated consecutive `;TYPE:` wall feature labels emitted on `target_layer_idx`.
+pub fn layer_wall_feature_sequence(gcode: &str, target_layer_idx: usize) -> Vec<String> {
+    let mut cur_layer: Option<usize> = None;
+    let mut seq = Vec::new();
+    for raw_line in gcode.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed == ";LAYER_CHANGE" {
+            cur_layer = Some(cur_layer.map_or(0, |n| n + 1));
+            continue;
+        }
+        if cur_layer == Some(target_layer_idx)
+            && let Some(rest) = trimmed.strip_prefix(";TYPE:")
+        {
+            let label = rest.trim();
+            if matches!(label, "Inner wall" | "Outer wall" | "Overhang wall")
+                && seq.last().map(String::as_str) != Some(label)
+            {
+                seq.push(label.to_owned());
+            }
+        }
+    }
+    seq
 }
 
 /// Summary of 2D rasterized extrusion coverage comparison between two G-code traces.
@@ -3133,5 +3422,97 @@ mod tests {
         .unwrap();
         assert!(rep.safety.is_clean(), "{:?}", rep.safety);
         assert_eq!(rep.active_layer_count, 20);
+    }
+
+    #[test]
+    fn combing_routes_around_hollow_tube_hole_without_crossing() {
+        let tube = layercraft_testkit::make_hollow_cylinder(16.0, 8.0, 4.0, 48).unwrap();
+        let mut cfg = PrintConfig::default();
+        cfg.process.layer_height_mm = 0.25;
+        cfg.process.first_layer_height_mm = 0.25;
+        cfg.process.sparse_infill_pattern = layercraft_config::InfillPattern::Rectilinear;
+        cfg.process.avoid_crossing_perimeters = true;
+
+        let plate = layercraft_slice::slice_single_mesh(&tube, &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert!(
+            rep.combed_travel_moves_count > 0,
+            "expected combed travel moves > 0"
+        );
+        let min_d = min_active_travel_distance_to_point(&out.gcode, 125.0, 125.0);
+        if let Some(d) = min_d {
+            assert!(
+                d >= 6.5,
+                "active travel cut into hollow tube center hole: min_d={d:.2} mm"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_png_thumbnails_parse_and_validate_png_ihdr() {
+        let mesh = make_box(20.0, 20.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.machine.thumbnails = vec![
+            layercraft_config::ThumbnailSize {
+                width: 160,
+                height: 120,
+            },
+            layercraft_config::ThumbnailSize {
+                width: 220,
+                height: 124,
+            },
+        ];
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out.gcode.contains("; thumbnail begin 160x120 "));
+        assert!(out.gcode.contains("; thumbnail begin 220x124 "));
+
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert_eq!(rep.thumbnail_count, 2);
+    }
+
+    #[test]
+    fn wall_order_and_concentric_surfaces_roundtrip_through_evaluator() {
+        let mesh = make_box(22.0, 22.0, 3.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_loops = 3;
+        cfg.process.wall_order = layercraft_config::WallOrder::InnerOuterInner;
+        cfg.process.top_surface_pattern = layercraft_config::SurfacePattern::Concentric;
+        cfg.process.bottom_surface_pattern = layercraft_config::SurfacePattern::Concentric;
+        cfg.process.arc_fitting = true;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        assert_eq!(
+            layer_wall_feature_sequence(&out.gcode, 1),
+            vec![
+                "Inner wall".to_owned(),
+                "Outer wall".to_owned(),
+                "Inner wall".to_owned(),
+            ]
+        );
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
     }
 }

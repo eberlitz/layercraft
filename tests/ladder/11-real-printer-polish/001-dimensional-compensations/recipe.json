@@ -1,0 +1,18 @@
+{
+  "name": "001-dimensional-compensations",
+  "description": "Hollow tube with layer-0 elephant-foot shrink and XY contour/hole dimensional compensations",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 15.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 6.0,
+    "segments": 64
+  },
+  "config": {
+    "process": {
+      "elephant_foot_compensation_mm": 0.25,
+      "xy_contour_compensation_mm": -0.30,
+      "xy_hole_compensation_mm": 0.35
+    }
+  }
+}

@@ -95,6 +95,61 @@ impl SeamPosition {
     }
 }
 
+/// Emission sequence for perimeter wall contours on each island.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WallOrder {
+    #[default]
+    InnerOuter,
+    OuterInner,
+    InnerOuterInner,
+}
+
+impl WallOrder {
+    /// All supported perimeter wall emission orderings.
+    pub const ALL: [Self; 3] = [Self::InnerOuter, Self::OuterInner, Self::InnerOuterInner];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InnerOuter => "Inner / Outer",
+            Self::OuterInner => "Outer / Inner",
+            Self::InnerOuterInner => "Inner / Outer / Inner",
+        }
+    }
+}
+
+/// Fill pattern used for exposed top and bottom skin surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfacePattern {
+    #[default]
+    Monotonic,
+    Rectilinear,
+    Concentric,
+}
+
+impl SurfacePattern {
+    /// All supported top/bottom solid surface patterns.
+    pub const ALL: [Self; 3] = [Self::Monotonic, Self::Rectilinear, Self::Concentric];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Monotonic => "Monotonic",
+            Self::Rectilinear => "Rectilinear",
+            Self::Concentric => "Concentric",
+        }
+    }
+}
+
+/// Dimensions (in pixels) of a PNG preview thumbnail embedded into G-code headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ThumbnailSize {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Machine hardware parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -108,6 +163,7 @@ pub struct MachineConfig {
     pub bed_height_mm: f64,
     pub relative_extrusion: bool,
     pub emit_progress_m73: bool,
+    pub thumbnails: Vec<ThumbnailSize>,
     pub retraction_length_mm: f64,
     pub retraction_speed_mm_s: f64,
     pub travel_speed_mm_s: f64,
@@ -133,6 +189,7 @@ impl Default for MachineConfig {
             bed_height_mm: 250.0,
             relative_extrusion: false,
             emit_progress_m73: false,
+            thumbnails: Vec::new(),
             retraction_length_mm: 0.8,
             retraction_speed_mm_s: 35.0,
             travel_speed_mm_s: 150.0,
@@ -508,12 +565,20 @@ pub struct ProcessConfig {
     pub layer_height_mm: f64,
     pub first_layer_height_mm: f64,
     pub wall_loops: u16,
+    pub wall_order: WallOrder,
     pub wall_generator: WallGenerator,
     pub arachne: ArachneConfig,
     pub top_shell_layers: u16,
     pub bottom_shell_layers: u16,
     pub top_shell_thickness_mm: Option<f64>,
     pub bottom_shell_thickness_mm: Option<f64>,
+    pub top_surface_pattern: SurfacePattern,
+    pub bottom_surface_pattern: SurfacePattern,
+    pub elephant_foot_compensation_mm: f64,
+    pub xy_contour_compensation_mm: f64,
+    pub xy_hole_compensation_mm: f64,
+    pub avoid_crossing_perimeters: bool,
+    pub avoid_crossing_perimeters_max_detour_mm: f64,
     pub adaptive_layer_height: AdaptiveLayerConfig,
     pub height_ranges: Vec<HeightRangeModifier>,
     /// Fraction in `0.0..=1.0` (e.g. `0.20` for 20%).
@@ -729,12 +794,20 @@ impl Default for ProcessConfig {
             layer_height_mm: 0.2,
             first_layer_height_mm: 0.2,
             wall_loops: 2,
+            wall_order: WallOrder::InnerOuter,
             wall_generator: WallGenerator::Classic,
             arachne: ArachneConfig::default(),
             top_shell_layers: 3,
             bottom_shell_layers: 3,
             top_shell_thickness_mm: None,
             bottom_shell_thickness_mm: None,
+            top_surface_pattern: SurfacePattern::Monotonic,
+            bottom_surface_pattern: SurfacePattern::Monotonic,
+            elephant_foot_compensation_mm: 0.0,
+            xy_contour_compensation_mm: 0.0,
+            xy_hole_compensation_mm: 0.0,
+            avoid_crossing_perimeters: false,
+            avoid_crossing_perimeters_max_detour_mm: 0.0,
             adaptive_layer_height: AdaptiveLayerConfig::default(),
             height_ranges: Vec::new(),
             sparse_infill_density: 0.20,
@@ -791,6 +864,25 @@ impl ProcessConfig {
     pub fn effective_solid_infill_speed_mm_s(&self) -> f64 {
         self.solid_infill_speed_mm_s
             .unwrap_or(self.infill_speed_mm_s)
+    }
+
+    /// Resolved top surface fill pattern, honoring legacy `monotonic_solid_infill = false`.
+    pub fn effective_top_surface_pattern(&self) -> SurfacePattern {
+        if self.top_surface_pattern == SurfacePattern::Monotonic && !self.monotonic_solid_infill {
+            SurfacePattern::Rectilinear
+        } else {
+            self.top_surface_pattern
+        }
+    }
+
+    /// Resolved bottom surface fill pattern, honoring legacy `monotonic_solid_infill = false`.
+    pub fn effective_bottom_surface_pattern(&self) -> SurfacePattern {
+        if self.bottom_surface_pattern == SurfacePattern::Monotonic && !self.monotonic_solid_infill
+        {
+            SurfacePattern::Rectilinear
+        } else {
+            self.bottom_surface_pattern
+        }
     }
 }
 
@@ -861,6 +953,20 @@ impl PrintConfig {
             "machine.min_travel_for_retract_mm",
             self.machine.min_travel_for_retract_mm,
         )?;
+        if self.machine.thumbnails.len() > 4 {
+            return Err(ConfigError::Invalid {
+                field: "machine.thumbnails",
+                reason: "at most 4 embedded thumbnail sizes supported",
+            });
+        }
+        for thumb in &self.machine.thumbnails {
+            if !(16..=640).contains(&thumb.width) || !(16..=640).contains(&thumb.height) {
+                return Err(ConfigError::Invalid {
+                    field: "machine.thumbnails",
+                    reason: "thumbnail width and height must be within 16..=640 px",
+                });
+            }
+        }
 
         check_pos("filament.diameter_mm", self.filament.diameter_mm)?;
         check_pos("filament.density_g_cm3", self.filament.density_g_cm3)?;
@@ -1121,6 +1227,34 @@ impl PrintConfig {
             });
         }
         check_non_neg("process.brim_width_mm", self.process.brim_width_mm)?;
+        if !self.process.elephant_foot_compensation_mm.is_finite()
+            || !(0.0..=5.0).contains(&self.process.elephant_foot_compensation_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.elephant_foot_compensation_mm",
+                reason: "must be within 0.0..=5.0",
+            });
+        }
+        if !self.process.xy_contour_compensation_mm.is_finite()
+            || !(-5.0..=5.0).contains(&self.process.xy_contour_compensation_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.xy_contour_compensation_mm",
+                reason: "must be within -5.0..=5.0",
+            });
+        }
+        if !self.process.xy_hole_compensation_mm.is_finite()
+            || !(-5.0..=5.0).contains(&self.process.xy_hole_compensation_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.xy_hole_compensation_mm",
+                reason: "must be within -5.0..=5.0",
+            });
+        }
+        check_non_neg(
+            "process.avoid_crossing_perimeters_max_detour_mm",
+            self.process.avoid_crossing_perimeters_max_detour_mm,
+        )?;
 
         let ir = &self.process.ironing;
         for (field, val, min, max) in [
@@ -1639,5 +1773,74 @@ mod tests {
         bad_ov.wall_loops = Some(3);
         bad_ov.infill_speed_mm_s = Some(0.0);
         assert!(bad_ov.validate().is_err());
+
+        // Phase 5B dimensional compensations, wall order, surface pattern, combing & thumbnails
+        assert_eq!(WallOrder::InnerOuterInner.label(), "Inner / Outer / Inner");
+        assert_eq!(SurfacePattern::Concentric.label(), "Concentric");
+        let mut p5b = PrintConfig::default();
+        p5b.machine.thumbnails = vec![
+            ThumbnailSize {
+                width: 160,
+                height: 120,
+            },
+            ThumbnailSize {
+                width: 220,
+                height: 124,
+            },
+        ];
+        p5b.process.elephant_foot_compensation_mm = 0.2;
+        p5b.process.xy_contour_compensation_mm = -0.15;
+        p5b.process.xy_hole_compensation_mm = 0.1;
+        p5b.process.wall_order = WallOrder::OuterInner;
+        p5b.process.top_surface_pattern = SurfacePattern::Concentric;
+        p5b.process.bottom_surface_pattern = SurfacePattern::Rectilinear;
+        p5b.process.avoid_crossing_perimeters = true;
+        p5b.process.avoid_crossing_perimeters_max_detour_mm = 25.0;
+        assert!(p5b.validate().is_ok());
+
+        let mut legacy = PrintConfig::default();
+        legacy.process.monotonic_solid_infill = false;
+        assert_eq!(
+            legacy.process.effective_top_surface_pattern(),
+            SurfacePattern::Rectilinear
+        );
+        assert_eq!(
+            legacy.process.effective_bottom_surface_pattern(),
+            SurfacePattern::Rectilinear
+        );
+        legacy.process.top_surface_pattern = SurfacePattern::Concentric;
+        assert_eq!(
+            legacy.process.effective_top_surface_pattern(),
+            SurfacePattern::Concentric
+        );
+
+        let mut bad_p5b = PrintConfig::default();
+        bad_p5b.process.elephant_foot_compensation_mm = -0.1;
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.process.elephant_foot_compensation_mm = f64::NAN;
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.process.elephant_foot_compensation_mm = 0.0;
+        bad_p5b.process.xy_contour_compensation_mm = 6.0;
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.process.xy_contour_compensation_mm = 0.0;
+        bad_p5b.process.xy_hole_compensation_mm = -6.0;
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.process.xy_hole_compensation_mm = 0.0;
+        bad_p5b.process.avoid_crossing_perimeters_max_detour_mm = -1.0;
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.process.avoid_crossing_perimeters_max_detour_mm = 0.0;
+        bad_p5b.machine.thumbnails = vec![ThumbnailSize {
+            width: 8,
+            height: 8,
+        }];
+        assert!(bad_p5b.validate().is_err());
+        bad_p5b.machine.thumbnails = vec![
+            ThumbnailSize {
+                width: 64,
+                height: 64
+            };
+            5
+        ];
+        assert!(bad_p5b.validate().is_err());
     }
 }

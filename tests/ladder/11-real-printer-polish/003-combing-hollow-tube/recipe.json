@@ -1,0 +1,19 @@
+{
+  "name": "003-combing-hollow-tube",
+  "description": "Hollow tube with avoid_crossing_perimeters routing travel moves around the central bore",
+  "shape": {
+    "kind": "hollow_cylinder",
+    "outer_radius_mm": 16.0,
+    "inner_radius_mm": 8.0,
+    "height_mm": 6.0,
+    "segments": 64
+  },
+  "config": {
+    "process": {
+      "layer_height_mm": 0.25,
+      "first_layer_height_mm": 0.25,
+      "sparse_infill_pattern": "rectilinear",
+      "avoid_crossing_perimeters": true
+    }
+  }
+}

@@ -9,7 +9,9 @@ use layercraft_clip::{
 use layercraft_config::PrintConfig;
 use layercraft_geom::{ExPolygon, Point2, Polygon, mm_to_nm};
 
-use crate::{ExtrusionPath, ExtrusionRole, SliceError, build_perimeters_classic};
+use crate::{
+    ExtrusionPath, ExtrusionRole, SliceError, build_perimeters_classic, wall_order_indices,
+};
 
 const EDGE_SUBDIVIDE_MM: f64 = 0.40;
 const MIN_COLLAPSED_EDGE_MM: f64 = 0.02;
@@ -333,8 +335,8 @@ pub(crate) fn build_perimeters_arachne(
             }
         }
 
-        let mut region_inner_paths = Vec::new();
-        let mut region_outer_paths = Vec::new();
+        let mut paired_by_ring: Vec<Vec<ExtrusionPath>> = vec![Vec::new(); n];
+        let mut odd_by_ring: Vec<Vec<ExtrusionPath>> = vec![Vec::new(); n];
 
         // Paired loops from innermost (n - 1) outward to m = 0.
         for m in (0..n).rev() {
@@ -352,10 +354,8 @@ pub(crate) fn build_perimeters_arachne(
                 ExtrusionRole::InnerWall
             };
             let speed = if m == 0 { outer_speed } else { inner_speed };
-            let target_dst = if m == 0 {
-                &mut region_outer_paths
-            } else {
-                &mut region_inner_paths
+            let Some(target_dst) = paired_by_ring.get_mut(m) else {
+                continue;
             };
 
             let min_r = (0.45 * params.thresh(2 * m + 2)).max(0.02);
@@ -390,10 +390,7 @@ pub(crate) fn build_perimeters_arachne(
             }
         }
 
-        // Odd medial center beads: inner center beads first, outer single-pass beads after.
-        let mut odd_inner = Vec::new();
-        let mut odd_outer = Vec::new();
-
+        // Odd medial center beads indexed by wall ring `m`.
         for m in 0..n {
             let t_lo = params.thresh(2 * m + 1);
             let t_hi = params.thresh(2 * m + 2) - 1e-4;
@@ -484,10 +481,8 @@ pub(crate) fn build_perimeters_arachne(
             };
             let speed = if m == 0 { outer_speed } else { inner_speed };
             let min_piece_len = (0.5 * min_w).max(0.15);
-            let dst = if m == 0 {
-                &mut odd_outer
-            } else {
-                &mut odd_inner
+            let Some(dst) = odd_by_ring.get_mut(m) else {
+                continue;
             };
 
             for (pts, widths, closed) in stitched {
@@ -499,11 +494,15 @@ pub(crate) fn build_perimeters_arachne(
             }
         }
 
-        // Standard inside-out print order: inner walls -> odd inner center walls -> outer walls.
-        all_paths.extend(region_inner_paths);
-        all_paths.extend(odd_inner);
-        all_paths.extend(region_outer_paths);
-        all_paths.extend(odd_outer);
+        // Emit perimeter rings in configured WallOrder (paired contour + center single-pass bead).
+        for m in wall_order_indices(n, config.process.wall_order) {
+            if let Some(paired) = paired_by_ring.get_mut(m) {
+                all_paths.append(paired);
+            }
+            if let Some(odd) = odd_by_ring.get_mut(m) {
+                all_paths.append(odd);
+            }
+        }
 
         // Residual infill region excluding all thickened zero-gap walls.
         let half_infill = 0.5 * params.t_infill;

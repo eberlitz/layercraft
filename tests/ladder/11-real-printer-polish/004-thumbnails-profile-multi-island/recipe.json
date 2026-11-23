@@ -1,0 +1,38 @@
+{
+  "name": "004-thumbnails-profile-multi-island",
+  "description": "Multi-island auto-arranged plate using built-in CORE One+ HF profile + Phase 5B overlays and dual embedded PNG thumbnails",
+  "objects": [
+    {
+      "shape": {
+        "kind": "box",
+        "width_mm": 16.0,
+        "depth_mm": 16.0,
+        "height_mm": 6.0
+      }
+    },
+    {
+      "shape": {
+        "kind": "cylinder",
+        "radius_mm": 8.0,
+        "height_mm": 6.0,
+        "segments": 48
+      }
+    },
+    {
+      "shape": {
+        "kind": "box",
+        "width_mm": 14.0,
+        "depth_mm": 14.0,
+        "height_mm": 6.0
+      }
+    }
+  ],
+  "auto_arrange_spacing_mm": 8.0,
+  "profile_bundle": {
+    "use_builtins": true,
+    "dir": "profiles",
+    "machine": "CORE One+ Polish",
+    "filament": "LayerCraft PLA (0.4mm HF Nozzle)",
+    "process": "Polish Balanced 0.20"
+  }
+}

@@ -1405,9 +1405,13 @@ dependencies = [
 name = "layercraft-gcode"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "layercraft-clip",
  "layercraft-config",
  "layercraft-geom",
  "layercraft-slice",
+ "layercraft-testkit",
+ "png",
  "schemars",
  "serde",
  "thiserror 2.0.21",

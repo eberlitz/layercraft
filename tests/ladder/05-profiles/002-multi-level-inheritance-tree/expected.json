@@ -22,7 +22,7 @@
     "Fast Gyroid 0.24"
   ],
   "expected_unmapped_keys": [
-    "xy_hole_compensation"
+    "custom_unmapped_setting"
   ],
   "max_profile_warnings": 0,
   "require_gcode_contains": [

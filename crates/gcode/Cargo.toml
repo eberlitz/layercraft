@@ -9,9 +9,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
+layercraft-clip.workspace = true
 layercraft-config.workspace = true
 layercraft-geom.workspace = true
 layercraft-slice.workspace = true
+png.workspace = true
 schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+layercraft-testkit.workspace = true

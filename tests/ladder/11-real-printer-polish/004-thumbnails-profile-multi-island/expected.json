@@ -1,0 +1,21 @@
+{
+  "layer_count": 30,
+  "max_z_mm": 6.0,
+  "require_outer_wall": true,
+  "require_top_surface": true,
+  "require_bottom_surface": true,
+  "require_thumbnail_count": 2,
+  "require_gcode_contains": [
+    "; thumbnail begin 160x120",
+    "; thumbnail begin 220x124"
+  ],
+  "require_wall_order_sequence": [
+    "Outer wall",
+    "Inner wall",
+    "Outer wall",
+    "Inner wall",
+    "Outer wall",
+    "Inner wall"
+  ],
+  "max_profile_warnings": 0
+}

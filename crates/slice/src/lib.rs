@@ -12,7 +12,9 @@ use layercraft_clip::{
     ClipError, JoinType, clip_lines, clip_polylines, clip_polylines_difference, difference,
     intersection, offset, union,
 };
-use layercraft_config::{InfillPattern, IroningType, PrintConfig, SupportStyle, WallGenerator};
+use layercraft_config::{
+    InfillPattern, IroningType, PrintConfig, SupportStyle, SurfacePattern, WallGenerator, WallOrder,
+};
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
 use layercraft_mesh::{
     ExplicitHeightRange, MeshError, RawSliceLayer, VariableScheduleParams,
@@ -471,16 +473,44 @@ pub fn slice_from_raw_layers_with_modifiers(
     }
 
     let n = raw_layers.len();
-    let sliced_mods = slice_modifier_volumes(modifiers, raw_layers)?;
+    let contour_comp = config.process.xy_contour_compensation_mm;
+    let hole_comp = config.process.xy_hole_compensation_mm;
+    let elephant_comp = config.process.elephant_foot_compensation_mm;
+    let has_uniform_xy = contour_comp.abs() > 1e-6 || hole_comp.abs() > 1e-6;
+    let comp_raw_holder: Option<Vec<RawSliceLayer>> = if has_uniform_xy {
+        let mut layers_vec = Vec::with_capacity(n);
+        for raw in raw_layers {
+            layers_vec.push(RawSliceLayer {
+                plane: raw.plane,
+                regions: apply_xy_compensations(&raw.regions, contour_comp, hole_comp, 0.0)?,
+            });
+        }
+        Some(layers_vec)
+    } else {
+        None
+    };
+    let comp_layers: &[RawSliceLayer] = comp_raw_holder.as_deref().unwrap_or(raw_layers);
+    let layer0_effective: Option<Vec<ExPolygon>> = if elephant_comp.abs() > 1e-6 {
+        raw_layers
+            .first()
+            .map(|raw0| {
+                apply_xy_compensations(&raw0.regions, contour_comp, hole_comp, elephant_comp)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    let sliced_mods = slice_modifier_volumes(modifiers, comp_layers)?;
     let support_paths_per_layer = generate_support_paths(
-        raw_layers,
+        comp_layers,
         config,
         &sliced_mods.blocker_masks,
         &sliced_mods.enforcer_masks,
     )?;
 
     let mut per_layer_base_params: Vec<EffectiveLayerParams> = Vec::with_capacity(n);
-    for raw in raw_layers {
+    for raw in comp_layers {
         let mut base_p = EffectiveLayerParams::from_config(config);
         base_p.apply_height_ranges(&config.process.height_ranges, raw.plane.z_slice_mm);
         per_layer_base_params.push(base_p);
@@ -490,7 +520,14 @@ pub fn slice_from_raw_layers_with_modifiers(
     let mut per_layer_infill_areas: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
 
     // Stage 2: Perimeters & infill boundary extraction.
-    for (idx, raw) in raw_layers.iter().enumerate() {
+    for (idx, raw) in comp_layers.iter().enumerate() {
+        let effective_regions: &[ExPolygon] = if idx == 0 {
+            layer0_effective
+                .as_deref()
+                .unwrap_or(raw.regions.as_slice())
+        } else {
+            raw.regions.as_slice()
+        };
         let h = raw.plane.height_mm;
         let Some(base_p) = per_layer_base_params.get(idx) else {
             continue;
@@ -508,11 +545,12 @@ pub fn slice_from_raw_layers_with_modifiers(
                 None
             };
             let cfg_ref = layer_cfg.as_ref().unwrap_or(config);
-            let (walls, infill_area) = build_perimeters(&raw.regions, raw.plane.index, h, cfg_ref)?;
+            let (walls, infill_area) =
+                build_perimeters(effective_regions, raw.plane.index, h, cfg_ref)?;
             per_layer_walls.push(walls);
             per_layer_infill_areas.push(infill_area);
         } else {
-            let buckets = partition_regions(&raw.regions, base_p, &active_perim)?;
+            let buckets = partition_regions(effective_regions, base_p, &active_perim)?;
             let mut layer_walls = Vec::new();
             let mut combined_infill = Vec::new();
             for (sub_regs, b_params) in buckets {
@@ -536,10 +574,10 @@ pub fn slice_from_raw_layers_with_modifiers(
         };
         let below = idx
             .checked_sub(1)
-            .and_then(|j| raw_layers.get(j))
+            .and_then(|j| comp_layers.get(j))
             .map(|l| l.regions.as_slice())
             .unwrap_or(&[]);
-        let above = raw_layers
+        let above = comp_layers
             .get(idx + 1)
             .map(|l| l.regions.as_slice())
             .unwrap_or(&[]);
@@ -548,10 +586,18 @@ pub fn slice_from_raw_layers_with_modifiers(
         top_exposed.push(difference(infill_here, above)?);
     }
 
+    let mut cursor_xy = (0.0_f64, 0.0_f64);
     let mut layers = Vec::with_capacity(n);
     for idx in 0..n {
-        let Some(raw) = raw_layers.get(idx) else {
+        let Some(raw) = comp_layers.get(idx) else {
             continue;
+        };
+        let effective_regions: &[ExPolygon] = if idx == 0 {
+            layer0_effective
+                .as_deref()
+                .unwrap_or(raw.regions.as_slice())
+        } else {
+            raw.regions.as_slice()
         };
         let Some(infill_here) = per_layer_infill_areas.get(idx) else {
             continue;
@@ -566,7 +612,7 @@ pub fn slice_from_raw_layers_with_modifiers(
 
         // Optional Stage 5 adhesion on layer 0 before part walls.
         if is_first {
-            append_adhesion_paths(&raw.regions, h, config, &mut paths)?;
+            append_adhesion_paths(effective_regions, h, config, &mut paths)?;
         }
 
         // Emit support structures (base & dense interface) before part walls.
@@ -574,10 +620,10 @@ pub fn slice_from_raw_layers_with_modifiers(
             paths.extend(spaths.iter().cloned());
         }
 
-        // Emit walls (already ordered inner -> outer), splitting unsupported outer walls into overhangs.
+        // Emit walls in configured WallOrder, splitting unsupported outer walls into overhangs.
         if let Some(wpaths) = per_layer_walls.get(idx) {
             if idx > 0 && config.process.detect_overhangs {
-                let below = raw_layers
+                let below = comp_layers
                     .get(idx - 1)
                     .map(|l| l.regions.as_slice())
                     .unwrap_or(&[]);
@@ -597,7 +643,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                 let mut shell_sources: Vec<ExPolygon> = Vec::new();
                 if bottom_shells > 0 {
                     let min_j = bottom_shell_start_idx(
-                        raw_layers,
+                        comp_layers,
                         idx,
                         bottom_shells,
                         config.process.bottom_shell_thickness_mm,
@@ -610,7 +656,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                 }
                 if top_shells > 0 {
                     let max_j = top_shell_end_idx(
-                        raw_layers,
+                        comp_layers,
                         idx,
                         top_shells,
                         config.process.top_shell_thickness_mm,
@@ -659,7 +705,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                     let mut shell_sources: Vec<ExPolygon> = Vec::new();
                     if b_bottom_n > 0 {
                         let min_j = bottom_shell_start_idx(
-                            raw_layers,
+                            comp_layers,
                             idx,
                             b_bottom_n,
                             config.process.bottom_shell_thickness_mm,
@@ -672,7 +718,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                     }
                     if b_top_n > 0 {
                         let max_j = top_shell_end_idx(
-                            raw_layers,
+                            comp_layers,
                             idx,
                             b_top_n,
                             config.process.top_shell_thickness_mm,
@@ -735,7 +781,7 @@ pub fn slice_from_raw_layers_with_modifiers(
         // Detect unsupported bottom areas above layer 0 and anchor them into supporting material below.
         let mut bridge_paths = Vec::new();
         if idx > 0 && config.process.detect_bridges && !bottom_here.is_empty() {
-            let below = raw_layers
+            let below = comp_layers
                 .get(idx - 1)
                 .map(|l| l.regions.as_slice())
                 .unwrap_or(&[]);
@@ -771,37 +817,55 @@ pub fn slice_from_raw_layers_with_modifiers(
             }
         }
 
-        // Emit solid infill & bridge categories.
-        let mono = config.process.monotonic_solid_infill;
-        for (region, role, speed, monotonic) in [
+        // Emit solid infill, exposed top/bottom surfaces (concentric, monotonic, or rectilinear), & bridges.
+        let bottom_pat = config.process.effective_bottom_surface_pattern();
+        let top_pat = config.process.effective_top_surface_pattern();
+        for (region, role, speed, pat) in [
             (
                 &bottom_here,
                 ExtrusionRole::BottomSurface,
                 solid_speed,
-                mono,
+                bottom_pat,
             ),
-            (&top_here, ExtrusionRole::TopSurface, top_speed, mono),
+            (&top_here, ExtrusionRole::TopSurface, top_speed, top_pat),
             (
                 &internal_solid,
                 ExtrusionRole::InternalSolidInfill,
                 solid_speed,
-                false,
+                SurfacePattern::Rectilinear,
             ),
         ] {
             if !region.is_empty() {
-                let hatched = generate_rectilinear_hatch(
-                    region,
-                    solid_angle,
-                    solid_spacing,
-                    0.0,
-                    monotonic,
-                    role,
-                    solid_w,
-                    h,
-                    speed,
-                    1.0,
-                )?;
-                paths.extend(hatched);
+                let fill_paths = match pat {
+                    SurfacePattern::Concentric => {
+                        generate_concentric_fill(region, role, solid_w, h, speed, 1.0)?
+                    }
+                    SurfacePattern::Monotonic => generate_rectilinear_hatch(
+                        region,
+                        solid_angle,
+                        solid_spacing,
+                        0.0,
+                        true,
+                        role,
+                        solid_w,
+                        h,
+                        speed,
+                        1.0,
+                    )?,
+                    SurfacePattern::Rectilinear => generate_rectilinear_hatch(
+                        region,
+                        solid_angle,
+                        solid_spacing,
+                        0.0,
+                        false,
+                        role,
+                        solid_w,
+                        h,
+                        speed,
+                        1.0,
+                    )?,
+                };
+                paths.extend(fill_paths);
             }
         }
         paths.extend(bridge_paths);
@@ -847,12 +911,12 @@ pub fn slice_from_raw_layers_with_modifiers(
             || active_iron
                 .iter()
                 .any(|(_, ov)| ov.ironing_mode.is_some_and(|m| m != IroningType::Off));
-        if any_iron && !raw.regions.is_empty() {
-            let above = raw_layers
+        if any_iron && !effective_regions.is_empty() {
+            let above = comp_layers
                 .get(idx + 1)
                 .map(|l| l.regions.as_slice())
                 .unwrap_or(&[]);
-            let exposed_top = difference(&raw.regions, above)?;
+            let exposed_top = difference(effective_regions, above)?;
             if !exposed_top.is_empty() {
                 let iron_regions = if iron.inset_mm > 1e-4 {
                     offset(
@@ -893,13 +957,16 @@ pub fn slice_from_raw_layers_with_modifiers(
             }
         }
 
+        // Order islands & infill paths to minimize cross-island & cross-layer non-extrusion travel.
+        paths = order_layer_paths_by_island(paths, effective_regions, &mut cursor_xy);
+
         let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
 
         layers.push(SlicedLayer {
             index: raw.plane.index,
             z_top_mm: raw.plane.z_top_mm,
             height_mm: h,
-            slice_regions: raw.regions.clone(),
+            slice_regions: effective_regions.to_vec(),
             paths,
             fan_percent,
             estimated_time_s,
@@ -1887,32 +1954,402 @@ pub(crate) fn build_perimeters_classic(
         offset(&true_interior, mm_to_nm(infill_overlap)?, join)?
     };
 
-    // Emit inner walls first, then outer wall (standard inside-out ordering).
+    // Emit perimeter walls according to configured wall order.
     let mut paths = Vec::new();
-    for (role, width_mm, speed_mm_s, poly_group) in rings.into_iter().rev() {
-        for ex in poly_group {
-            push_closed_poly(
-                &ex.outer,
-                role,
-                width_mm,
-                layer_height_mm,
-                speed_mm_s,
-                &mut paths,
-            );
-            for hole in ex.holes {
+    for ring_idx in wall_order_indices(rings.len(), config.process.wall_order) {
+        if let Some((role, width_mm, speed_mm_s, poly_group)) = rings.get(ring_idx) {
+            for ex in poly_group {
                 push_closed_poly(
-                    &hole,
-                    role,
-                    width_mm,
+                    &ex.outer,
+                    *role,
+                    *width_mm,
                     layer_height_mm,
-                    speed_mm_s,
+                    *speed_mm_s,
                     &mut paths,
                 );
+                for hole in &ex.holes {
+                    push_closed_poly(
+                        hole,
+                        *role,
+                        *width_mm,
+                        layer_height_mm,
+                        *speed_mm_s,
+                        &mut paths,
+                    );
+                }
             }
         }
     }
 
     Ok((paths, infill_area))
+}
+
+pub(crate) fn wall_order_indices(ring_count: usize, order: WallOrder) -> Vec<usize> {
+    match order {
+        WallOrder::InnerOuter => (0..ring_count).rev().collect(),
+        WallOrder::OuterInner => (0..ring_count).collect(),
+        WallOrder::InnerOuterInner => {
+            if ring_count >= 2 {
+                let mut order_vec = Vec::with_capacity(ring_count);
+                order_vec.push(1);
+                order_vec.push(0);
+                order_vec.extend(2..ring_count);
+                order_vec
+            } else {
+                (0..ring_count).collect()
+            }
+        }
+    }
+}
+
+fn apply_xy_compensations(
+    regions: &[ExPolygon],
+    contour_delta_mm: f64,
+    hole_delta_mm: f64,
+    elephant_foot_mm: f64,
+) -> Result<Vec<ExPolygon>, SliceError> {
+    if regions.is_empty()
+        || (contour_delta_mm.abs() <= 1e-6
+            && hole_delta_mm.abs() <= 1e-6
+            && elephant_foot_mm.abs() <= 1e-6)
+    {
+        return Ok(regions.to_vec());
+    }
+    let join = JoinType::Miter { limit: 2.0 };
+    let outer_delta_mm = contour_delta_mm - elephant_foot_mm;
+    let hole_expand_mm = hole_delta_mm + elephant_foot_mm;
+    let mut out = Vec::with_capacity(regions.len());
+
+    for ex in regions {
+        let outer_only = vec![ExPolygon::new(ex.outer.clone(), Vec::new())];
+        let outer_comp = if outer_delta_mm.abs() <= 1e-6 {
+            outer_only
+        } else {
+            offset(&outer_only, mm_to_nm(outer_delta_mm)?, join)?
+        };
+        if outer_comp.is_empty() {
+            continue;
+        }
+        if ex.holes.is_empty() {
+            out.extend(outer_comp);
+            continue;
+        }
+        let mut hole_polys = Vec::with_capacity(ex.holes.len());
+        for hole in &ex.holes {
+            let h_ex = [ExPolygon::new(hole.clone(), Vec::new())];
+            if hole_expand_mm.abs() <= 1e-6 {
+                hole_polys.extend(h_ex);
+            } else {
+                hole_polys.extend(offset(&h_ex, mm_to_nm(hole_expand_mm)?, join)?);
+            }
+        }
+        if hole_polys.is_empty() {
+            out.extend(outer_comp);
+        } else {
+            out.extend(difference(&outer_comp, &hole_polys)?);
+        }
+    }
+
+    union_if_multi(out)
+}
+
+fn generate_concentric_fill(
+    region: &[ExPolygon],
+    role: ExtrusionRole,
+    width_mm: f64,
+    height_mm: f64,
+    speed_mm_s: f64,
+    flow_ratio: f64,
+) -> Result<Vec<ExtrusionPath>, SliceError> {
+    if region.is_empty() || width_mm <= 0.0 || height_mm <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let spacing_mm = stadium_spacing_mm(width_mm, height_mm);
+    let join = JoinType::Miter { limit: 2.0 };
+    let mut inset_mm = 0.5 * width_mm;
+    let mut current = offset(region, -mm_to_nm(inset_mm)?, join)?;
+    if current.is_empty() {
+        inset_mm = 0.25 * width_mm;
+        current = offset(region, -mm_to_nm(inset_mm)?, join)?;
+    }
+
+    let mut out = Vec::new();
+    for _ in 0..2000 {
+        if current.is_empty() {
+            break;
+        }
+        for ex in current {
+            if ex.outer.points.len() >= 3 {
+                out.push(ExtrusionPath {
+                    role,
+                    width_mm,
+                    point_widths_mm: Vec::new(),
+                    height_mm,
+                    speed_mm_s,
+                    flow_ratio,
+                    points: ex.outer.points,
+                    closed: true,
+                });
+            }
+            for hole in ex.holes {
+                if hole.points.len() >= 3 {
+                    out.push(ExtrusionPath {
+                        role,
+                        width_mm,
+                        point_widths_mm: Vec::new(),
+                        height_mm,
+                        speed_mm_s,
+                        flow_ratio,
+                        points: hole.points,
+                        closed: true,
+                    });
+                }
+            }
+        }
+        inset_mm += spacing_mm;
+        current = offset(region, -mm_to_nm(inset_mm)?, join)?;
+    }
+    Ok(out)
+}
+
+fn path_start_end_mm(path: &ExtrusionPath) -> Option<((f64, f64), (f64, f64))> {
+    let first = path.points.first()?.to_mm();
+    let last = if path.closed {
+        first
+    } else {
+        path.points.last()?.to_mm()
+    };
+    Some((first, last))
+}
+
+fn nearest_island_idx(
+    path: &ExtrusionPath,
+    regions: &[ExPolygon],
+    centers: &[(f64, f64)],
+) -> usize {
+    if regions.len() <= 1 || path.points.is_empty() {
+        return 0;
+    }
+    let mut samples = Vec::with_capacity(4);
+    if let Some(&first) = path.points.first() {
+        samples.push(first);
+    }
+    if let Some(&mid) = path.points.get(path.points.len() / 2) {
+        samples.push(mid);
+    }
+    if let (Some(&p0), Some(&p1)) = (path.points.first(), path.points.get(1)) {
+        samples.push(Point2::new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2));
+    }
+    for pt in &samples {
+        if let Some(idx) = regions.iter().position(|ex| ex.contains_point(*pt)) {
+            return idx;
+        }
+    }
+    let ref_mm = samples.first().map(|p| p.to_mm()).unwrap_or((0.0, 0.0));
+    centers
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = (a.0 - ref_mm.0).hypot(a.1 - ref_mm.1);
+            let db = (b.0 - ref_mm.0).hypot(b.1 - ref_mm.1);
+            da.total_cmp(&db)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn greedy_order_paths(mut pool: Vec<ExtrusionPath>, cursor: &mut (f64, f64)) -> Vec<ExtrusionPath> {
+    let mut out = Vec::with_capacity(pool.len());
+    while !pool.is_empty() {
+        let mut best_idx = 0usize;
+        let mut best_rev = false;
+        let mut best_dist = f64::INFINITY;
+        for (i, p) in pool.iter().enumerate() {
+            let Some((s, e)) = path_start_end_mm(p) else {
+                continue;
+            };
+            let ds = (s.0 - cursor.0).hypot(s.1 - cursor.1);
+            if ds < best_dist {
+                best_dist = ds;
+                best_idx = i;
+                best_rev = false;
+            }
+            if !p.closed {
+                let de = (e.0 - cursor.0).hypot(e.1 - cursor.1);
+                if de < best_dist {
+                    best_dist = de;
+                    best_idx = i;
+                    best_rev = true;
+                }
+            }
+        }
+        let mut chosen = pool.swap_remove(best_idx);
+        if best_rev && !chosen.closed {
+            chosen.points.reverse();
+            if !chosen.point_widths_mm.is_empty() {
+                chosen.point_widths_mm.reverse();
+            }
+        }
+        if let Some((_, end)) = path_start_end_mm(&chosen) {
+            *cursor = end;
+        }
+        out.push(chosen);
+    }
+    out
+}
+
+#[derive(Default)]
+struct IslandPathBucket {
+    walls: Vec<ExtrusionPath>,
+    surfaces: Vec<ExtrusionPath>,
+    internal_solid: Vec<ExtrusionPath>,
+    bridges: Vec<ExtrusionPath>,
+    sparse: Vec<ExtrusionPath>,
+    ironing: Vec<ExtrusionPath>,
+}
+
+impl IslandPathBucket {
+    fn first_anchor_mm(&self) -> Option<(f64, f64)> {
+        self.walls
+            .first()
+            .or_else(|| self.surfaces.first())
+            .or_else(|| self.internal_solid.first())
+            .or_else(|| self.bridges.first())
+            .or_else(|| self.sparse.first())
+            .or_else(|| self.ironing.first())
+            .and_then(|p| path_start_end_mm(p).map(|(s, _)| s))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.walls.is_empty()
+            && self.surfaces.is_empty()
+            && self.internal_solid.is_empty()
+            && self.bridges.is_empty()
+            && self.sparse.is_empty()
+            && self.ironing.is_empty()
+    }
+}
+
+fn order_layer_paths_by_island(
+    paths: Vec<ExtrusionPath>,
+    slice_regions: &[ExPolygon],
+    cursor_xy: &mut (f64, f64),
+) -> Vec<ExtrusionPath> {
+    if paths.is_empty() {
+        return paths;
+    }
+    let island_count = slice_regions.len().max(1);
+    let centers: Vec<(f64, f64)> = slice_regions
+        .iter()
+        .map(|ex| {
+            ex.aabb()
+                .map(|bb| {
+                    let (x0, y0) = bb.min.to_mm();
+                    let (x1, y1) = bb.max.to_mm();
+                    (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+                })
+                .unwrap_or((0.0, 0.0))
+        })
+        .collect();
+
+    let mut adhesion = Vec::new();
+    let mut support_base = Vec::new();
+    let mut support_iface = Vec::new();
+    let mut buckets: Vec<IslandPathBucket> = (0..island_count)
+        .map(|_| IslandPathBucket::default())
+        .collect();
+
+    for path in paths {
+        if path.points.len() < 2 {
+            continue;
+        }
+        match path.role {
+            ExtrusionRole::Skirt | ExtrusionRole::Brim => adhesion.push(path),
+            ExtrusionRole::Support => support_base.push(path),
+            ExtrusionRole::SupportInterface => support_iface.push(path),
+            _ => {
+                let idx = nearest_island_idx(&path, slice_regions, &centers);
+                if let Some(bucket) = buckets.get_mut(idx) {
+                    match path.role {
+                        ExtrusionRole::OuterWall
+                        | ExtrusionRole::InnerWall
+                        | ExtrusionRole::OverhangWall => bucket.walls.push(path),
+                        ExtrusionRole::BottomSurface | ExtrusionRole::TopSurface => {
+                            bucket.surfaces.push(path);
+                        }
+                        ExtrusionRole::InternalSolidInfill => bucket.internal_solid.push(path),
+                        ExtrusionRole::Bridge => bucket.bridges.push(path),
+                        ExtrusionRole::SparseInfill => bucket.sparse.push(path),
+                        ExtrusionRole::Ironing => bucket.ironing.push(path),
+                        ExtrusionRole::Support
+                        | ExtrusionRole::SupportInterface
+                        | ExtrusionRole::Skirt
+                        | ExtrusionRole::Brim => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for p in adhesion {
+        if let Some((_, end)) = path_start_end_mm(&p) {
+            *cursor_xy = end;
+        }
+        out.push(p);
+    }
+    if !support_base.is_empty() {
+        out.extend(greedy_order_paths(support_base, cursor_xy));
+    }
+    if !support_iface.is_empty() {
+        out.extend(greedy_order_paths(support_iface, cursor_xy));
+    }
+
+    let mut remaining: Vec<IslandPathBucket> =
+        buckets.into_iter().filter(|b| !b.is_empty()).collect();
+    while !remaining.is_empty() {
+        let mut best_i = 0usize;
+        let mut best_dist = f64::INFINITY;
+        for (i, b) in remaining.iter().enumerate() {
+            if let Some(anchor) = b.first_anchor_mm() {
+                let d = (anchor.0 - cursor_xy.0).hypot(anchor.1 - cursor_xy.1);
+                if d < best_dist {
+                    best_dist = d;
+                    best_i = i;
+                }
+            }
+        }
+        let chosen = remaining.swap_remove(best_i);
+        for p in chosen.walls {
+            if let Some((_, end)) = path_start_end_mm(&p) {
+                *cursor_xy = end;
+            }
+            out.push(p);
+        }
+        for p in chosen.surfaces {
+            if let Some((_, end)) = path_start_end_mm(&p) {
+                *cursor_xy = end;
+            }
+            out.push(p);
+        }
+        if !chosen.internal_solid.is_empty() {
+            out.extend(greedy_order_paths(chosen.internal_solid, cursor_xy));
+        }
+        if !chosen.bridges.is_empty() {
+            out.extend(greedy_order_paths(chosen.bridges, cursor_xy));
+        }
+        if !chosen.sparse.is_empty() {
+            out.extend(greedy_order_paths(chosen.sparse, cursor_xy));
+        }
+        for p in chosen.ironing {
+            if let Some((_, end)) = path_start_end_mm(&p) {
+                *cursor_xy = end;
+            }
+            out.push(p);
+        }
+    }
+
+    out
 }
 
 pub(crate) fn push_closed_poly(
@@ -3550,5 +3987,171 @@ mod tests {
 
     fn mesh_for_bad_mod() -> TriangleMesh {
         make_box_mesh(10.0, 10.0, 4.0)
+    }
+
+    #[test]
+    fn elephant_foot_and_xy_contour_hole_compensations_shift_dimensions() {
+        let tube =
+            layercraft_mesh::build_sample_shape(layercraft_mesh::SampleShape::HollowTube).unwrap();
+
+        let base = slice_single_mesh(&tube, &PrintConfig::default()).unwrap();
+        let mut comp_cfg = PrintConfig::default();
+        comp_cfg.process.elephant_foot_compensation_mm = 0.25;
+        comp_cfg.process.xy_contour_compensation_mm = -0.30;
+        comp_cfg.process.xy_hole_compensation_mm = 0.35;
+        let comp = slice_single_mesh(&tube, &comp_cfg).unwrap();
+
+        let span_of = |layer_idx: usize, plate: &SlicedPlate| -> (f64, f64) {
+            let l = &plate.layers[layer_idx];
+            let reg = &l.slice_regions[0];
+            let ob = reg.outer.aabb().unwrap();
+            let hb = reg.holes[0].aabb().unwrap();
+            let outer_w = ob.max.to_mm().0 - ob.min.to_mm().0;
+            let hole_w = hb.max.to_mm().0 - hb.min.to_mm().0;
+            (outer_w, hole_w)
+        };
+
+        let (base_l0_o, base_l0_h) = span_of(0, &base);
+        let (comp_l0_o, comp_l0_h) = span_of(0, &comp);
+        assert!(
+            comp_l0_o < base_l0_o - 0.9,
+            "layer 0 outer width should shrink by ~1.10mm: {base_l0_o} -> {comp_l0_o}"
+        );
+        assert!(
+            comp_l0_h > base_l0_h + 1.0,
+            "layer 0 hole width should grow by ~1.20mm: {base_l0_h} -> {comp_l0_h}"
+        );
+
+        let (base_l5_o, base_l5_h) = span_of(5, &base);
+        let (comp_l5_o, comp_l5_h) = span_of(5, &comp);
+        assert!(
+            (comp_l5_o - (base_l5_o - 0.60)).abs() < 0.05,
+            "layer 5 outer width expected {:.2}, got {:.2}",
+            base_l5_o - 0.60,
+            comp_l5_o
+        );
+        assert!(
+            (comp_l5_h - (base_l5_h + 0.70)).abs() < 0.05,
+            "layer 5 hole width expected {:.2}, got {:.2}",
+            base_l5_h + 0.70,
+            comp_l5_h
+        );
+    }
+
+    #[test]
+    fn wall_order_emits_inner_outer_outer_inner_and_inner_outer_inner() {
+        let box_mesh = make_box_mesh(24.0, 24.0, 2.0);
+        for wall_gen in [WallGenerator::Classic, WallGenerator::Arachne] {
+            for (order, expected) in [
+                (
+                    WallOrder::InnerOuter,
+                    vec![
+                        ExtrusionRole::InnerWall,
+                        ExtrusionRole::InnerWall,
+                        ExtrusionRole::OuterWall,
+                    ],
+                ),
+                (
+                    WallOrder::OuterInner,
+                    vec![
+                        ExtrusionRole::OuterWall,
+                        ExtrusionRole::InnerWall,
+                        ExtrusionRole::InnerWall,
+                    ],
+                ),
+                (
+                    WallOrder::InnerOuterInner,
+                    vec![
+                        ExtrusionRole::InnerWall,
+                        ExtrusionRole::OuterWall,
+                        ExtrusionRole::InnerWall,
+                    ],
+                ),
+            ] {
+                let mut cfg = PrintConfig::default();
+                cfg.process.wall_generator = wall_gen;
+                cfg.process.wall_loops = 3;
+                cfg.process.wall_order = order;
+                let plate = slice_single_mesh(&box_mesh, &cfg).unwrap();
+                let roles: Vec<ExtrusionRole> = plate.layers[1]
+                    .paths
+                    .iter()
+                    .filter(|p| {
+                        matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall)
+                    })
+                    .map(|p| p.role)
+                    .collect();
+                assert_eq!(roles, expected, "wall_gen={wall_gen:?} order={order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn concentric_top_and_bottom_surfaces_emit_closed_nested_rings() {
+        let box_mesh = make_box_mesh(20.0, 20.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.top_surface_pattern = SurfacePattern::Concentric;
+        cfg.process.bottom_surface_pattern = SurfacePattern::Concentric;
+        let plate = slice_single_mesh(&box_mesh, &cfg).unwrap();
+
+        let bot_paths: Vec<&ExtrusionPath> = plate.layers[0]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::BottomSurface)
+            .collect();
+        assert!(bot_paths.len() >= 8);
+        assert!(bot_paths.iter().all(|p| p.closed));
+
+        let top_paths: Vec<&ExtrusionPath> = plate
+            .layers
+            .last()
+            .unwrap()
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::TopSurface)
+            .collect();
+        assert!(top_paths.len() >= 8);
+        assert!(top_paths.iter().all(|p| p.closed));
+    }
+
+    #[test]
+    fn nearest_neighbor_island_ordering_groups_islands_and_reduces_travel() {
+        let raw_box = make_box_mesh(16.0, 16.0, 2.0);
+        let m1 = layercraft_mesh::prepare_transformed_object(
+            &raw_box,
+            layercraft_mesh::ObjectTransform {
+                position_xy_mm: [40.0, 125.0],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let m2 = layercraft_mesh::prepare_transformed_object(
+            &raw_box,
+            layercraft_mesh::ObjectTransform {
+                position_xy_mm: [200.0, 125.0],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cfg = PrintConfig::default();
+        let plate = slice_meshes(&[m1, m2], &cfg).unwrap();
+        let top_layer = plate.layers.last().unwrap();
+
+        // Expect island transitions (left <-> right) <= 1 because each island prints all of
+        // its walls + skin before traveling to the other island.
+        let mut sides: Vec<bool> = Vec::new();
+        for p in &top_layer.paths {
+            let x = p.points[0].to_mm().0;
+            let right = x > 125.0;
+            if sides.last().copied() != Some(right) {
+                sides.push(right);
+            }
+        }
+        assert_eq!(
+            sides.len(),
+            2,
+            "expected 2 grouped islands, got {:?}",
+            sides
+        );
     }
 }

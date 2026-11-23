@@ -1,0 +1,18 @@
+[
+  {
+    "type": "machine",
+    "name": "CORE One+ Polish",
+    "inherits": "LayerCraft CORE One+ HF 0.4mm",
+    "thumbnails": ["160x120", "220x124"]
+  },
+  {
+    "type": "process",
+    "name": "Polish Balanced 0.20",
+    "inherits": "LayerCraft 0.20mm Balanced (0.4mm HF)",
+    "elefant_foot_compensation": "0.15",
+    "wall_sequence": "outer wall/inner wall",
+    "top_surface_pattern": "concentric",
+    "bottom_surface_pattern": "concentric",
+    "avoid_crossing_wall": "1"
+  }
+]

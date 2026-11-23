@@ -6,7 +6,9 @@ use std::time::Instant;
 use layercraft_config::{
     ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileLibrary,
 };
-use layercraft_gcode::{emit_gcode, evaluate_gcode};
+use layercraft_gcode::{
+    emit_gcode, evaluate_gcode, layer_wall_feature_sequence, min_active_travel_distance_to_point,
+};
 use layercraft_mesh::{
     ModifierPrimitive, ModifierTransform, ObjectTransform, auto_arrange_footprints,
     build_modifier_primitive, prepare_modifier_mesh, prepare_transformed_object,
@@ -129,6 +131,16 @@ struct LadderExpected {
     forbid_support: bool,
     #[serde(default)]
     min_bbox_width_mm: Option<f64>,
+    #[serde(default)]
+    max_bbox_width_mm: Option<f64>,
+    #[serde(default)]
+    require_thumbnail_count: Option<usize>,
+    #[serde(default)]
+    require_combed_travels: bool,
+    #[serde(default)]
+    forbid_travel_circle_mm: Option<[f64; 3]>,
+    #[serde(default)]
+    require_wall_order_sequence: Vec<String>,
     #[serde(default)]
     min_volume_mm3: Option<f64>,
     #[serde(default)]
@@ -472,6 +484,42 @@ pub fn run(root: &Path) -> Result<(), String> {
                 if got_w < min_w {
                     errs.push(format!(
                         "extrusion bbox width {got_w:.2} mm < {min_w:.2} mm"
+                    ));
+                }
+            }
+            if let Some(max_w) = exp.max_bbox_width_mm {
+                let got_w = rep.extrusion_bbox_xy.map(|b| b[2] - b[0]).unwrap_or(0.0);
+                if got_w > max_w {
+                    errs.push(format!(
+                        "extrusion bbox width {got_w:.2} mm > max {max_w:.2} mm"
+                    ));
+                }
+            }
+            if let Some(min_thumbs) = exp.require_thumbnail_count
+                && rep.thumbnail_count < min_thumbs
+            {
+                errs.push(format!(
+                    "thumbnail count {} < required {min_thumbs}",
+                    rep.thumbnail_count
+                ));
+            }
+            if exp.require_combed_travels && rep.combed_travel_moves_count == 0 {
+                errs.push("missing combed interior travel moves".to_owned());
+            }
+            if let Some([cx, cy, radius_mm]) = exp.forbid_travel_circle_mm
+                && let Some(d) = min_active_travel_distance_to_point(&out.gcode, cx, cy)
+                && d < radius_mm
+            {
+                errs.push(format!(
+                    "active travel came within {d:.2} mm of ({cx}, {cy}) < forbidden radius {radius_mm:.2} mm"
+                ));
+            }
+            if !exp.require_wall_order_sequence.is_empty() {
+                let seq = layer_wall_feature_sequence(&out.gcode, 1);
+                if seq != exp.require_wall_order_sequence {
+                    errs.push(format!(
+                        "layer 1 wall sequence {seq:?} != {:?}",
+                        exp.require_wall_order_sequence
                     ));
                 }
             }

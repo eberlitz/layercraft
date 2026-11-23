@@ -1,0 +1,9 @@
+{
+  "layer_count": 20,
+  "max_z_mm": 4.0,
+  "require_outer_wall": true,
+  "require_top_surface": true,
+  "require_bottom_surface": true,
+  "require_arcs": true,
+  "require_wall_order_sequence": ["Inner wall", "Outer wall", "Inner wall"]
+}

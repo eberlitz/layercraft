@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     ConfigError, GcodeFlavor, InfillPattern, IroningType, PrintConfig, SeamPosition, SupportStyle,
-    WallGenerator,
+    SurfacePattern, ThumbnailSize, WallGenerator, WallOrder,
 };
 
 /// Maximum inheritance chain length allowed when resolving profiles.
@@ -805,6 +805,104 @@ fn parse_f64_val(key: &str, val: &Value) -> Result<f64, ProfileError> {
     Ok(parsed)
 }
 
+fn parse_thumbnails_val(key: &str, val: &Value) -> Result<Vec<ThumbnailSize>, ProfileError> {
+    let raw_items: Vec<&str> = match val {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    return Err(ProfileError::InvalidValue {
+                        key: key.to_owned(),
+                        reason: "thumbnail entries must be strings like `160x120`".to_owned(),
+                    });
+                };
+                out.push(s);
+            }
+            out
+        }
+        _ => {
+            return Err(ProfileError::InvalidValue {
+                key: key.to_owned(),
+                reason: format!("expected thumbnail string or array, got `{val}`"),
+            });
+        }
+    };
+
+    let mut sizes = Vec::new();
+    for raw in raw_items {
+        for part in raw.split(',') {
+            let clean = part.trim();
+            if clean.is_empty() || clean.eq_ignore_ascii_case("nil") {
+                continue;
+            }
+            let dims = clean.split('/').next().unwrap_or(clean).trim();
+            let Some((w_str, h_str)) = dims.split_once(['x', 'X']) else {
+                return Err(ProfileError::InvalidValue {
+                    key: key.to_owned(),
+                    reason: format!("invalid thumbnail size `{clean}`, expected `WxH`"),
+                });
+            };
+            let width: u32 = w_str
+                .trim()
+                .parse()
+                .map_err(|_| ProfileError::InvalidValue {
+                    key: key.to_owned(),
+                    reason: format!("invalid thumbnail width in `{clean}`"),
+                })?;
+            let height: u32 = h_str
+                .trim()
+                .parse()
+                .map_err(|_| ProfileError::InvalidValue {
+                    key: key.to_owned(),
+                    reason: format!("invalid thumbnail height in `{clean}`"),
+                })?;
+            if !(16..=640).contains(&width) || !(16..=640).contains(&height) {
+                return Err(ProfileError::InvalidValue {
+                    key: key.to_owned(),
+                    reason: format!("thumbnail size `{width}x{height}` must be within 16..=640"),
+                });
+            }
+            sizes.push(ThumbnailSize { width, height });
+        }
+    }
+    if sizes.len() > 4 {
+        return Err(ProfileError::InvalidValue {
+            key: key.to_owned(),
+            reason: "at most 4 thumbnail sizes supported".to_owned(),
+        });
+    }
+    Ok(sizes)
+}
+
+fn parse_surface_pattern_val(
+    key: &str,
+    val: &Value,
+    profile_name: &str,
+    ctx: &mut MapperCtx,
+) -> Result<SurfacePattern, ProfileError> {
+    let raw = parse_string_val(key, val)?;
+    let norm = raw.trim().to_ascii_lowercase();
+    let pat = match norm.as_str() {
+        "monotonic" | "monotonicline" | "monotonic_line" | "monotonic line" => {
+            SurfacePattern::Monotonic
+        }
+        "rectilinear" | "alignedrectilinear" | "aligned_rectilinear" | "aligned rectilinear" => {
+            SurfacePattern::Rectilinear
+        }
+        "concentric" => SurfacePattern::Concentric,
+        _ => {
+            ctx.warn(
+                profile_name,
+                key,
+                format!("surface pattern `{raw}` approximated using `monotonic`"),
+            );
+            SurfacePattern::Monotonic
+        }
+    };
+    Ok(pat)
+}
+
 fn parse_u16_val(key: &str, val: &Value) -> Result<u16, ProfileError> {
     let f = parse_f64_val(key, val)?;
     let rounded = f.round();
@@ -1201,6 +1299,13 @@ fn apply_machine_settings(
         && !is_nil_value(v)
     {
         cfg.machine.emit_progress_m73 = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["thumbnails"])
+        && !is_nil_value(v)
+    {
+        cfg.machine.thumbnails = parse_thumbnails_val(k, v)?;
         ctx.mark_applied(k);
     }
 
@@ -1955,19 +2060,132 @@ fn apply_process_settings_pass1(
     {
         cfg.process.monotonic_solid_infill = parse_bool_val(k, v)?;
         ctx.mark_applied(k);
-    } else if let Some((k, v)) =
-        ctx.get_primary(s, &["top_surface_pattern", "bottom_surface_pattern"])
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["top_surface_pattern"])
         && !is_nil_value(v)
     {
-        let pat = parse_string_val(k, v)?;
-        let mono = pat.trim().to_ascii_lowercase().starts_with("monotonic");
-        cfg.process.monotonic_solid_infill = mono;
-        if !mono {
-            ctx.warn(
-                &process.name,
-                k,
-                format!("surface pattern `{pat}` sets `monotonic_solid_infill = false`"),
-            );
+        cfg.process.top_surface_pattern = parse_surface_pattern_val(k, v, &process.name, ctx)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["bottom_surface_pattern"])
+        && !is_nil_value(v)
+    {
+        cfg.process.bottom_surface_pattern = parse_surface_pattern_val(k, v, &process.name, ctx)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &["elefant_foot_compensation", "elephant_foot_compensation"],
+    ) && !is_nil_value(v)
+    {
+        cfg.process.elephant_foot_compensation_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["xy_contour_compensation"])
+        && !is_nil_value(v)
+    {
+        cfg.process.xy_contour_compensation_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["xy_hole_compensation"])
+        && !is_nil_value(v)
+    {
+        cfg.process.xy_hole_compensation_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["wall_sequence", "wall_order"])
+        && !is_nil_value(v)
+    {
+        let raw = parse_string_val(k, v)?;
+        let norm = raw.trim().to_ascii_lowercase();
+        cfg.process.wall_order = match norm.as_str() {
+            "inner wall/outer wall"
+            | "inner/outer"
+            | "inner_outer"
+            | "inner-outer"
+            | "inner outer" => WallOrder::InnerOuter,
+            "outer wall/inner wall"
+            | "outer/inner"
+            | "outer_inner"
+            | "outer-inner"
+            | "outer inner" => WallOrder::OuterInner,
+            "inner-outer-inner wall"
+            | "inner_outer_inner"
+            | "inner/outer/inner"
+            | "inner-outer-inner"
+            | "inner/outer/inner wall" => WallOrder::InnerOuterInner,
+            _ => {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    format!("wall order `{raw}` approximated using `inner/outer`"),
+                );
+                WallOrder::InnerOuter
+            }
+        };
+        ctx.mark_applied(k);
+    } else if let Some((k, v)) = ctx.get_primary(s, &["external_perimeters_first"])
+        && !is_nil_value(v)
+    {
+        let first = parse_bool_val(k, v)?;
+        cfg.process.wall_order = if first {
+            WallOrder::OuterInner
+        } else {
+            WallOrder::InnerOuter
+        };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["avoid_crossing_wall", "avoid_crossing_perimeters"])
+        && !is_nil_value(v)
+    {
+        cfg.process.avoid_crossing_perimeters = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &[
+            "avoid_crossing_wall_max_detour",
+            "avoid_crossing_perimeters_max_detour",
+        ],
+    ) && !is_nil_value(v)
+    {
+        if let Some(Value::String(raw_s)) = unwrap_scalar(v) {
+            let trimmed = raw_s.trim();
+            if trimmed.ends_with('%') {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    "percentage `avoid_crossing_perimeters_max_detour` approximated as unlimited (`0.0 mm`)",
+                );
+                cfg.process.avoid_crossing_perimeters_max_detour_mm = 0.0;
+            } else {
+                let cleaned = trimmed
+                    .strip_suffix("mm")
+                    .or_else(|| trimmed.strip_suffix("MM"))
+                    .unwrap_or(trimmed)
+                    .trim();
+                let mm: f64 = cleaned.parse().map_err(|_| ProfileError::InvalidValue {
+                    key: k.to_owned(),
+                    reason: format!("invalid detour distance `{trimmed}`"),
+                })?;
+                if !mm.is_finite() || mm < 0.0 {
+                    return Err(ProfileError::InvalidValue {
+                        key: k.to_owned(),
+                        reason: "detour distance must be finite and >= 0".to_owned(),
+                    });
+                }
+                cfg.process.avoid_crossing_perimeters_max_detour_mm = mm;
+            }
+        } else {
+            cfg.process.avoid_crossing_perimeters_max_detour_mm = parse_f64_val(k, v)?;
         }
         ctx.mark_applied(k);
     }
@@ -2526,6 +2744,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "wipe_distance": ["1.5"],
                 "travel_speed": "250",
                 "remaining_times": "1",
+                "thumbnails": ["160x120"],
                 "machine_start_gcode": concat!(
                     "M862.3 P \"[printer_model]\"\n",
                     "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
@@ -2578,6 +2797,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "wipe_distance": ["1.5"],
                 "travel_speed": "300",
                 "remaining_times": "1",
+                "thumbnails": ["160x120"],
                 "machine_start_gcode": concat!(
                     "M862.3 P \"[printer_model]\"\n",
                     "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
@@ -3464,5 +3684,71 @@ mod tests {
         assert!((petg.config.filament.max_volumetric_speed_mm3_s - 18.0).abs() < 1e-9);
         assert_eq!(petg.config.filament.nozzle_temp_c, 245);
         assert_eq!(petg.config.filament.bed_temp_c, 80);
+    }
+
+    #[test]
+    fn phase5b_profile_keys_map_without_warnings() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"[
+              {
+                "type": "machine",
+                "name": "p5b_machine",
+                "thumbnails": ["160x120/PNG", "220x124"]
+              },
+              {
+                "type": "process",
+                "name": "p5b_process",
+                "elefant_foot_compensation": "0.2",
+                "xy_contour_compensation": "-0.1",
+                "xy_hole_compensation": "0.15",
+                "wall_sequence": "inner-outer-inner wall",
+                "top_surface_pattern": "concentric",
+                "bottom_surface_pattern": "rectilinear",
+                "avoid_crossing_wall": "1",
+                "avoid_crossing_wall_max_detour": "30mm"
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("p5b_machine"),
+                None,
+                Some("p5b_process"),
+            )
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert_eq!(
+            res.config.machine.thumbnails,
+            vec![
+                ThumbnailSize {
+                    width: 160,
+                    height: 120
+                },
+                ThumbnailSize {
+                    width: 220,
+                    height: 124
+                }
+            ]
+        );
+        assert!((res.config.process.elephant_foot_compensation_mm - 0.2).abs() < 1e-9);
+        assert!((res.config.process.xy_contour_compensation_mm - (-0.1)).abs() < 1e-9);
+        assert!((res.config.process.xy_hole_compensation_mm - 0.15).abs() < 1e-9);
+        assert_eq!(res.config.process.wall_order, WallOrder::InnerOuterInner);
+        assert_eq!(
+            res.config.process.top_surface_pattern,
+            SurfacePattern::Concentric
+        );
+        assert_eq!(
+            res.config.process.bottom_surface_pattern,
+            SurfacePattern::Rectilinear
+        );
+        assert!(res.config.process.avoid_crossing_perimeters);
+        assert!((res.config.process.avoid_crossing_perimeters_max_detour_mm - 30.0).abs() < 1e-9);
     }
 }

@@ -32,6 +32,6 @@
     "inner_wall_line_width": "110%",
     "sparse_infill_density": "20%",
     "sparse_infill_pattern": "gyroid",
-    "xy_hole_compensation": "0.05"
+    "custom_unmapped_setting": "1"
   }
 ]

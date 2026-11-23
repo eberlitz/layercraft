@@ -1,0 +1,19 @@
+{
+  "name": "002-wall-order-concentric-arcs",
+  "description": "Cylinder with 3 walls in Inner/Outer/Inner order, concentric top/bottom skins, and G2/G3 arc fitting",
+  "shape": {
+    "kind": "cylinder",
+    "radius_mm": 12.0,
+    "height_mm": 4.0,
+    "segments": 64
+  },
+  "config": {
+    "process": {
+      "wall_loops": 3,
+      "wall_order": "inner_outer_inner",
+      "top_surface_pattern": "concentric",
+      "bottom_surface_pattern": "concentric",
+      "arc_fitting": true
+    }
+  }
+}
