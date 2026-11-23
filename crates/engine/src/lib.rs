@@ -8,7 +8,10 @@ use layercraft_config::{
     ActiveProfiles, ConfigError, ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult,
     ProfileError, ProfileKind, ProfileLibrary, ProfileSummary, ResolvedProfile,
 };
-use layercraft_gcode::{GcodeError, GcodeOutput, GcodeReport, emit_gcode, evaluate_gcode};
+use layercraft_gcode::{
+    GcodeError, GcodeOutput, GcodeReport, PrintStatistics, RasterComparison, compare_layer_iou,
+    emit_gcode, evaluate_gcode,
+};
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{IoError, read_3mf_bytes, read_stl_bytes};
 use layercraft_mesh::{
@@ -17,8 +20,8 @@ use layercraft_mesh::{
     prepare_modifier_mesh, prepare_transformed_object,
 };
 use layercraft_slice::{
-    ModifierVolume, SliceError, SlicedPlate, slice_prepared_mesh_with_modifiers,
-    slice_single_mesh_with_modifiers,
+    ModifierVolume, PrintabilityReport, SliceError, SlicedPlate, analyze_printability,
+    slice_prepared_mesh_with_modifiers, slice_single_mesh_with_modifiers,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,11 @@ pub enum EngineError {
     UnknownCommand(String),
     #[error("invalid command parameters: {0}")]
     InvalidParams(#[from] serde_json::Error),
+    #[error("invalid argument `{field}`: {reason}")]
+    InvalidArgument {
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error("no mesh loaded on build plate")]
     NoMeshLoaded,
     #[error("plate object id {0} not found")]
@@ -42,6 +50,9 @@ pub enum EngineError {
     NotSliced,
     #[error("layer index {index} out of range (plate has {count} layers)")]
     LayerOutOfRange { index: usize, count: usize },
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("file error: {0}")]
+    FileWrite(String),
     #[error(transparent)]
     Geom(#[from] GeomError),
     #[error(transparent)]
@@ -142,7 +153,7 @@ pub struct PlateModifierInfo {
 }
 
 /// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub config: PrintConfig,
     pub profiles: ProfileLibrary,
@@ -389,6 +400,147 @@ pub struct LayerInspection {
     pub role_lengths_mm: BTreeMap<String, f64>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Compact metadata entry returned by [`list_command_summaries`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CommandSummary {
+    pub name: &'static str,
+    pub summary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PatchConfigParams {
+    /// Partial JSON object merged onto the active `PrintConfig` (RFC 7396 merge patch).
+    pub patch: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AnalyzePrintabilityParams {
+    /// Slice the plate automatically if no cached slice exists yet (default `true`).
+    #[serde(default = "default_true")]
+    pub auto_slice: bool,
+}
+
+impl Default for AnalyzePrintabilityParams {
+    fn default() -> Self {
+        Self { auto_slice: true }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct CompareSlicesParams {
+    /// Optional partial `PrintConfig` patch for baseline config A (defaults to current config).
+    pub patch_a: Option<Value>,
+    /// Partial `PrintConfig` patch for candidate config B.
+    pub patch_b: Value,
+    /// Raster resolution (mm/pixel) for 2D swept-bead IoU comparison (default `0.5`).
+    pub pixel_mm: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SliceSideMetrics {
+    pub layer_count: usize,
+    pub filament_volume_mm3: f64,
+    pub filament_mass_g: f64,
+    pub estimated_time_s: f64,
+    pub travel_distance_mm: f64,
+    pub arc_moves_count: usize,
+    pub safety_clean: bool,
+    pub stats: PrintStatistics,
+    pub report: GcodeReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SliceDeltaMetrics {
+    pub layer_count_delta: i64,
+    pub filament_volume_delta_mm3: f64,
+    pub filament_volume_delta_percent: f64,
+    pub filament_mass_delta_g: f64,
+    pub estimated_time_delta_s: f64,
+    pub estimated_time_delta_percent: f64,
+    pub travel_distance_delta_mm: f64,
+    pub arc_moves_delta: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SliceComparisonReport {
+    pub a: SliceSideMetrics,
+    pub b: SliceSideMetrics,
+    pub delta: SliceDeltaMetrics,
+    pub raster: RasterComparison,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SaveGcodeFileParams {
+    pub path: String,
+    #[serde(default = "default_true")]
+    pub evaluate: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SaveGcodeFileResult {
+    pub path: String,
+    pub bytes_written: usize,
+    pub stats: PrintStatistics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<GcodeReport>,
+}
+
+/// One step in a [`execute_batch`] call.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchStep {
+    pub command: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// Output from one executed step in a batch.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchStepResult {
+    pub index: usize,
+    pub command: String,
+    pub result: Value,
+}
+
+/// Aggregate result returned by [`execute_batch`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchResult {
+    pub ok: bool,
+    pub completed_steps: usize,
+    pub rolled_back: bool,
+    pub results: Vec<BatchStepResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// List compact command names and one-line summaries (optionally filtered by prefix).
+pub fn list_command_summaries(prefix: Option<&str>) -> Vec<CommandSummary> {
+    let filter = prefix.map(str::trim).filter(|s| !s.is_empty());
+    command_registry()
+        .into_iter()
+        .filter(|c| match filter {
+            Some(p) => c.name.starts_with(p),
+            None => true,
+        })
+        .map(|c| CommandSummary {
+            name: c.name,
+            summary: c.summary,
+        })
+        .collect()
+}
+
+/// Look up the full descriptor and schemas for one command name.
+pub fn describe_command(name: &str) -> Option<CommandDescriptor> {
+    command_registry().into_iter().find(|c| c.name == name)
+}
+
 /// Return descriptors and JSON schemas for all supported commands.
 pub fn command_registry() -> Vec<CommandDescriptor> {
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
@@ -543,7 +695,32 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             params_schema: schema_val::<EvaluateGcodeParams>(),
             result_schema: schema_val::<GcodeReport>(),
         },
+        CommandDescriptor {
+            name: "config.patch",
+            summary: "Partially patch the active PrintConfig via JSON merge patch and validate.",
+            params_schema: schema_val::<PatchConfigParams>(),
+            result_schema: schema_val::<PrintConfig>(),
+        },
+        CommandDescriptor {
+            name: "plate.analyze_printability",
+            summary: "Run Printability / DFM diagnostics (overhangs, floating islands, thin walls, adhesion, feature breakdown).",
+            params_schema: schema_val::<AnalyzePrintabilityParams>(),
+            result_schema: schema_val::<PrintabilityReport>(),
+        },
+        CommandDescriptor {
+            name: "slice.compare",
+            summary: "Non-destructively slice and compare two config variants (deltas and per-layer 2D raster IoU).",
+            params_schema: schema_val::<CompareSlicesParams>(),
+            result_schema: schema_val::<SliceComparisonReport>(),
+        },
     ];
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "gcode.save_file",
+        summary: "Emit G-code if needed, write directly to a file on disk, and optionally run physical evaluation.",
+        params_schema: schema_val::<SaveGcodeFileParams>(),
+        result_schema: schema_val::<SaveGcodeFileResult>(),
+    });
     #[cfg(not(target_arch = "wasm32"))]
     cmds.push(CommandDescriptor {
         name: "plate.add_mesh_file",
@@ -758,6 +935,148 @@ fn apply_session_config(session: &mut Session, new_config: PrintConfig) -> Resul
     Ok(())
 }
 
+/// Recursively merge a JSON Merge Patch (RFC 7396) onto `target`.
+pub fn merge_json_patch(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(t_map), Value::Object(p_map)) => {
+            for (k, v) in p_map {
+                if v.is_null() {
+                    t_map.remove(k);
+                } else if let Some(existing) = t_map.get_mut(k) {
+                    merge_json_patch(existing, v);
+                } else {
+                    t_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        (target_slot, new_val) => {
+            *target_slot = new_val.clone();
+        }
+    }
+}
+
+/// Apply a partial JSON merge patch onto `base` `PrintConfig` and validate it.
+pub fn apply_config_patch_value(
+    base: &PrintConfig,
+    patch: &Value,
+) -> Result<PrintConfig, EngineError> {
+    if patch.is_null() {
+        return Ok(base.clone());
+    }
+    if !patch.is_object() {
+        return Err(EngineError::InvalidArgument {
+            field: "patch",
+            reason: "must be a JSON object",
+        });
+    }
+    let mut val = serde_json::to_value(base)?;
+    merge_json_patch(&mut val, patch);
+    let cfg: PrintConfig = serde_json::from_value(val)?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// Non-destructively slice the plate loaded in `session` under an explicit `config`.
+pub fn slice_with_config(
+    session: &Session,
+    config: &PrintConfig,
+) -> Result<SlicedPlate, EngineError> {
+    let mod_vols: Vec<ModifierVolume> = session
+        .modifiers
+        .iter()
+        .map(PlateModifierEntry::to_volume)
+        .collect();
+    if let Some(prepared) = session.prepared_mesh.as_ref() {
+        Ok(slice_prepared_mesh_with_modifiers(
+            prepared, config, &mod_vols,
+        )?)
+    } else if let Some(raw) = session.mesh.as_ref() {
+        Ok(slice_single_mesh_with_modifiers(raw, config, &mod_vols)?)
+    } else {
+        Err(EngineError::NoMeshLoaded)
+    }
+}
+
+/// Execute a sequence of engine commands, optionally rolling back `session` on failure.
+pub fn execute_batch(session: &mut Session, steps: &[BatchStep], atomic: bool) -> BatchResult {
+    let snapshot = if atomic { Some(session.clone()) } else { None };
+    let mut results = Vec::with_capacity(steps.len());
+
+    for (idx, step) in steps.iter().enumerate() {
+        match execute(session, &step.command, step.params.clone()) {
+            Ok(result) => {
+                results.push(BatchStepResult {
+                    index: idx,
+                    command: step.command.clone(),
+                    result,
+                });
+            }
+            Err(e) => {
+                let mut rolled_back = false;
+                if let Some(prev) = snapshot {
+                    *session = prev;
+                    rolled_back = true;
+                }
+                return BatchResult {
+                    ok: false,
+                    completed_steps: results.len(),
+                    rolled_back,
+                    results,
+                    error: Some(format!("step {idx} (`{}`): {e}", step.command)),
+                };
+            }
+        }
+    }
+
+    BatchResult {
+        ok: true,
+        completed_steps: results.len(),
+        rolled_back: false,
+        results,
+        error: None,
+    }
+}
+
+fn delta_percent(a: f64, b: f64) -> f64 {
+    if a.abs() > 1e-9 {
+        ((b - a) / a) * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn build_side_metrics(
+    session: &Session,
+    cfg: &PrintConfig,
+) -> Result<
+    (
+        SliceSideMetrics,
+        Vec<layercraft_gcode::GcodeExtrusionSegment>,
+    ),
+    EngineError,
+> {
+    let plate = slice_with_config(session, cfg)?;
+    let out = emit_gcode(&plate, cfg)?;
+    let (report, segs) = evaluate_gcode(
+        &out.gcode,
+        cfg.filament.diameter_mm,
+        cfg.machine.bed_width_mm,
+        cfg.machine.bed_depth_mm,
+    )?;
+    let metrics = SliceSideMetrics {
+        layer_count: out.stats.layer_count,
+        filament_volume_mm3: out.stats.filament_volume_mm3,
+        filament_mass_g: out.stats.filament_weight_g,
+        estimated_time_s: out.stats.estimated_time_s,
+        travel_distance_mm: out.stats.travel_distance_mm,
+        arc_moves_count: report.arc_moves_count,
+        safety_clean: report.safety.is_clean(),
+        stats: out.stats,
+        report,
+    };
+    Ok((metrics, segs))
+}
+
 /// Execute a named command with JSON parameters against `session`.
 pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value, EngineError> {
     match name {
@@ -970,6 +1289,27 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             apply_session_config(session, p.config)?;
             Ok(serde_json::to_value(&session.config)?)
         }
+        "config.patch" => {
+            let patch_val = match &params {
+                Value::Null => Value::Object(serde_json::Map::new()),
+                Value::Object(map) => {
+                    if let Some(inner) = map.get("patch") {
+                        inner.clone()
+                    } else {
+                        params
+                    }
+                }
+                _ => {
+                    return Err(EngineError::InvalidArgument {
+                        field: "patch",
+                        reason: "must be a JSON object",
+                    });
+                }
+            };
+            let new_cfg = apply_config_patch_value(&session.config, &patch_val)?;
+            apply_session_config(session, new_cfg)?;
+            Ok(serde_json::to_value(&session.config)?)
+        }
         "profile.list" => {
             let p: ListProfilesParams = if params.is_null() {
                 ListProfilesParams::default()
@@ -1042,18 +1382,7 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             Ok(serde_json::to_value(apply_res)?)
         }
         "slice.run" => {
-            let mod_vols: Vec<ModifierVolume> = session
-                .modifiers
-                .iter()
-                .map(PlateModifierEntry::to_volume)
-                .collect();
-            let plate = if let Some(prepared) = session.prepared_mesh.as_ref() {
-                slice_prepared_mesh_with_modifiers(prepared, &session.config, &mod_vols)?
-            } else if let Some(raw) = session.mesh.as_ref() {
-                slice_single_mesh_with_modifiers(raw, &session.config, &mod_vols)?
-            } else {
-                return Err(EngineError::NoMeshLoaded);
-            };
+            let plate = slice_with_config(session, &session.config)?;
             let total_paths = plate.layers.iter().map(|l| l.paths.len()).sum();
             let res = SliceSummaryResult {
                 layer_count: plate.layers.len(),
@@ -1062,6 +1391,66 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
             session.sliced = Some(plate);
             session.last_gcode = None;
             Ok(serde_json::to_value(res)?)
+        }
+        "plate.analyze_printability" => {
+            let p: AnalyzePrintabilityParams = if params.is_null() {
+                AnalyzePrintabilityParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            if session.prepared_mesh.is_none() && session.mesh.is_none() {
+                return Err(EngineError::NoMeshLoaded);
+            }
+            if session.sliced.is_none() && p.auto_slice {
+                let plate = slice_with_config(session, &session.config)?;
+                session.sliced = Some(plate);
+                session.last_gcode = None;
+            }
+            let mesh = session
+                .prepared_mesh
+                .as_ref()
+                .or(session.mesh.as_ref())
+                .ok_or(EngineError::NoMeshLoaded)?;
+            let report = analyze_printability(mesh, session.sliced.as_ref(), &session.config);
+            Ok(serde_json::to_value(report)?)
+        }
+        "slice.compare" => {
+            let p: CompareSlicesParams = serde_json::from_value(params)?;
+            let pixel_mm = p.pixel_mm.unwrap_or(0.5);
+            if !pixel_mm.is_finite() || pixel_mm <= 0.0 || pixel_mm > 10.0 {
+                return Err(EngineError::InvalidArgument {
+                    field: "pixel_mm",
+                    reason: "must be finite and within (0.0, 10.0]",
+                });
+            }
+            let cfg_a = match &p.patch_a {
+                Some(pa) => apply_config_patch_value(&session.config, pa)?,
+                None => session.config.clone(),
+            };
+            let cfg_b = apply_config_patch_value(&session.config, &p.patch_b)?;
+            let (a, segs_a) = build_side_metrics(session, &cfg_a)?;
+            let (b, segs_b) = build_side_metrics(session, &cfg_b)?;
+            let bead_r = 0.5 * cfg_a.machine.nozzle_diameter_mm.max(0.2);
+            let raster = compare_layer_iou(&segs_a, &segs_b, pixel_mm, bead_r);
+            let delta = SliceDeltaMetrics {
+                layer_count_delta: (b.layer_count as i64) - (a.layer_count as i64),
+                filament_volume_delta_mm3: b.filament_volume_mm3 - a.filament_volume_mm3,
+                filament_volume_delta_percent: delta_percent(
+                    a.filament_volume_mm3,
+                    b.filament_volume_mm3,
+                ),
+                filament_mass_delta_g: b.filament_mass_g - a.filament_mass_g,
+                estimated_time_delta_s: b.estimated_time_s - a.estimated_time_s,
+                estimated_time_delta_percent: delta_percent(a.estimated_time_s, b.estimated_time_s),
+                travel_distance_delta_mm: b.travel_distance_mm - a.travel_distance_mm,
+                arc_moves_delta: (b.arc_moves_count as i64) - (a.arc_moves_count as i64),
+            };
+            Ok(serde_json::to_value(SliceComparisonReport {
+                a,
+                b,
+                delta,
+                raster,
+            })?)
         }
         "layer.inspect" => {
             let p: InspectLayerParams = serde_json::from_value(params)?;
@@ -1122,6 +1511,49 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
                 .unwrap_or(session.config.machine.bed_depth_mm);
             let (report, _) = evaluate_gcode(&p.gcode, d, w, depth)?;
             Ok(serde_json::to_value(report)?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "gcode.save_file" => {
+            let p: SaveGcodeFileParams = serde_json::from_value(params)?;
+            let trimmed_path = p.path.trim();
+            if trimmed_path.is_empty() {
+                return Err(EngineError::InvalidArgument {
+                    field: "path",
+                    reason: "must not be empty",
+                });
+            }
+            if session.last_gcode.is_none() {
+                let plate = session.sliced.as_ref().ok_or(EngineError::NotSliced)?;
+                let out = emit_gcode(plate, &session.config)?;
+                session.last_gcode = Some(out);
+            }
+            let gcode_out = session.last_gcode.as_ref().ok_or(EngineError::NotSliced)?;
+            let out_path = std::path::Path::new(trimmed_path);
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| EngineError::FileWrite(format!("{}: {e}", parent.display())))?;
+            }
+            std::fs::write(out_path, gcode_out.gcode.as_bytes())
+                .map_err(|e| EngineError::FileWrite(format!("{}: {e}", out_path.display())))?;
+            let evaluation = if p.evaluate {
+                let (rep, _) = evaluate_gcode(
+                    &gcode_out.gcode,
+                    session.config.filament.diameter_mm,
+                    session.config.machine.bed_width_mm,
+                    session.config.machine.bed_depth_mm,
+                )?;
+                Some(rep)
+            } else {
+                None
+            };
+            Ok(serde_json::to_value(SaveGcodeFileResult {
+                path: trimmed_path.to_owned(),
+                bytes_written: gcode_out.gcode.len(),
+                stats: gcode_out.stats.clone(),
+                evaluation,
+            })?)
         }
         other => Err(EngineError::UnknownCommand(other.to_owned())),
     }
@@ -1633,5 +2065,106 @@ mod tests {
         )
         .unwrap();
         assert!(cleared_mods.is_empty());
+    }
+
+    #[test]
+    fn config_patch_and_atomic_batch_and_compare_work() {
+        let mut sess = Session::default();
+
+        // Discovery helpers
+        let summaries = list_command_summaries(Some("config."));
+        assert!(summaries.iter().any(|s| s.name == "config.patch"));
+        let desc = describe_command("slice.compare").unwrap();
+        assert_eq!(desc.name, "slice.compare");
+
+        // Atomic batch rolls back completely on failure
+        let bad_batch = execute_batch(
+            &mut sess,
+            &[
+                BatchStep {
+                    command: "plate.add_sample_shape".to_owned(),
+                    params: serde_json::json!({ "shape": "cube20" }),
+                },
+                BatchStep {
+                    command: "config.patch".to_owned(),
+                    params: serde_json::json!({ "patch": { "process": { "layer_height_mm": 0.16 } } }),
+                },
+                BatchStep {
+                    command: "nonexistent.command".to_owned(),
+                    params: Value::Null,
+                },
+            ],
+            true,
+        );
+        assert!(!bad_batch.ok);
+        assert!(bad_batch.rolled_back);
+        assert!(sess.objects.is_empty());
+        assert!((sess.config.process.layer_height_mm - 0.2).abs() < 1e-6);
+
+        // Successful batch
+        let ok_batch = execute_batch(
+            &mut sess,
+            &[
+                BatchStep {
+                    command: "plate.add_sample_shape".to_owned(),
+                    params: serde_json::json!({ "shape": "bridge_arch" }),
+                },
+                BatchStep {
+                    command: "config.patch".to_owned(),
+                    params: serde_json::json!({
+                        "process": { "sparse_infill_density": 0.15 }
+                    }),
+                },
+                BatchStep {
+                    command: "slice.run".to_owned(),
+                    params: Value::Null,
+                },
+            ],
+            true,
+        );
+        assert!(ok_batch.ok, "{:?}", ok_batch.error);
+        assert!((sess.config.process.sparse_infill_density - 0.15).abs() < 1e-6);
+
+        // Printability DFM check
+        let dfm: PrintabilityReport = serde_json::from_value(
+            execute(&mut sess, "plate.analyze_printability", Value::Null).unwrap(),
+        )
+        .unwrap();
+        assert!(dfm.sliced);
+        assert!(dfm.fits_bed);
+        assert!(dfm.bridge_count > 0 || dfm.overhang_triangle_area_mm2 > 0.0);
+
+        // Non-destructive A/B slice comparison (does not mutate active config)
+        let cmp: SliceComparisonReport = serde_json::from_value(
+            execute(
+                &mut sess,
+                "slice.compare",
+                serde_json::json!({
+                    "patch_b": { "process": { "sparse_infill_density": 0.45 } }
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cmp.delta.filament_volume_delta_mm3 > 10.0);
+        assert!((sess.config.process.sparse_infill_density - 0.15).abs() < 1e-6);
+
+        // Direct disk export + built-in safety evaluation
+        let tmp_gcode = std::env::temp_dir().join("layercraft_engine_phase5c_test.gcode");
+        let saved: SaveGcodeFileResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "gcode.save_file",
+                serde_json::json!({
+                    "path": tmp_gcode.to_string_lossy(),
+                    "evaluate": true
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(saved.bytes_written > 200);
+        assert!(saved.evaluation.as_ref().unwrap().safety.is_clean());
+        let _ = std::fs::remove_file(tmp_gcode);
     }
 }

@@ -15,16 +15,16 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="#architecture--verification">Architecture</a> ·
   <a href="docs/oracle.md">Oracle (6/6)</a> ·
-  <a href="docs/ladder.md">Complexity Ladder (43/43)</a> ·
+  <a href="docs/ladder.md">Complexity Ladder (47/47)</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
 
 <p align="center">
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-14B8A6" alt="License: MIT OR Apache-2.0" /></a>
   <a href="docs/layers.md"><img src="https://img.shields.io/badge/Pure%20Rust-WASM--Clean-0D9488" alt="Pure Rust WASM-Clean" /></a>
-  <a href="docs/mcp.md"><img src="https://img.shields.io/badge/MCP-JSON--RPC%202.0%20%2B%20PNG-14B8A6" alt="MCP: JSON-RPC 2.0 + PNG" /></a>
+  <a href="docs/mcp.md"><img src="https://img.shields.io/badge/MCP-Live%20Studio%20%2B%20PNG-14B8A6" alt="MCP: Live Studio + PNG" /></a>
   <a href="docs/oracle.md"><img src="https://img.shields.io/badge/Oracle-6%2F6%20Passing-10B981" alt="Oracle: 6/6 Passing" /></a>
-  <a href="docs/ladder.md"><img src="https://img.shields.io/badge/Ladder-10%20Tiers%20%C2%B7%2043%2F43-10B981" alt="Ladder: 10 Tiers · 43/43" /></a>
+  <a href="docs/ladder.md"><img src="https://img.shields.io/badge/Ladder-11%20Tiers%20%C2%B7%2047%2F47-10B981" alt="Ladder: 11 Tiers · 47/47" /></a>
 </p>
 
 <p align="center">
@@ -46,18 +46,19 @@
 
 A core goal of LayerCraft is making **3D printing workflows first-class for AI agents**. Rather than bolting automation onto a GUI later, every action in LayerCraft goes through a deterministic, schema-typed command engine (`layercraft-engine`) exposed directly over the [Model Context Protocol](https://modelcontextprotocol.io) (`layercraft-cli mcp`).
 
-- **Self-describing command schemas:** Agents query `commands` for JSON input/output schemas across all plate, modifier, profile, slicing, and G-code operations instead of guessing flags or parsing fragile text.
-- **Visual closed-loop inspection:** The `screenshot` tool renders the 3D build plate, sliced toolpaths, or individual top-down layers as inline PNG images (`image/png`) so vision-capable agents can spot thin-wall gaps, floating islands, or support placement before exporting.
-- **Physical safety verification:** `gcode.evaluate` checks every generated G-code file for non-finite coordinates, out-of-bounds moves, layer continuity, volumetric flow, Z-hops, arcs, and adaptive layer variation.
-- **Zero modal dialogs, panic-free errors:** Invalid parameters or malformed meshes return structured errors cleanly (`unwrap`/`expect`/`panic`/`unsafe` are lint-forbidden across non-test code).
-- **Natural companion to CAD MCP servers:** Pair LayerCraft with an upstream CAD MCP server (such as [SolidCraft](https://github.com/tangency-labs/solidcraft)) so an agent can generate parametric geometry, load the exported STL/3MF onto LayerCraft's plate, tune settings or modifier volumes, inspect screenshots, and produce verified G-code in one loop.
+- **Live Studio connection (or headless on demand):** Launch `layercraft` Studio and run `layercraft-cli mcp` — tool calls attach over local IPC so you can watch the agent load parts, slice, toggle views, and capture `camera: "current"` screenshots directly in the open window (`--connect` to require Studio, `--standalone` for isolated headless CI).
+- **Token-efficient discovery, patching & atomic batches:** Agents list concise command summaries (`list_commands`), fetch schemas on demand (`describe_command`), tweak individual fields (`config_patch`), and combine steps safely with rollback (`batch`).
+- **Printability & DFM diagnostics:** `analyze_printability` reports overhang risk, detached floating islands, thin-wall collapses, bed adhesion metrics, and per-feature filament/time breakdowns with remediation hints.
+- **Visual closed-loop & A/B inspection:** `screenshot` renders `plate`, `preview`, or `layer_top_down` PNGs, while `compare_slices` and `compare_screenshot` compare two configs quantitatively and visually with a 3-panel `A | B | Diff` composite.
+- **Direct verified G-code export:** `save_gcode` writes `.gcode` straight to disk and runs physical invariant checks (non-finite values, out-of-bounds moves, layer continuity, volumetric flow, Z-hops, arcs) without flooding agent context.
+- **Natural companion to CAD MCP servers:** Pair LayerCraft with an upstream CAD MCP server (such as [SolidCraft](https://github.com/tangency-labs/solidcraft)) so an agent can generate parametric geometry, load the exported STL/3MF live onto LayerCraft's plate, tune settings or modifier volumes, inspect screenshots, and produce verified G-code in one loop.
 
 ### Connect in Seconds
 
-Build `layercraft-cli`:
+Build both desktop Studio and CLI (`layercraft-cli mcp`):
 
 ```sh
-cargo build --release -p layercraft-cli
+cargo build --release -p layercraft -p layercraft-cli
 ```
 
 Register with **Claude Code**:
@@ -79,17 +80,21 @@ Or add to any MCP client (`Claude Desktop`, `Cursor`, `Antigravity`):
 }
 ```
 
-### MCP Tools (`layercraft-mcp`)
+### MCP Highlights (`layercraft-mcp`)
+
+16 MCP tools + 3 MCP resources (`layercraft://skill`, `layercraft://plate/summary`, `layercraft://commands`), including:
 
 | Tool | What the Agent Gets |
 |---|---|
-| `commands` | Full JSON Schema registry of all `layercraft-engine` commands (`29` commands). |
-| `execute` | Execute any plate, modifier, profile, slice, layer, or G-code command in the stateful session. |
-| `inspect_plate` | Active `PrintConfig`, merged mesh inspection bounds/volume/manifoldness, `layer_count`, and `gcode_stats`. |
-| `inspect_layer` | Per-layer Z height, layer thickness, fan %, estimated print time, region count, and per-role lengths. |
-| `screenshot` | Inline base64 `image/png` rendered in `plate`, `preview`, or `layer_top_down` mode with camera & color controls. |
+| `version` / `set_view` | Check `live_studio` vs `headless` connection state and steer Studio view mode, camera, layer, and color mode. |
+| `list_commands` / `describe_command` | Compact schema-on-demand discovery across all **33** `layercraft-engine` commands. |
+| `execute` / `batch` / `config_patch` | Run single commands, rollback-safe atomic batches, or partial `PrintConfig` patches. |
+| `analyze_printability` | Overhang area, floating islands, thin-wall checks, bed contact ratio, and per-feature filament/time breakdown. |
+| `screenshot` / `compare_screenshot` / `compare_slices` | Inline PNG inspection (including live `camera: "current"` + `sync_view`), 3-panel `A \| B \| Diff` renders, and 2D IoU slice diffs. |
+| `save_gcode` | Write G-code directly to disk with built-in physical safety evaluation. |
+| `skill_reference` | Built-in `SKILL.md` workflow and DFM guide (`skills/layercraft/SKILL.md`). |
 
-Full MCP setup, parameter schemas, command catalog, and an end-to-end agent walkthrough: **[docs/mcp.md](docs/mcp.md)**.
+Full MCP setup, Live Studio flags (`--connect`, `--standalone`, `--socket`), parameter schemas, and agent walkthrough: **[docs/mcp.md](docs/mcp.md)**.
 
 ---
 
@@ -104,7 +109,7 @@ Everything below runs through the same pure-Rust engine across the desktop app, 
 - **Printer-Ready G-code & JSON Profiles:** `Klipper`, `Marlin`, and Prusa `MarlinBuddy` emitters with volumetric flow capping, pressure/linear advance, per-role acceleration, chamber heating, `M73` progress, and safe `{if}/{elsif}/{else}` + arithmetic macro templates. Includes built-in starter presets (`LayerCraft Generic Klipper 250mm`, `LayerCraft Generic Marlin 220mm`, `LayerCraft CORE One+ HF 0.2mm`, `LayerCraft CORE One+ HF 0.4mm`) and Orca/Bambu-compatible JSON profile inheritance.
 - **Studio Desktop App, Browser WASM, CLI & MCP:** Native `eframe` + `4× MSAA` `wgpu` studio with Dark Studio / Light Drafting / System themes, interactive ViewCube & layer scrubber, browser WASM build (`apps/layercraft-web`), headless PNG & G-code CLI, and JSON-RPC 2.0 MCP server.
 
-See [docs/architecture.md](docs/architecture.md) for crate structure and [ROADMAP.md](ROADMAP.md) for completed milestones and upcoming phases (`Phase 5B` real-printer polish, `.3mf` project files, parallel/sweep-line slicing).
+See [docs/architecture.md](docs/architecture.md) for crate structure and [ROADMAP.md](ROADMAP.md) for completed milestones and upcoming phases (`.3mf` project files, parallel/sweep-line slicing, mesh repair).
 
 ---
 
@@ -143,7 +148,7 @@ cd apps/layercraft-web && trunk serve
 
 ```sh
 cargo xtask fast   # cargo fmt --check, clippy -D warnings, layers, licences, wasm, unit tests
-cargo xtask ci     # fast + analytic/OrcaSlicer oracle + 10-tier complexity ladder
+cargo xtask ci     # fast + analytic/OrcaSlicer oracle + 11-tier complexity ladder
 ```
 
 ---
@@ -183,7 +188,7 @@ LayerCraft enforces strict architectural seams and automated quality gates via `
 - **Permissive-Only Dependencies:** Every shipped crate is audited against an allowlist (`MIT`, `Apache-2.0`, `BSD-*`, `BSL-1.0`, `ISC`, `Zlib`, etc.) and recorded in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt) (`cargo xtask licences --check`).
 - **No-Crash Policy:** `unsafe_code = "forbid"` and workspace Clippy lints deny `unwrap`, `expect`, `panic`, and `indexing_slicing` in non-test code.
 - **Analytic & Black-Box Oracle ([docs/oracle.md](docs/oracle.md)):** **6 / 6** reference cases validated against closed-form analytic geometry (`tools/oracle-analytic/`) and out-of-process `OrcaSlicer 2.5.2` CLI statistics (`tools/orca-oracle/`).
-- **Complexity Ladder ([docs/ladder.md](docs/ladder.md)):** **10 tiers / 43 regression cases** passing from basic calibration primitives (`01-mesh-slice`) through adaptive layer scheduling and 3D modifier volumes (`10-variable-layer-modifiers`).
+- **Complexity Ladder ([docs/ladder.md](docs/ladder.md)):** **11 tiers / 47 regression cases** passing from basic calibration primitives (`01-mesh-slice`) through dimensional compensations, combing, and embedded thumbnails (`11-real-printer-polish`).
 
 ---
 

@@ -1,9 +1,11 @@
 //! Deterministic FDM slicing pipeline: slice -> perimeters -> skins -> infill -> adhesion.
 
 mod arachne;
+pub mod dfm;
 mod modifiers;
 mod tree_support;
 
+pub use dfm::*;
 pub use modifiers::ModifierVolume;
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};

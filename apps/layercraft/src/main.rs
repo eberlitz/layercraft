@@ -5,8 +5,10 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use layercraft_mcp::bridge::StudioBridgeHost;
+use layercraft_mcp::{UiViewMode, handle_studio_bridge_request};
 use layercraft_mesh::SampleShape;
-use layercraft_ui_egui::{LayerCraftApp, ThemeMode};
+use layercraft_ui_egui::{LayerCraftApp, ThemeMode, ViewMode};
 use layercraft_viewport_gpu::{ViewportGpuRenderer, install_renderer};
 
 #[derive(Parser)]
@@ -30,6 +32,12 @@ struct Args {
     /// Optional PNG output path: render headlessly offscreen via wgpu and exit.
     #[arg(long)]
     screenshot: Option<PathBuf>,
+    /// Custom IPC socket path for Live MCP Studio bridge (overrides LAYERCRAFT_SOCKET).
+    #[arg(long)]
+    bridge_socket: Option<PathBuf>,
+    /// Disable the Live MCP Studio IPC bridge.
+    #[arg(long)]
+    no_bridge: bool,
 }
 
 fn parse_sample(name: &str) -> SampleShape {
@@ -305,7 +313,58 @@ fn main() -> ExitCode {
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 install_renderer(rs);
             }
-            let app = build_app(initial_bytes, sample, theme, preview);
+            let mut app = build_app(initial_bytes, sample, theme, preview);
+            if !args.no_bridge {
+                let ctx = cc.egui_ctx.clone();
+                match StudioBridgeHost::bind(
+                    args.bridge_socket,
+                    Arc::new(move || ctx.request_repaint()),
+                ) {
+                    Ok(host) => {
+                        let ep = host.endpoint_display();
+                        let info = host.info().clone();
+                        let mut last_shot: Option<Vec<u8>> = None;
+                        app.set_bridge_status(Some(ep), None);
+                        app.set_external_poller(Box::new(move |app| {
+                            for incoming in host.drain_requests() {
+                                let live_cam = app.camera();
+                                let (resp, out) = handle_studio_bridge_request(
+                                    app.session_mut(),
+                                    &mut last_shot,
+                                    &info,
+                                    Some(&live_cam),
+                                    incoming.request,
+                                );
+                                if let Some(out) = out {
+                                    if let Some(cmd) = &out.executed_command {
+                                        app.sync_after_external_command(cmd);
+                                    }
+                                    if let Some(vs) = out.view_sync {
+                                        let vm = vs.view_mode.map(|m| match m {
+                                            UiViewMode::Prepare => ViewMode::Prepare,
+                                            UiViewMode::Preview => ViewMode::Preview,
+                                        });
+                                        app.apply_view_sync(
+                                            vm,
+                                            vs.camera_preset,
+                                            vs.max_layer,
+                                            vs.single_layer_only,
+                                            vs.color_mode,
+                                        );
+                                    }
+                                    if let Some(act) = out.activity_label {
+                                        app.set_bridge_status(None, Some(act));
+                                    }
+                                }
+                                let _ = incoming.reply.send(resp);
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        eprintln!("note: Studio MCP bridge disabled: {e}");
+                    }
+                }
+            }
             Ok(Box::new(app))
         }),
     );

@@ -33,6 +33,9 @@ pub enum ViewMode {
     Preview,
 }
 
+/// Frame callback invoked before UI layout to pump external controllers (e.g. Live MCP bridge).
+pub type ExternalPoller = Box<dyn FnMut(&mut LayerCraftApp)>;
+
 /// Shared application state driving both native `eframe` and browser `WebRunner`.
 pub struct LayerCraftApp {
     pub(crate) session: Session,
@@ -62,6 +65,9 @@ pub struct LayerCraftApp {
     pub(crate) ribbon_collapsed: bool,
     pub(crate) show_legend_hud: bool,
     pub(crate) last_scene_dark: bool,
+    pub(crate) external_poller: Option<ExternalPoller>,
+    pub(crate) bridge_endpoint: Option<String>,
+    pub(crate) last_mcp_activity: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
     #[cfg(target_arch = "wasm32")]
@@ -106,6 +112,9 @@ impl LayerCraftApp {
             ribbon_collapsed: false,
             show_legend_hud: true,
             last_scene_dark: true,
+            external_poller: None,
+            bridge_endpoint: None,
+            last_mcp_activity: None,
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(target_arch = "wasm32")]
@@ -122,6 +131,120 @@ impl LayerCraftApp {
     /// Set the active color theme mode (`Dark`, `Light`, or `System`).
     pub fn set_theme_mode(&mut self, mode: ThemeMode) {
         self.theme_mode = mode;
+    }
+
+    /// Install an external frame poller callback (used by native Studio to pump IPC bridge requests).
+    pub fn set_external_poller(&mut self, poller: ExternalPoller) {
+        self.external_poller = Some(poller);
+    }
+
+    /// Update the live MCP bridge indicator in the Studio status bar.
+    pub fn set_bridge_status(&mut self, endpoint: Option<String>, last_activity: Option<String>) {
+        if endpoint.is_some() {
+            self.bridge_endpoint = endpoint;
+        }
+        if last_activity.is_some() {
+            self.last_mcp_activity = last_activity;
+        }
+    }
+
+    /// Immutable reference to the underlying [`Session`].
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Mutable reference to the underlying [`Session`].
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Snapshot of the current 3D orbit camera.
+    pub fn camera(&self) -> OrbitCamera {
+        self.camera
+    }
+
+    /// Synchronize UI view state from an external controller (e.g. MCP `set_view` / `screenshot`).
+    pub fn apply_view_sync(
+        &mut self,
+        view_mode: Option<ViewMode>,
+        camera: Option<CameraPreset>,
+        max_layer: Option<usize>,
+        single_layer_only: Option<bool>,
+        color_mode: Option<ColorMode>,
+    ) {
+        if let Some(m) = view_mode {
+            self.view_mode = m;
+        }
+        if let Some(c) = camera {
+            self.frame_camera(c);
+        }
+        if let Some(layer) = max_layer {
+            let max_idx = self
+                .session
+                .sliced
+                .as_ref()
+                .map(|s| s.layers.len().saturating_sub(1))
+                .unwrap_or(0);
+            self.max_layer = layer.min(max_idx);
+        }
+        if let Some(single) = single_layer_only {
+            self.single_layer_only = single;
+        }
+        if let Some(cm) = color_mode
+            && self.color_mode != cm
+        {
+            self.color_mode = cm;
+            self.rebuild_scene();
+        }
+    }
+
+    /// Synchronize sidebar selections, view mode, and 3D scene after an external engine mutation.
+    pub fn sync_after_external_command(&mut self, command: &str) {
+        self.last_error = None;
+        self.selected_machine_profile = self.session.active_profiles.machine.clone();
+        self.selected_filament_profile = self.session.active_profiles.filament.clone();
+        self.selected_process_profile = self.session.active_profiles.process.clone();
+
+        let obj_still_exists = self
+            .selected_object_id
+            .is_some_and(|id| self.session.objects.iter().any(|o| o.id == id));
+        if !obj_still_exists {
+            self.selected_object_id = self.session.objects.last().map(|o| o.id);
+        }
+        let mod_still_exists = self
+            .selected_modifier_id
+            .is_some_and(|id| self.session.modifiers.iter().any(|m| m.id == id));
+        if !mod_still_exists {
+            self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+        }
+
+        if command == "plate.clear" {
+            self.view_mode = ViewMode::Prepare;
+            self.max_layer = 0;
+            self.status_message = "Cleared plate via MCP.".to_owned();
+        } else if command.starts_with("plate.add_") || command == "plate.auto_arrange" {
+            if self.session.sliced.is_none() {
+                self.view_mode = ViewMode::Prepare;
+            }
+            self.frame_camera(CameraPreset::Isometric);
+            self.status_message = format!("Updated plate via MCP ({command}).");
+        } else if (command == "slice.run" || command == "plate.analyze_printability")
+            && self.session.sliced.is_some()
+        {
+            let layers = self
+                .session
+                .sliced
+                .as_ref()
+                .map(|s| s.layers.len())
+                .unwrap_or(0);
+            self.max_layer = layers.saturating_sub(1);
+            self.view_mode = ViewMode::Preview;
+            self.status_message = format!("Sliced {layers} layers via MCP.");
+        } else {
+            self.status_message = format!("Updated via MCP ({command}).");
+        }
+
+        self.rebuild_scene();
     }
 
     /// Load a mesh from raw STL or 3MF bytes via `layercraft-engine` commands.
@@ -771,6 +894,24 @@ impl LayerCraftApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(ep) = &self.bridge_endpoint {
+                            let label = match &self.last_mcp_activity {
+                                Some(act) => format!("MCP: {act}"),
+                                None => "MCP Live".to_owned(),
+                            };
+                            ui.add_space(6.0);
+                            let badge = egui::Frame::new()
+                                .fill(p.bg_card)
+                                .stroke(Stroke::new(1.0, p.accent))
+                                .corner_radius(4.0)
+                                .inner_margin(Margin::symmetric(6, 1))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(label).size(10.5).color(p.accent));
+                                });
+                            badge
+                                .response
+                                .on_hover_text(format!("MCP Live Studio bridge listening at {ep}"));
+                        }
                         ui.label(
                             RichText::new(format!(
                                 "Bed {:.0}×{:.0}×{:.0} mm  ·  Drag: orbit · Shift+Drag: pan · Wheel: zoom · F: fit",
@@ -874,6 +1015,12 @@ impl LayerCraftApp {
 
     /// Run one frame of the LayerCraft UI inside `ui` (shared between live `eframe` and headless captures).
     pub fn render_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(mut poller) = self.external_poller.take() {
+            poller(self);
+            if self.external_poller.is_none() {
+                self.external_poller = Some(poller);
+            }
+        }
         if !self.styles_installed {
             theme::install_styles(ui.ctx());
             self.styles_installed = true;

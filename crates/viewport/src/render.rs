@@ -49,12 +49,36 @@ impl Default for RenderRequest {
     }
 }
 
+/// Result of comparing two equal-dimension PNG images pixel-by-pixel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PngDiffResult {
+    /// 3-panel horizontal RGB8 composite PNG (`width * 3` by `height`): A | B | Diff heatmap.
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub diff_pixels: usize,
+    pub total_pixels: usize,
+    pub diff_percent: f64,
+    pub mean_abs_diff: f64,
+}
+
 /// Render the current build plate, mesh, or sliced toolpaths into an RGB8 PNG byte vector.
 pub fn render_png(
     mesh: Option<&TriangleMesh>,
     plate: Option<&SlicedPlate>,
     config: &PrintConfig,
     req: &RenderRequest,
+) -> Result<Vec<u8>, ViewportError> {
+    render_png_with_camera(mesh, plate, config, req, None)
+}
+
+/// Render the plate/mesh/toolpaths using an optional explicit camera (falling back to preset).
+pub fn render_png_with_camera(
+    mesh: Option<&TriangleMesh>,
+    plate: Option<&SlicedPlate>,
+    config: &PrintConfig,
+    req: &RenderRequest,
+    custom_camera: Option<&OrbitCamera>,
 ) -> Result<Vec<u8>, ViewportError> {
     if req.width == 0 || req.height == 0 {
         return Err(ViewportError::InvalidDimensions {
@@ -90,9 +114,13 @@ pub fn render_png(
     let mut depth_buf = vec![1.0_f32; w * h];
     let bed_w = config.machine.bed_width_mm as f32;
     let bed_d = config.machine.bed_depth_mm as f32;
-    let cam = match mesh.and_then(TriangleMesh::aabb) {
-        Some(aabb) => OrbitCamera::framed_on_aabb(req.camera_preset, aabb, bed_w, bed_d),
-        None => OrbitCamera::from_preset(req.camera_preset, bed_w, bed_d, 20.0),
+    let cam = if let Some(custom) = custom_camera {
+        *custom
+    } else {
+        match mesh.and_then(TriangleMesh::aabb) {
+            Some(aabb) => OrbitCamera::framed_on_aabb(req.camera_preset, aabb, bed_w, bed_d),
+            None => OrbitCamera::from_preset(req.camera_preset, bed_w, bed_d, 20.0),
+        }
     };
     let vp = cam.view_proj((w as f32) / (h as f32));
 
@@ -385,4 +413,210 @@ fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, ViewportEr
             .map_err(|e| ViewportError::PngEncode(e.to_string()))?;
     }
     Ok(out)
+}
+
+fn decode_png_rgb(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), ViewportError> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| ViewportError::PngDecode(e.to_string()))?;
+    let buf_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| ViewportError::PngDecode("image buffer size overflow".to_owned()))?;
+    let mut raw = vec![0u8; buf_size];
+    let info = reader
+        .next_frame(&mut raw)
+        .map_err(|e| ViewportError::PngDecode(e.to_string()))?;
+    let data = raw
+        .get(..info.buffer_size())
+        .ok_or_else(|| ViewportError::PngDecode("truncated frame buffer".to_owned()))?;
+    let rgb = match info.color_type {
+        png::ColorType::Rgb => data.to_vec(),
+        png::ColorType::Rgba => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect(),
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g]).collect(),
+        png::ColorType::GrayscaleAlpha => data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[g, _]| [g, g, g])
+            .collect(),
+        other => {
+            return Err(ViewportError::PngDecode(format!(
+                "unsupported PNG color type: {other:?}"
+            )));
+        }
+    };
+    Ok((info.width, info.height, rgb))
+}
+
+/// Compare two equal-dimension PNGs and produce a 3-panel A | B | Diff composite PNG.
+pub fn compare_png(png_a: &[u8], png_b: &[u8]) -> Result<PngDiffResult, ViewportError> {
+    let (wa, ha, rgb_a) = decode_png_rgb(png_a)?;
+    let (wb, hb, rgb_b) = decode_png_rgb(png_b)?;
+    if wa == 0 || ha == 0 || wa != wb || ha != hb {
+        return Err(ViewportError::InvalidDimensions {
+            width: wb,
+            height: hb,
+        });
+    }
+
+    let w = wa as usize;
+    let h = ha as usize;
+    let total_pixels = w * h;
+    let panel_bytes = total_pixels * 3;
+    if rgb_a.len() < panel_bytes || rgb_b.len() < panel_bytes {
+        return Err(ViewportError::PngDecode(
+            "decoded RGB buffer smaller than dimensions".to_owned(),
+        ));
+    }
+
+    let out_w = w * 3;
+    let mut composite = vec![0u8; out_w * h * 3];
+    let mut diff_pixels = 0usize;
+    let mut sum_abs_diff = 0.0_f64;
+
+    for y in 0..h {
+        for x in 0..w {
+            let src_idx = (y * w + x) * 3;
+            let (Some(pa), Some(pb)) = (
+                rgb_a.get(src_idx..src_idx + 3),
+                rgb_b.get(src_idx..src_idx + 3),
+            ) else {
+                continue;
+            };
+            let ra = pa.first().copied().unwrap_or(0);
+            let ga = pa.get(1).copied().unwrap_or(0);
+            let ba = pa.get(2).copied().unwrap_or(0);
+            let rb = pb.first().copied().unwrap_or(0);
+            let gb = pb.get(1).copied().unwrap_or(0);
+            let bb = pb.get(2).copied().unwrap_or(0);
+
+            let dr = ra.abs_diff(rb);
+            let dg = ga.abs_diff(gb);
+            let db = ba.abs_diff(bb);
+            let max_d = dr.max(dg).max(db);
+            sum_abs_diff += f64::from(dr) + f64::from(dg) + f64::from(db);
+            if max_d > 4 {
+                diff_pixels += 1;
+            }
+
+            let left_col = if x + 1 == w {
+                [62, 70, 82]
+            } else {
+                [ra, ga, ba]
+            };
+            let mid_col = if x + 1 == w {
+                [62, 70, 82]
+            } else {
+                [rb, gb, bb]
+            };
+
+            let diff_col = if max_d > 4 {
+                let t = ((f32::from(max_d)) / 64.0).clamp(0.35, 1.0);
+                [
+                    (40.0 + 215.0 * t) as u8,
+                    (20.0 + 44.0 * (1.0 - t)) as u8,
+                    (60.0 + 140.0 * t) as u8,
+                ]
+            } else {
+                let luma = ((0.299 * f32::from(ra) + 0.587 * f32::from(ga) + 0.114 * f32::from(ba))
+                    * 0.30) as u8;
+                [luma, luma, luma]
+            };
+
+            let dst_a = (y * out_w + x) * 3;
+            let dst_b = (y * out_w + (w + x)) * 3;
+            let dst_d = (y * out_w + (w * 2 + x)) * 3;
+            if let Some(s) = composite.get_mut(dst_a..dst_a + 3) {
+                s.copy_from_slice(&left_col);
+            }
+            if let Some(s) = composite.get_mut(dst_b..dst_b + 3) {
+                s.copy_from_slice(&mid_col);
+            }
+            if let Some(s) = composite.get_mut(dst_d..dst_d + 3) {
+                s.copy_from_slice(&diff_col);
+            }
+        }
+    }
+
+    let png = encode_png((out_w) as u32, ha, &composite)?;
+    let denom = (total_pixels * 3).max(1) as f64;
+    Ok(PngDiffResult {
+        png,
+        width: out_w as u32,
+        height: ha,
+        diff_pixels,
+        total_pixels,
+        diff_percent: (diff_pixels as f64 / total_pixels.max(1) as f64) * 100.0,
+        mean_abs_diff: sum_abs_diff / denom,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use layercraft_geom::{Point3, Triangle};
+
+    fn test_cube_mesh() -> TriangleMesh {
+        let (x0, x1, y0, y1, z0, z1) = (115.0, 135.0, 115.0, 135.0, 0.0, 20.0);
+        let p000 = Point3::new(x0, y0, z0);
+        let p100 = Point3::new(x1, y0, z0);
+        let p110 = Point3::new(x1, y1, z0);
+        let p010 = Point3::new(x0, y1, z0);
+        let p001 = Point3::new(x0, y0, z1);
+        let p101 = Point3::new(x1, y0, z1);
+        let p111 = Point3::new(x1, y1, z1);
+        let p011 = Point3::new(x0, y1, z1);
+        TriangleMesh::new(vec![
+            Triangle::new(p000, p110, p100),
+            Triangle::new(p000, p010, p110),
+            Triangle::new(p001, p101, p111),
+            Triangle::new(p001, p111, p011),
+            Triangle::new(p000, p100, p101),
+            Triangle::new(p000, p101, p001),
+            Triangle::new(p010, p111, p110),
+            Triangle::new(p010, p011, p111),
+            Triangle::new(p000, p001, p011),
+            Triangle::new(p000, p011, p010),
+            Triangle::new(p100, p110, p111),
+            Triangle::new(p100, p111, p101),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn compare_png_reports_zero_diff_for_identical_and_detects_changes() {
+        let cfg = PrintConfig::default();
+        let mesh = test_cube_mesh();
+        let req_iso = RenderRequest {
+            width: 160,
+            height: 120,
+            mode: RenderMode::Plate,
+            camera_preset: CameraPreset::Isometric,
+            ..RenderRequest::default()
+        };
+        let req_top = RenderRequest {
+            camera_preset: CameraPreset::Top,
+            ..req_iso.clone()
+        };
+
+        let png_a = render_png(Some(&mesh), None, &cfg, &req_iso).unwrap();
+        let same = compare_png(&png_a, &png_a).unwrap();
+        assert_eq!(same.width, 480);
+        assert_eq!(same.height, 120);
+        assert_eq!(same.diff_pixels, 0);
+        assert!((same.diff_percent - 0.0).abs() < 1e-9);
+
+        let png_b = render_png(Some(&mesh), None, &cfg, &req_top).unwrap();
+        let diff = compare_png(&png_a, &png_b).unwrap();
+        assert!(diff.diff_pixels > 100);
+        assert!(diff.diff_percent > 0.5);
+        assert!(diff.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
 }

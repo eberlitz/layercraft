@@ -1338,6 +1338,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui-wgpu",
+ "layercraft-mcp",
  "layercraft-mesh",
  "layercraft-ui-egui",
  "layercraft-viewport-gpu",

@@ -8,7 +8,7 @@ use layercraft_config::{PrintConfig, ProfileKind, ProfileLibrary, ProfileSummary
 use layercraft_engine::{Session, command_registry, execute};
 use layercraft_gcode::{compare_layer_iou, emit_gcode, evaluate_gcode};
 use layercraft_io::read_mesh_file;
-use layercraft_mcp::McpServer;
+use layercraft_mcp::{McpConnectMode, McpServer};
 use layercraft_mesh::prepare_for_plate;
 use layercraft_slice::slice_single_mesh;
 use layercraft_viewport::{CameraPreset, ColorMode, RenderMode, RenderRequest, render_png};
@@ -106,7 +106,17 @@ enum Cmd {
         height: u32,
     },
     /// Run the LayerCraft MCP JSON-RPC 2.0 server over stdio.
-    Mcp,
+    Mcp {
+        /// Require connecting to an existing running LayerCraft Studio instance.
+        #[arg(long, conflicts_with = "standalone")]
+        connect: bool,
+        /// Always run an isolated headless session (do not connect to Studio).
+        #[arg(long, conflicts_with = "connect")]
+        standalone: bool,
+        /// Custom Studio IPC socket path (overrides LAYERCRAFT_SOCKET; implies --connect).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Print the JSON command registry with input/output schemas.
     Commands,
     /// Execute a JSON command script `[{"command": "...", "params": ...}, ...]`.
@@ -352,7 +362,20 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             Ok(())
         }
-        Cmd::Mcp => McpServer::default().serve_stdio(),
+        Cmd::Mcp {
+            connect,
+            standalone,
+            socket,
+        } => {
+            let mode = if standalone {
+                McpConnectMode::Standalone
+            } else if connect || socket.is_some() {
+                McpConnectMode::Connect
+            } else {
+                McpConnectMode::Auto
+            };
+            McpServer::new(mode, socket).serve_stdio()
+        }
         Cmd::Commands => {
             let reg = command_registry();
             let json = serde_json::to_string_pretty(&reg).map_err(|e| e.to_string())?;

@@ -13,7 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use render::{RenderMode, RenderRequest, render_png};
+pub use render::{
+    PngDiffResult, RenderMode, RenderRequest, compare_png, render_png, render_png_with_camera,
+};
 
 /// Viewport lighting & bed-plate palette theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,6 +32,8 @@ pub enum ViewportError {
     InvalidDimensions { width: u32, height: u32 },
     #[error("PNG encoding failed: {0}")]
     PngEncode(String),
+    #[error("PNG decoding failed: {0}")]
+    PngDecode(String),
 }
 
 /// Standard camera presets oriented around the build plate (Z-up).
