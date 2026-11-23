@@ -344,6 +344,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let mut current_accel_mm_s2: Option<f64> = None;
     let mut feature_stats: BTreeMap<String, FeatureStats> = BTreeMap::new();
     let mut current_role: Option<ExtrusionRole> = None;
+    let mut prev_role: Option<ExtrusionRole> = None;
     let mut prev_layer_seams: Vec<(f64, f64)> = Vec::new();
     let mut last_path_trail: Vec<(f64, f64)> = Vec::new();
 
@@ -440,7 +441,6 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             cur_z = layer.z_top_mm;
             false
         };
-        let mut prev_role: Option<ExtrusionRole> = None;
 
         let mut layer_state = LayerEmitState {
             out: &mut out,
@@ -3921,6 +3921,26 @@ mod tests {
         assert!(rep.safety.is_clean(), "{:?}", rep.safety);
     }
 
+    fn count_retract_events(gcode: &str) -> usize {
+        let mut events = 0usize;
+        let mut in_wipe = false;
+        for raw in gcode.lines() {
+            let s = raw.trim();
+            if s == ";WIPE_START" {
+                in_wipe = true;
+                events += 1;
+            } else if s == ";WIPE_END" {
+                in_wipe = false;
+            } else if !in_wipe
+                && (s.starts_with("G1 ") || s.starts_with("G0 "))
+                && s.contains(" E-")
+            {
+                events += 1;
+            }
+        }
+        events
+    }
+
     #[test]
     fn reduce_infill_retraction_cuts_gyroid_retractions_while_retracting_across_holes() {
         let mut base = PrintConfig::default();
@@ -3929,7 +3949,7 @@ mod tests {
         base.machine.z_hop_mm = 0.2;
         base.machine.wipe_on_retract = true;
         base.machine.wipe_distance_mm = 1.5;
-        base.process.sparse_infill_pattern = layercraft_config::InfillPattern::Grid;
+        base.process.sparse_infill_pattern = layercraft_config::InfillPattern::Cubic;
         base.process.sparse_infill_density = 0.20;
 
         let cube = make_box(20.0, 20.0, 6.0);
@@ -3942,14 +3962,8 @@ mod tests {
         let out_unred =
             emit_gcode(&slice_single_mesh(&cube, &unreduced).unwrap(), &unreduced).unwrap();
 
-        let count_retracts = |gcode: &str| {
-            gcode
-                .lines()
-                .filter(|l| l.starts_with("G1 ") && l.contains(" E-"))
-                .count()
-        };
-        let red_ret = count_retracts(&out_red.gcode);
-        let unred_ret = count_retracts(&out_unred.gcode);
+        let red_ret = count_retract_events(&out_red.gcode);
+        let unred_ret = count_retract_events(&out_unred.gcode);
         assert!(
             red_ret * 2 < unred_ret,
             "expected >50% retraction reduction: reduced={red_ret}, unreduced={unred_ret}"
@@ -3970,7 +3984,7 @@ mod tests {
         // Hollow tube still retracts across the central air hole.
         let tube = layercraft_testkit::make_hollow_cylinder(16.0, 8.0, 3.0, 48).unwrap();
         let out_tube = emit_gcode(&slice_single_mesh(&tube, &reduced).unwrap(), &reduced).unwrap();
-        let tube_retracts = count_retracts(&out_tube.gcode);
+        let tube_retracts = count_retract_events(&out_tube.gcode);
         assert!(
             tube_retracts > 5,
             "tube retractions too low: {tube_retracts}"
@@ -4075,10 +4089,32 @@ mod tests {
         )
         .unwrap();
         assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        let cube_retracts = count_retract_events(&out.gcode);
         assert!(
-            rep.total_travel_mm < 4200.0,
-            "expected travel < 4200 mm after chaining + post-seam ordering, got {:.1}",
+            rep.total_travel_mm < 2000.0 && cube_retracts < 120,
+            "expected cube travel < 2000 mm and retracts < 120, got travel={:.1} retracts={cube_retracts}",
             rep.total_travel_mm
+        );
+
+        let mut step_tris = make_box(30.0, 30.0, 6.0).triangles;
+        let mut top = make_box(16.0, 16.0, 10.0);
+        top.translate(7.0, 7.0, 6.0).unwrap();
+        step_tris.extend(top.triangles);
+        let stepped = layercraft_geom::TriangleMesh::new(step_tris).unwrap();
+        let out_step = emit_gcode(&slice_single_mesh(&stepped, &cfg).unwrap(), &cfg).unwrap();
+        let (rep_step, _) = evaluate_gcode(
+            &out_step.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep_step.safety.is_clean(), "{:?}", rep_step.safety);
+        let step_retracts = count_retract_events(&out_step.gcode);
+        assert!(
+            rep_step.total_travel_mm < 2400.0 && step_retracts < 120,
+            "expected stepped_block travel < 2400 mm and retracts < 120, got travel={:.1} retracts={step_retracts}",
+            rep_step.total_travel_mm
         );
     }
 

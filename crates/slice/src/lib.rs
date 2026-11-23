@@ -1023,7 +1023,7 @@ pub fn slice_from_raw_layers_with_modifiers(
         }
 
         // Order islands & infill paths to minimize cross-island & cross-layer non-extrusion travel.
-        paths = order_layer_paths_by_island(paths, effective_regions, &mut cursor_xy);
+        paths = order_layer_paths_by_island(idx, paths, effective_regions, &mut cursor_xy, config);
 
         let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
 
@@ -2625,15 +2625,42 @@ struct IslandPathBucket {
 }
 
 impl IslandPathBucket {
-    fn first_anchor_mm(&self) -> Option<(f64, f64)> {
-        self.walls
-            .first()
-            .or_else(|| self.surfaces.first())
-            .or_else(|| self.internal_solid.first())
-            .or_else(|| self.bridges.first())
-            .or_else(|| self.sparse.first())
-            .or_else(|| self.ironing.first())
-            .and_then(|p| path_start_end_mm(p).map(|(s, _)| s))
+    fn supports_infill_first(&self, layer_idx: usize, config: &PrintConfig) -> bool {
+        layer_idx > 0
+            && !layer_idx.is_multiple_of(2)
+            && config.process.wall_loops >= 2
+            && config.process.wall_order != WallOrder::OuterInner
+            && !self.sparse.is_empty()
+            && !self.walls.is_empty()
+            && self.surfaces.is_empty()
+            && self.bridges.is_empty()
+            && self.internal_solid.is_empty()
+            && self.ironing.is_empty()
+            && !self
+                .walls
+                .iter()
+                .any(|p| p.role == ExtrusionRole::OverhangWall)
+    }
+
+    fn first_anchor_mm(&self, infill_first: bool) -> Option<(f64, f64)> {
+        let first = if infill_first {
+            self.sparse
+                .first()
+                .or_else(|| self.walls.first())
+                .or_else(|| self.surfaces.first())
+                .or_else(|| self.internal_solid.first())
+                .or_else(|| self.bridges.first())
+                .or_else(|| self.ironing.first())
+        } else {
+            self.walls
+                .first()
+                .or_else(|| self.surfaces.first())
+                .or_else(|| self.internal_solid.first())
+                .or_else(|| self.bridges.first())
+                .or_else(|| self.sparse.first())
+                .or_else(|| self.ironing.first())
+        };
+        first.and_then(|p| path_start_end_mm(p).map(|(s, _)| s))
     }
 
     fn is_empty(&self) -> bool {
@@ -2646,10 +2673,25 @@ impl IslandPathBucket {
     }
 }
 
+fn append_ordered_bucket_group(
+    group: Vec<ExtrusionPath>,
+    cursor_xy: &mut (f64, f64),
+    out: &mut Vec<ExtrusionPath>,
+) {
+    for p in group {
+        if let Some((_, end)) = path_start_end_mm(&p) {
+            *cursor_xy = end;
+        }
+        out.push(p);
+    }
+}
+
 fn order_layer_paths_by_island(
+    layer_idx: usize,
     paths: Vec<ExtrusionPath>,
     slice_regions: &[ExPolygon],
     cursor_xy: &mut (f64, f64),
+    config: &PrintConfig,
 ) -> Vec<ExtrusionPath> {
     if paths.is_empty() {
         return paths;
@@ -2729,7 +2771,8 @@ fn order_layer_paths_by_island(
         let mut best_i = 0usize;
         let mut best_dist = f64::INFINITY;
         for (i, b) in remaining.iter().enumerate() {
-            if let Some(anchor) = b.first_anchor_mm() {
+            let infill_first = b.supports_infill_first(layer_idx, config);
+            if let Some(anchor) = b.first_anchor_mm(infill_first) {
                 let d = (anchor.0 - cursor_xy.0).hypot(anchor.1 - cursor_xy.1);
                 if d < best_dist {
                     best_dist = d;
@@ -2738,32 +2781,24 @@ fn order_layer_paths_by_island(
             }
         }
         let chosen = remaining.swap_remove(best_i);
-        for p in chosen.walls {
-            if let Some((_, end)) = path_start_end_mm(&p) {
-                *cursor_xy = end;
+        if chosen.supports_infill_first(layer_idx, config) {
+            if !chosen.sparse.is_empty() {
+                out.extend(greedy_order_paths(chosen.sparse, cursor_xy));
             }
-            out.push(p);
-        }
-        for p in chosen.surfaces {
-            if let Some((_, end)) = path_start_end_mm(&p) {
-                *cursor_xy = end;
+            append_ordered_bucket_group(chosen.walls, cursor_xy, &mut out);
+        } else {
+            append_ordered_bucket_group(chosen.walls, cursor_xy, &mut out);
+            append_ordered_bucket_group(chosen.surfaces, cursor_xy, &mut out);
+            if !chosen.internal_solid.is_empty() {
+                out.extend(greedy_order_paths(chosen.internal_solid, cursor_xy));
             }
-            out.push(p);
-        }
-        if !chosen.internal_solid.is_empty() {
-            out.extend(greedy_order_paths(chosen.internal_solid, cursor_xy));
-        }
-        if !chosen.bridges.is_empty() {
-            out.extend(greedy_order_paths(chosen.bridges, cursor_xy));
-        }
-        if !chosen.sparse.is_empty() {
-            out.extend(greedy_order_paths(chosen.sparse, cursor_xy));
-        }
-        for p in chosen.ironing {
-            if let Some((_, end)) = path_start_end_mm(&p) {
-                *cursor_xy = end;
+            if !chosen.bridges.is_empty() {
+                out.extend(greedy_order_paths(chosen.bridges, cursor_xy));
             }
-            out.push(p);
+            if !chosen.sparse.is_empty() {
+                out.extend(greedy_order_paths(chosen.sparse, cursor_xy));
+            }
+            append_ordered_bucket_group(chosen.ironing, cursor_xy, &mut out);
         }
     }
 
@@ -2860,32 +2895,326 @@ fn flush_hatch_pts(
     }
 }
 
-fn try_chain_hatch_segment(
-    current_pts: &mut Vec<Point2>,
-    mut a: Point2,
-    mut b: Point2,
-    max_link_mm: f64,
-    region: &[ExPolygon],
-    reorient_end: bool,
-) -> Option<(Point2, Point2)> {
-    let Some(&last_pt) = current_pts.last() else {
-        return Some((a, b));
+fn point_in_region(region: &[ExPolygon], p: Point2) -> bool {
+    region.iter().any(|ex| ex.contains_point(p))
+}
+
+struct HatchSeg {
+    row: i64,
+    u0: f64,
+    u1: f64,
+    u_mid: f64,
+    v_mid: f64,
+    pa: Point2,
+    pb: Point2,
+}
+
+fn unlock_hatch_dependents(
+    chosen: usize,
+    deps: &[Vec<usize>],
+    in_deg: &mut [usize],
+    ready: &mut Vec<usize>,
+) {
+    let Some(nexts) = deps.get(chosen) else {
+        return;
     };
-    if reorient_end && last_pt.distance_mm(b) < last_pt.distance_mm(a) {
-        std::mem::swap(&mut a, &mut b);
-    }
-    let dist = last_pt.distance_mm(a);
-    let mid = Point2::new((last_pt.x + a.x) / 2, (last_pt.y + a.y) / 2);
-    let inside = region.iter().any(|ex| ex.contains_point(mid));
-    if dist <= max_link_mm && inside {
-        if a != last_pt {
-            current_pts.push(a);
+    for &nxt in nexts {
+        if let Some(deg) = in_deg.get_mut(nxt)
+            && *deg > 0
+        {
+            *deg -= 1;
+            if *deg == 0 {
+                ready.push(nxt);
+            }
         }
-        current_pts.push(b);
-        None
-    } else {
-        Some((a, b))
     }
+}
+
+fn build_monotonic_hatch_deps(
+    segs: &[HatchSeg],
+    row_runs: &[(i64, usize, usize)],
+    spacing_mm: f64,
+    cos_a: f64,
+    sin_a: f64,
+    chain_region: &[ExPolygon],
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let n = segs.len();
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_deg: Vec<usize> = vec![0; n];
+    for w in row_runs.windows(2) {
+        let (Some(&(r0, s0, e0)), Some(&(r1, s1, e1))) = (w.first(), w.get(1)) else {
+            continue;
+        };
+        if r1 != r0 + 1 {
+            continue;
+        }
+        for i in s0..e0 {
+            let Some(si) = segs.get(i) else {
+                continue;
+            };
+            for j in s1..e1 {
+                let Some(sj) = segs.get(j) else {
+                    continue;
+                };
+                let u_lo = si.u0.max(sj.u0);
+                let u_hi = si.u1.min(sj.u1);
+                if u_hi < u_lo - 0.5 * spacing_mm {
+                    continue;
+                }
+                let v_test = 0.5 * (si.v_mid + sj.v_mid);
+                let connected = if u_hi >= u_lo {
+                    let span = u_hi - u_lo;
+                    [u_lo + 0.25 * span, 0.5 * (u_lo + u_hi), u_lo + 0.75 * span]
+                        .into_iter()
+                        .any(|u_t| {
+                            let x = u_t * cos_a - v_test * sin_a;
+                            let y = u_t * sin_a + v_test * cos_a;
+                            Point2::from_mm(x, y).is_ok_and(|pt| point_in_region(chain_region, pt))
+                        })
+                } else {
+                    let u_t = 0.5 * (u_lo + u_hi);
+                    let x = u_t * cos_a - v_test * sin_a;
+                    let y = u_t * sin_a + v_test * cos_a;
+                    Point2::from_mm(x, y).is_ok_and(|pt| point_in_region(chain_region, pt))
+                };
+                if connected {
+                    if let Some(list) = deps.get_mut(i) {
+                        list.push(j);
+                    }
+                    if let Some(deg) = in_deg.get_mut(j) {
+                        *deg += 1;
+                    }
+                }
+            }
+        }
+    }
+    (deps, in_deg)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_hatch_monotonic(
+    segs: &[HatchSeg],
+    row_runs: &[(i64, usize, usize)],
+    spacing_mm: f64,
+    cos_a: f64,
+    sin_a: f64,
+    max_link_mm: f64,
+    chain_region: &[ExPolygon],
+    check_endpoints: bool,
+    role: ExtrusionRole,
+    width_mm: f64,
+    height_mm: f64,
+    speed_mm_s: f64,
+    flow_ratio: f64,
+) -> Vec<ExtrusionPath> {
+    let n = segs.len();
+    let (deps, mut in_deg) =
+        build_monotonic_hatch_deps(segs, row_runs, spacing_mm, cos_a, sin_a, chain_region);
+    let mut ready: Vec<usize> = (0..n)
+        .filter(|&i| in_deg.get(i).copied() == Some(0))
+        .collect();
+    let mut paths: Vec<ExtrusionPath> = Vec::new();
+    let mut current_pts: Vec<Point2> = Vec::new();
+
+    while !ready.is_empty() {
+        if let Some(&last_pt) = current_pts.last() {
+            let mut best_chain: Option<(usize, Point2, Point2, f64)> = None;
+            let mut best_jump: Option<(usize, Point2, Point2, f64, i64)> = None;
+            for (pos, &cand_idx) in ready.iter().enumerate() {
+                let Some(seg) = segs.get(cand_idx) else {
+                    continue;
+                };
+                for (entry_pt, exit_pt) in [(seg.pa, seg.pb), (seg.pb, seg.pa)] {
+                    let d = last_pt.distance_mm(entry_pt);
+                    let better_jump = best_jump.is_none_or(|(_, _, _, bd, br)| {
+                        d < bd - 1e-6 || ((d - bd).abs() <= 1e-6 && seg.row < br)
+                    });
+                    if better_jump {
+                        best_jump = Some((pos, entry_pt, exit_pt, d, seg.row));
+                    }
+                    if d <= max_link_mm
+                        && best_chain.is_none_or(|(_, _, _, bd)| d < bd)
+                        && segment_inside_same_region(
+                            chain_region,
+                            last_pt,
+                            entry_pt,
+                            check_endpoints,
+                        )
+                    {
+                        best_chain = Some((pos, entry_pt, exit_pt, d));
+                    }
+                }
+            }
+            if let Some((pos, entry_pt, exit_pt, _)) = best_chain {
+                let chosen = ready.remove(pos);
+                if entry_pt != last_pt {
+                    current_pts.push(entry_pt);
+                }
+                current_pts.push(exit_pt);
+                unlock_hatch_dependents(chosen, &deps, &mut in_deg, &mut ready);
+            } else {
+                flush_hatch_pts(
+                    &mut current_pts,
+                    role,
+                    width_mm,
+                    height_mm,
+                    speed_mm_s,
+                    flow_ratio,
+                    &mut paths,
+                );
+                if let Some((pos, entry_pt, exit_pt, _, _)) = best_jump {
+                    let chosen = ready.remove(pos);
+                    current_pts = vec![entry_pt, exit_pt];
+                    unlock_hatch_dependents(chosen, &deps, &mut in_deg, &mut ready);
+                } else {
+                    let chosen = ready.remove(0);
+                    unlock_hatch_dependents(chosen, &deps, &mut in_deg, &mut ready);
+                }
+            }
+        } else {
+            let chosen = ready.remove(0);
+            if let Some(seg) = segs.get(chosen) {
+                current_pts = vec![seg.pa, seg.pb];
+            }
+            unlock_hatch_dependents(chosen, &deps, &mut in_deg, &mut ready);
+        }
+    }
+
+    flush_hatch_pts(
+        &mut current_pts,
+        role,
+        width_mm,
+        height_mm,
+        speed_mm_s,
+        flow_ratio,
+        &mut paths,
+    );
+    paths
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_hatch_strip(
+    segs: &[HatchSeg],
+    row_runs: &[(i64, usize, usize)],
+    seg_run_idx: &[usize],
+    max_link_mm: f64,
+    chain_region: &[ExPolygon],
+    check_endpoints: bool,
+    role: ExtrusionRole,
+    width_mm: f64,
+    height_mm: f64,
+    speed_mm_s: f64,
+    flow_ratio: f64,
+) -> Vec<ExtrusionPath> {
+    let n = segs.len();
+    let Some(seg0) = segs.first() else {
+        return Vec::new();
+    };
+    let mut visited = vec![false; n];
+    if let Some(v0) = visited.first_mut() {
+        *v0 = true;
+    }
+    let mut remaining = n - 1;
+    let mut next_unvisited = 1usize;
+    let mut cur_run_idx = seg_run_idx.first().copied().unwrap_or(0);
+    let mut paths: Vec<ExtrusionPath> = Vec::new();
+    let mut current_pts: Vec<Point2> = vec![seg0.pa, seg0.pb];
+
+    while remaining > 0 {
+        let Some(&last_pt) = current_pts.last() else {
+            break;
+        };
+        let run_lo = cur_run_idx.saturating_sub(2);
+        let run_hi = (cur_run_idx + 2).min(row_runs.len().saturating_sub(1));
+        let mut best_chain: Option<(usize, Point2, Point2, f64)> = None;
+        for run_idx in run_lo..=run_hi {
+            let Some(&(_, s, e)) = row_runs.get(run_idx) else {
+                continue;
+            };
+            for cand_idx in s..e {
+                if visited.get(cand_idx).copied().unwrap_or(true) {
+                    continue;
+                }
+                let Some(seg) = segs.get(cand_idx) else {
+                    continue;
+                };
+                for (entry_pt, exit_pt) in [(seg.pa, seg.pb), (seg.pb, seg.pa)] {
+                    let d = last_pt.distance_mm(entry_pt);
+                    if d <= max_link_mm
+                        && best_chain.is_none_or(|(_, _, _, bd)| d < bd)
+                        && segment_inside_same_region(
+                            chain_region,
+                            last_pt,
+                            entry_pt,
+                            check_endpoints,
+                        )
+                    {
+                        best_chain = Some((cand_idx, entry_pt, exit_pt, d));
+                    }
+                }
+            }
+        }
+
+        if let Some((chosen, entry_pt, exit_pt, _)) = best_chain {
+            if let Some(v) = visited.get_mut(chosen) {
+                *v = true;
+            }
+            remaining -= 1;
+            cur_run_idx = seg_run_idx.get(chosen).copied().unwrap_or(cur_run_idx);
+            if entry_pt != last_pt {
+                current_pts.push(entry_pt);
+            }
+            current_pts.push(exit_pt);
+        } else {
+            flush_hatch_pts(
+                &mut current_pts,
+                role,
+                width_mm,
+                height_mm,
+                speed_mm_s,
+                flow_ratio,
+                &mut paths,
+            );
+            while next_unvisited < n && visited.get(next_unvisited).copied().unwrap_or(true) {
+                next_unvisited += 1;
+            }
+            let mut best_jump: Option<(usize, Point2, Point2, f64)> = None;
+            for cand_idx in next_unvisited..n {
+                if visited.get(cand_idx).copied().unwrap_or(true) {
+                    continue;
+                }
+                let Some(seg) = segs.get(cand_idx) else {
+                    continue;
+                };
+                for (entry_pt, exit_pt) in [(seg.pa, seg.pb), (seg.pb, seg.pa)] {
+                    let d = last_pt.distance_mm(entry_pt);
+                    if best_jump.is_none_or(|(_, _, _, bd)| d < bd) {
+                        best_jump = Some((cand_idx, entry_pt, exit_pt, d));
+                    }
+                }
+            }
+            let Some((chosen, entry_pt, exit_pt, _)) = best_jump else {
+                break;
+            };
+            if let Some(v) = visited.get_mut(chosen) {
+                *v = true;
+            }
+            remaining -= 1;
+            cur_run_idx = seg_run_idx.get(chosen).copied().unwrap_or(0);
+            current_pts = vec![entry_pt, exit_pt];
+        }
+    }
+
+    flush_hatch_pts(
+        &mut current_pts,
+        role,
+        width_mm,
+        height_mm,
+        speed_mm_s,
+        flow_ratio,
+        &mut paths,
+    );
+    paths
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2961,7 +3290,7 @@ pub(crate) fn generate_rectilinear_hatch(
     }
 
     let min_seg_mm = (0.2 * width_mm).min(0.08);
-    let mut tagged: Vec<(i64, f64, Point2, Point2)> = Vec::with_capacity(clipped.len());
+    let mut segs: Vec<HatchSeg> = Vec::with_capacity(clipped.len());
     for seg in clipped {
         let (Some(&p0), Some(&p1)) = (seg.first(), seg.last()) else {
             continue;
@@ -2977,104 +3306,89 @@ pub(crate) fn generate_rectilinear_hatch(
 
         let u0_p = x0 * cos_a + y0 * sin_a;
         let u1_p = x1 * cos_a + y1 * sin_a;
-        let (pa, pb) = if u1_p < u0_p { (p1, p0) } else { (p0, p1) };
-        tagged.push((row, u_mid, pa, pb));
+        let (pa, pb, u0_s, u1_s) = if u1_p < u0_p {
+            (p1, p0, u1_p, u0_p)
+        } else {
+            (p0, p1, u0_p, u1_p)
+        };
+        segs.push(HatchSeg {
+            row,
+            u0: u0_s,
+            u1: u1_s,
+            u_mid,
+            v_mid,
+            pa,
+            pb,
+        });
     }
-    tagged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+    if segs.is_empty() {
+        return Ok(Vec::new());
+    }
+    segs.sort_by(|a, b| a.row.cmp(&b.row).then_with(|| a.u_mid.total_cmp(&b.u_mid)));
 
-    let max_link_mm = (2.5 * spacing_mm).max(2.0 * width_mm);
-    let mut paths: Vec<ExtrusionPath> = Vec::new();
-    let mut current_pts: Vec<Point2> = Vec::new();
-    let mut flip_dir = false;
+    let chain_region_owned = match offset(region, mm_to_nm(0.02)?, JoinType::Miter { limit: 2.0 }) {
+        Ok(expanded) if !expanded.is_empty() => Some(expanded),
+        _ => None,
+    };
+    let chain_region: &[ExPolygon] = chain_region_owned.as_deref().unwrap_or(region);
+    let check_endpoints = chain_region_owned.is_some();
 
-    if monotonic {
-        for row_segs in tagged.chunk_by(|a, b| a.0 == b.0) {
-            flip_dir = !flip_dir;
-            if row_segs.len() > 1 {
-                flush_hatch_pts(
-                    &mut current_pts,
-                    role,
-                    width_mm,
-                    height_mm,
-                    speed_mm_s,
-                    flow_ratio,
-                    &mut paths,
-                );
-                let mut ordered: Vec<(Point2, Point2)> =
-                    row_segs.iter().map(|t| (t.2, t.3)).collect();
-                if flip_dir {
-                    ordered.reverse();
-                }
-                for (mut a, mut b) in ordered {
-                    if flip_dir {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    let mut single = vec![a, b];
-                    flush_hatch_pts(
-                        &mut single,
-                        role,
-                        width_mm,
-                        height_mm,
-                        speed_mm_s,
-                        flow_ratio,
-                        &mut paths,
-                    );
-                }
-            } else if let Some(&(_, _, mut a, mut b)) = row_segs.first() {
-                if flip_dir {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                if let Some((na, nb)) =
-                    try_chain_hatch_segment(&mut current_pts, a, b, max_link_mm, region, false)
-                {
-                    flush_hatch_pts(
-                        &mut current_pts,
-                        role,
-                        width_mm,
-                        height_mm,
-                        speed_mm_s,
-                        flow_ratio,
-                        &mut paths,
-                    );
-                    current_pts = vec![na, nb];
-                }
-            }
-        }
+    let max_link_mm = if spacing_mm <= 2.0 * width_mm {
+        (3.0 * spacing_mm).max(2.5 * width_mm)
     } else {
-        for (i, &(_, _, mut a, mut b)) in tagged.iter().enumerate() {
-            let prev_row = i.checked_sub(1).and_then(|j| tagged.get(j)).map(|t| t.0);
-            if prev_row != Some(tagged.get(i).map(|t| t.0).unwrap_or(0)) {
-                flip_dir = !flip_dir;
+        (2.5 * spacing_mm).max(2.0 * width_mm)
+    };
+
+    let n = segs.len();
+    let mut row_runs: Vec<(i64, usize, usize)> = Vec::new();
+    let mut seg_run_idx: Vec<usize> = vec![0; n];
+    let mut idx = 0usize;
+    while let Some(first_seg) = segs.get(idx) {
+        let row = first_seg.row;
+        let start = idx;
+        let run_i = row_runs.len();
+        while let Some(cur) = segs.get(idx)
+            && cur.row == row
+        {
+            if let Some(slot) = seg_run_idx.get_mut(idx) {
+                *slot = run_i;
             }
-            if flip_dir {
-                std::mem::swap(&mut a, &mut b);
-            }
-            if let Some((na, nb)) =
-                try_chain_hatch_segment(&mut current_pts, a, b, max_link_mm, region, true)
-            {
-                flush_hatch_pts(
-                    &mut current_pts,
-                    role,
-                    width_mm,
-                    height_mm,
-                    speed_mm_s,
-                    flow_ratio,
-                    &mut paths,
-                );
-                current_pts = vec![na, nb];
-            }
+            idx += 1;
         }
+        row_runs.push((row, start, idx));
     }
 
-    flush_hatch_pts(
-        &mut current_pts,
-        role,
-        width_mm,
-        height_mm,
-        speed_mm_s,
-        flow_ratio,
-        &mut paths,
-    );
+    let paths = if monotonic {
+        chain_hatch_monotonic(
+            &segs,
+            &row_runs,
+            spacing_mm,
+            cos_a,
+            sin_a,
+            max_link_mm,
+            chain_region,
+            check_endpoints,
+            role,
+            width_mm,
+            height_mm,
+            speed_mm_s,
+            flow_ratio,
+        )
+    } else {
+        chain_hatch_strip(
+            &segs,
+            &row_runs,
+            &seg_run_idx,
+            max_link_mm,
+            chain_region,
+            check_endpoints,
+            role,
+            width_mm,
+            height_mm,
+            speed_mm_s,
+            flow_ratio,
+        )
+    };
 
     Ok(paths)
 }
@@ -3418,12 +3732,26 @@ mod tests {
             1.0,
         )
         .unwrap();
-        assert!(paths.len() > 2);
+        assert!(
+            !paths.is_empty() && paths.len() <= 4,
+            "expected holed monotonic region to chain into <=4 paths, got {}",
+            paths.len()
+        );
+
+        struct EmittedRow {
+            order: usize,
+            row: i64,
+            u0: f64,
+            u1: f64,
+            v_mid: f64,
+        }
 
         let sin_a = angle.sin();
         let cos_a = angle.cos();
-        let mut last_row = i64::MIN;
+        let mut emitted = Vec::new();
+        let mut order_idx = 0usize;
         for p in &paths {
+            let mut prev_row_in_path = i64::MIN;
             for seg in p.points.windows(2) {
                 let (x0, y0) = seg[0].to_mm();
                 let (x1, y1) = seg[1].to_mm();
@@ -3433,13 +3761,92 @@ mod tests {
                     let v_mid = -0.5 * (x0 + x1) * sin_a + 0.5 * (y0 + y1) * cos_a;
                     let row = (v_mid / spacing).round() as i64;
                     assert!(
-                        row >= last_row,
-                        "monotonic order regressed from row {last_row} to {row}"
+                        row >= prev_row_in_path,
+                        "within path monotonic order regressed from row {prev_row_in_path} to {row}"
                     );
-                    last_row = row;
+                    prev_row_in_path = row;
+                    let ua = x0 * cos_a + y0 * sin_a;
+                    let ub = x1 * cos_a + y1 * sin_a;
+                    emitted.push(EmittedRow {
+                        order: order_idx,
+                        row,
+                        u0: ua.min(ub),
+                        u1: ua.max(ub),
+                        v_mid,
+                    });
+                    order_idx += 1;
                 }
             }
         }
+        assert!(order_idx > 10);
+
+        for a in &emitted {
+            for b in &emitted {
+                if b.row != a.row + 1 {
+                    continue;
+                }
+                let u_lo = a.u0.max(b.u0);
+                let u_hi = a.u1.min(b.u1);
+                if u_hi < u_lo {
+                    continue;
+                }
+                let v_test = 0.5 * (a.v_mid + b.v_mid);
+                let span = u_hi - u_lo;
+                let connected = [u_lo + 0.25 * span, 0.5 * (u_lo + u_hi), u_lo + 0.75 * span]
+                    .into_iter()
+                    .any(|u_t| {
+                        let x = u_t * cos_a - v_test * sin_a;
+                        let y = u_t * sin_a + v_test * cos_a;
+                        point_in_region(&region, Point2::from_mm(x, y).unwrap())
+                    });
+                if connected {
+                    assert!(
+                        a.order < b.order,
+                        "monotonic dependency violated: row {} (order {}) printed after row {} (order {})",
+                        a.row,
+                        a.order,
+                        b.row,
+                        b.order
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alternating_infill_first_reorders_odd_interior_layers_only() {
+        let mesh = make_box_mesh(20.0, 20.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_loops = 2;
+        cfg.process.bottom_shell_layers = 3;
+        cfg.process.top_shell_layers = 3;
+        cfg.process.sparse_infill_density = 0.20;
+        cfg.process.wall_order = WallOrder::InnerOuter;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        assert_eq!(plate.layers[0].paths[0].role, ExtrusionRole::InnerWall);
+        // Even interior sparse layer (idx = 6): walls before sparse infill.
+        assert!(matches!(
+            plate.layers[6].paths[0].role,
+            ExtrusionRole::InnerWall | ExtrusionRole::OuterWall
+        ));
+        // Odd interior sparse layer (idx = 7): sparse infill before walls.
+        assert_eq!(plate.layers[7].paths[0].role, ExtrusionRole::SparseInfill);
+        let wall_pos = plate.layers[7]
+            .paths
+            .iter()
+            .position(|p| matches!(p.role, ExtrusionRole::InnerWall | ExtrusionRole::OuterWall))
+            .unwrap();
+        assert!(wall_pos > 0);
+
+        // OuterInner wall order never reorders infill ahead of walls.
+        let mut outer_first_cfg = cfg;
+        outer_first_cfg.process.wall_order = WallOrder::OuterInner;
+        let plate_outer = slice_single_mesh(&mesh, &outer_first_cfg).unwrap();
+        assert_eq!(
+            plate_outer.layers[7].paths[0].role,
+            ExtrusionRole::OuterWall
+        );
     }
 
     fn make_c_bracket_mesh(
