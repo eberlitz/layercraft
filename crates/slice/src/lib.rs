@@ -53,6 +53,7 @@ pub enum ExtrusionRole {
     Ironing,
     InternalSolidInfill,
     Bridge,
+    InternalBridge,
     SparseInfill,
     Support,
     SupportInterface,
@@ -72,6 +73,7 @@ impl ExtrusionRole {
             Self::Ironing => "Ironing",
             Self::InternalSolidInfill => "Internal solid infill",
             Self::Bridge => "Bridge",
+            Self::InternalBridge => "Internal Bridge",
             Self::SparseInfill => "Sparse infill",
             Self::Support => "Support",
             Self::SupportInterface => "Support interface",
@@ -589,6 +591,7 @@ pub fn slice_from_raw_layers_with_modifiers(
     }
 
     let mut cursor_xy = (0.0_f64, 0.0_f64);
+    let mut prev_sparse_region: Vec<ExPolygon> = Vec::new();
     let mut layers = Vec::with_capacity(n);
     for idx in 0..n {
         let Some(raw) = comp_layers.get(idx) else {
@@ -819,6 +822,54 @@ pub fn slice_from_raw_layers_with_modifiers(
             }
         }
 
+        // Detect internal bridges: the first solid layer directly bridging over sparse/hollow infill.
+        if idx > 0
+            && config.process.detect_bridges
+            && !internal_solid.is_empty()
+            && !prev_sparse_region.is_empty()
+        {
+            let raw_ib = intersection(&internal_solid, &prev_sparse_region)?;
+            if !raw_ib.is_empty() {
+                let anchor_mm = 2.0 * solid_w;
+                let expanded_ib = offset(
+                    &raw_ib,
+                    mm_to_nm(anchor_mm)?,
+                    JoinType::Miter { limit: 2.0 },
+                )?;
+                let anchored_ib = intersection(&internal_solid, &expanded_ib)?;
+                if !anchored_ib.is_empty() {
+                    internal_solid = difference(&internal_solid, &anchored_ib)?;
+                    for ib_poly in &anchored_ib {
+                        let ib_angle = ib_poly
+                            .aabb()
+                            .map(|bb| {
+                                let (x0, y0) = bb.min.to_mm();
+                                let (x1, y1) = bb.max.to_mm();
+                                if (x1 - x0) <= (y1 - y0) {
+                                    0.0
+                                } else {
+                                    FRAC_PI_2
+                                }
+                            })
+                            .unwrap_or(0.0);
+                        let hatched = generate_rectilinear_hatch(
+                            std::slice::from_ref(ib_poly),
+                            ib_angle,
+                            solid_spacing,
+                            0.0,
+                            false,
+                            ExtrusionRole::InternalBridge,
+                            solid_w,
+                            h,
+                            config.process.bridge_speed_mm_s,
+                            config.process.bridge_flow_ratio,
+                        )?;
+                        bridge_paths.extend(hatched);
+                    }
+                }
+            }
+        }
+
         // Emit solid infill, exposed top/bottom surfaces (concentric, monotonic, or rectilinear), & bridges.
         let bottom_pat = config.process.effective_bottom_surface_pattern();
         let top_pat = config.process.effective_top_surface_pattern();
@@ -873,6 +924,7 @@ pub fn slice_from_raw_layers_with_modifiers(
         paths.extend(bridge_paths);
 
         // Stage 4: Sparse infill (partitioned across active modifier volumes when present).
+        let mut next_prev_sparse: Vec<ExPolygon> = Vec::new();
         if !sparse_region.is_empty() {
             let sparse_w = config.process.sparse_infill_width_mm;
             let active_infill = sliced_mods.active_param_mods(idx, |ov| {
@@ -882,7 +934,13 @@ pub fn slice_from_raw_layers_with_modifiers(
             });
             let infill_buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
             for (sub_sparse, b_params) in infill_buckets {
-                if sub_sparse.is_empty() || b_params.sparse_infill_density <= 1e-6 {
+                if sub_sparse.is_empty() {
+                    continue;
+                }
+                if b_params.sparse_infill_density < 0.99 {
+                    next_prev_sparse.extend(sub_sparse.iter().cloned());
+                }
+                if b_params.sparse_infill_density <= 1e-6 {
                     continue;
                 }
                 let speed = if is_first
@@ -905,6 +963,11 @@ pub fn slice_from_raw_layers_with_modifiers(
                 paths.extend(hatched);
             }
         }
+        prev_sparse_region = if next_prev_sparse.is_empty() {
+            Vec::new()
+        } else {
+            union_if_multi(next_prev_sparse)?
+        };
 
         // Stage 6 (Optional): Top-surface ironing pass (global, height-range, or modifier-local).
         let iron = &config.process.ironing;
@@ -978,6 +1041,7 @@ pub fn slice_from_raw_layers_with_modifiers(
     Ok(SlicedPlate { layers })
 }
 
+#[cfg(test)]
 fn path_length_mm(path: &ExtrusionPath) -> f64 {
     let mut len = 0.0;
     for pair in path.points.windows(2) {
@@ -993,6 +1057,240 @@ fn path_length_mm(path: &ExtrusionPath) -> f64 {
     len
 }
 
+/// Fallback extrusion acceleration (mm/s^2) when config leaves accelerations unset.
+pub const DEFAULT_EXTRUSION_ACCEL_MM_S2: f64 = 3000.0;
+/// Fallback travel acceleration (mm/s^2) when config leaves travel/default acceleration unset.
+pub const DEFAULT_TRAVEL_ACCEL_MM_S2: f64 = 5000.0;
+/// Conservative Z-axis acceleration (mm/s^2) used for layer changes and Z-hops.
+pub const DEFAULT_Z_ACCEL_MM_S2: f64 = 500.0;
+/// Classical junction-deviation cornering tolerance (mm).
+pub const DEFAULT_JUNCTION_DEVIATION_MM: f64 = 0.05;
+
+/// Effective XY acceleration (mm/s^2) for extruding `role` on `layer_idx`.
+pub fn effective_role_accel_mm_s2(
+    layer_idx: usize,
+    role: ExtrusionRole,
+    config: &PrintConfig,
+) -> f64 {
+    let raw = if layer_idx == 0 {
+        config
+            .process
+            .first_layer_acceleration_mm_s2
+            .or(config.process.default_acceleration_mm_s2)
+    } else {
+        match role {
+            ExtrusionRole::OuterWall | ExtrusionRole::OverhangWall => config
+                .process
+                .outer_wall_acceleration_mm_s2
+                .or(config.process.default_acceleration_mm_s2),
+            ExtrusionRole::InnerWall => config
+                .process
+                .inner_wall_acceleration_mm_s2
+                .or(config.process.default_acceleration_mm_s2),
+            _ => config.process.default_acceleration_mm_s2,
+        }
+    };
+    raw.unwrap_or(DEFAULT_EXTRUSION_ACCEL_MM_S2).max(10.0)
+}
+
+/// Effective XY travel acceleration (mm/s^2).
+pub fn effective_travel_accel_mm_s2(config: &PrintConfig) -> f64 {
+    config
+        .process
+        .travel_acceleration_mm_s2
+        .or(config.process.default_acceleration_mm_s2)
+        .unwrap_or(DEFAULT_TRAVEL_ACCEL_MM_S2)
+        .max(10.0)
+}
+
+/// Estimate rest-to-rest 1D trapezoidal (or triangular) move duration in seconds.
+pub fn estimate_trapezoid_move_time_s(
+    dist_mm: f64,
+    cruise_speed_mm_s: f64,
+    accel_mm_s2: f64,
+) -> f64 {
+    if !dist_mm.is_finite()
+        || dist_mm <= 1e-9
+        || !cruise_speed_mm_s.is_finite()
+        || cruise_speed_mm_s <= 1e-9
+    {
+        return 0.0;
+    }
+    if !accel_mm_s2.is_finite() || accel_mm_s2 <= 1e-9 {
+        return dist_mm / cruise_speed_mm_s;
+    }
+    let d_ramp = (cruise_speed_mm_s * cruise_speed_mm_s) / accel_mm_s2;
+    if dist_mm >= d_ramp {
+        dist_mm / cruise_speed_mm_s + cruise_speed_mm_s / accel_mm_s2
+    } else {
+        2.0 * (dist_mm / accel_mm_s2).sqrt()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KinSeg {
+    len: f64,
+    ux: f64,
+    uy: f64,
+    v: f64,
+}
+
+/// Estimate polyline duration (s) with junction-deviation cornering and forward/backward lookahead.
+pub fn estimate_polyline_kinematic_time_s(
+    pts_mm: &[(f64, f64)],
+    seg_speeds_mm_s: &[f64],
+    accel_mm_s2: f64,
+    junction_dev_mm: f64,
+) -> f64 {
+    if pts_mm.len() < 2 || seg_speeds_mm_s.is_empty() {
+        return 0.0;
+    }
+    let seg_count = pts_mm.len().saturating_sub(1).min(seg_speeds_mm_s.len());
+    let mut segs: Vec<KinSeg> = Vec::with_capacity(seg_count);
+    for i in 0..seg_count {
+        let (Some(&a), Some(&b), Some(&spd_raw)) =
+            (pts_mm.get(i), pts_mm.get(i + 1), seg_speeds_mm_s.get(i))
+        else {
+            continue;
+        };
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        let len = dx.hypot(dy);
+        if len <= 1e-9 || !len.is_finite() {
+            continue;
+        }
+        let v = if spd_raw.is_finite() && spd_raw > 1e-6 {
+            spd_raw
+        } else {
+            1e-3
+        };
+        segs.push(KinSeg {
+            len,
+            ux: dx / len,
+            uy: dy / len,
+            v,
+        });
+    }
+    let m = segs.len();
+    if m == 0 {
+        return 0.0;
+    }
+    if !accel_mm_s2.is_finite() || accel_mm_s2 <= 1e-9 {
+        return segs.iter().map(|s| s.len / s.v).sum();
+    }
+
+    let a = accel_mm_s2;
+    let mut v_junc = vec![0.0_f64; m + 1];
+    for k in 1..m {
+        let (Some(&prev_s), Some(&cur_s)) = (segs.get(k - 1), segs.get(k)) else {
+            continue;
+        };
+        let cos_phi = (prev_s.ux * cur_s.ux + prev_s.uy * cur_s.uy).clamp(-1.0, 1.0);
+        let sin_half_alpha = (0.5 * (1.0 + cos_phi)).max(0.0).sqrt();
+        let v_cap = prev_s.v.min(cur_s.v);
+        let v_c = if sin_half_alpha >= 0.9999 {
+            v_cap
+        } else if sin_half_alpha <= 1e-4 || junction_dev_mm <= 1e-9 {
+            0.0
+        } else {
+            ((a * junction_dev_mm * sin_half_alpha) / (1.0 - sin_half_alpha))
+                .sqrt()
+                .min(v_cap)
+        };
+        if let Some(slot) = v_junc.get_mut(k) {
+            *slot = v_c;
+        }
+    }
+
+    for i in 0..m {
+        let Some(seg) = segs.get(i) else {
+            continue;
+        };
+        let v0 = v_junc.get(i).copied().unwrap_or(0.0);
+        let reachable = (v0 * v0 + 2.0 * a * seg.len).max(0.0).sqrt();
+        if let Some(next_slot) = v_junc.get_mut(i + 1) {
+            *next_slot = next_slot.min(reachable);
+        }
+    }
+    for i in (0..m).rev() {
+        let Some(seg) = segs.get(i) else {
+            continue;
+        };
+        let v1 = v_junc.get(i + 1).copied().unwrap_or(0.0);
+        let reachable = (v1 * v1 + 2.0 * a * seg.len).max(0.0).sqrt();
+        if let Some(cur_slot) = v_junc.get_mut(i) {
+            *cur_slot = cur_slot.min(reachable);
+        }
+    }
+
+    let mut total = 0.0_f64;
+    for i in 0..m {
+        let Some(seg) = segs.get(i) else {
+            continue;
+        };
+        let v = seg.v;
+        let v0 = v_junc.get(i).copied().unwrap_or(0.0).min(v);
+        let v1 = v_junc.get(i + 1).copied().unwrap_or(0.0).min(v);
+        let d_acc = ((v * v - v0 * v0) / (2.0 * a)).max(0.0);
+        let d_dec = ((v * v - v1 * v1) / (2.0 * a)).max(0.0);
+        let dt = if d_acc + d_dec <= seg.len {
+            ((v - v0) / a).max(0.0) + ((v - v1) / a).max(0.0) + (seg.len - d_acc - d_dec) / v
+        } else {
+            let v_peak = (0.5 * (2.0 * a * seg.len + v0 * v0 + v1 * v1))
+                .max(v0 * v0)
+                .max(v1 * v1)
+                .sqrt();
+            ((v_peak - v0) / a).max(0.0) + ((v_peak - v1) / a).max(0.0)
+        };
+        total += dt;
+    }
+    total
+}
+
+fn estimate_path_kinematic_time_s(
+    layer_idx: usize,
+    path: &ExtrusionPath,
+    config: &PrintConfig,
+) -> f64 {
+    if path.points.len() < 2 {
+        return 0.0;
+    }
+    let n = path.points.len();
+    let seg_count = if path.closed { n } else { n.saturating_sub(1) };
+    let mut pts_mm = Vec::with_capacity(seg_count + 1);
+    for pt in &path.points {
+        pts_mm.push(pt.to_mm());
+    }
+    if path.closed
+        && let Some(&first) = path.points.first()
+    {
+        pts_mm.push(first.to_mm());
+    }
+
+    let max_vol_flow = config.filament.max_volumetric_speed_mm3_s;
+    let fil_flow = config.filament.flow_ratio.max(0.001);
+    let flow = path.flow_ratio.max(0.001) * fil_flow;
+    let var_w = path.has_variable_width() && max_vol_flow.is_finite() && max_vol_flow > 0.0;
+    let mut speeds = Vec::with_capacity(seg_count);
+    for si in 0..seg_count {
+        let s = if var_w {
+            let sw = path.segment_width_mm(si);
+            let sarea = bead_area_mm2(sw, path.height_mm) * flow;
+            if sarea > 1e-9 {
+                path.speed_mm_s.min(max_vol_flow / sarea)
+            } else {
+                path.speed_mm_s
+            }
+        } else {
+            path.speed_mm_s
+        };
+        speeds.push(s.max(1e-3));
+    }
+
+    let accel = effective_role_accel_mm_s2(layer_idx, path.role, config);
+    estimate_polyline_kinematic_time_s(&pts_mm, &speeds, accel, DEFAULT_JUNCTION_DEVIATION_MM)
+}
+
 fn apply_flow_and_cooling(
     layer_idx: usize,
     paths: &mut [ExtrusionPath],
@@ -1000,8 +1298,8 @@ fn apply_flow_and_cooling(
 ) -> (u8, f64) {
     let max_vol_flow = config.filament.max_volumetric_speed_mm3_s;
     let travel_speed = config.machine.travel_speed_mm_s.max(1e-6);
+    let travel_accel = effective_travel_accel_mm_s2(config);
 
-    let mut path_lengths = Vec::with_capacity(paths.len());
     let mut extrusion_time_s = 0.0;
     let mut travel_time_s = 0.0;
     let mut prev_end: Option<Point2> = None;
@@ -1011,7 +1309,7 @@ fn apply_flow_and_cooling(
     for path in paths.iter_mut() {
         if matches!(
             path.role,
-            ExtrusionRole::Bridge | ExtrusionRole::OverhangWall
+            ExtrusionRole::Bridge | ExtrusionRole::InternalBridge | ExtrusionRole::OverhangWall
         ) {
             has_bridge_or_overhang = true;
         }
@@ -1020,37 +1318,15 @@ fn apply_flow_and_cooling(
         if eff_area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
             path.speed_mm_s = path.speed_mm_s.min(max_vol_flow / eff_area);
         }
-        let len = path_length_mm(path);
-        path_lengths.push(len);
-        if path.has_variable_width() && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
-            let n = path.points.len();
-            let segs = if path.closed { n } else { n.saturating_sub(1) };
-            let flow = path.flow_ratio.max(0.001) * fil_flow;
-            for si in 0..segs {
-                let (Some(&a), Some(&b)) = (path.points.get(si), path.points.get((si + 1) % n))
-                else {
-                    continue;
-                };
-                let slen = a.distance_mm(b);
-                if slen <= 1e-9 {
-                    continue;
-                }
-                let sw = path.segment_width_mm(si);
-                let sarea = bead_area_mm2(sw, path.height_mm) * flow;
-                let sspd = if sarea > 1e-9 {
-                    path.speed_mm_s.min(max_vol_flow / sarea)
-                } else {
-                    path.speed_mm_s
-                };
-                extrusion_time_s += slen / sspd.max(1e-6);
-            }
-        } else {
-            extrusion_time_s += len / path.speed_mm_s.max(1e-6);
-        }
+        extrusion_time_s += estimate_path_kinematic_time_s(layer_idx, path, config);
 
         if let Some(&start) = path.points.first() {
             if let Some(prev) = prev_end {
-                travel_time_s += prev.distance_mm(start) / travel_speed;
+                travel_time_s += estimate_trapezoid_move_time_s(
+                    prev.distance_mm(start),
+                    travel_speed,
+                    travel_accel,
+                );
             }
             prev_end = if path.closed {
                 Some(start)
@@ -1084,13 +1360,30 @@ fn apply_flow_and_cooling(
 
         let needed_ext = (target - travel_time_s).max(extrusion_time_s);
         if needed_ext > extrusion_time_s + 1e-9 {
-            let scale = (extrusion_time_s / needed_ext).clamp(0.0, 1.0);
-            for path in paths.iter_mut() {
-                let floor_speed = config
-                    .filament
-                    .slow_down_min_speed_mm_s
-                    .min(path.speed_mm_s);
-                path.speed_mm_s = (path.speed_mm_s * scale).max(floor_speed);
+            for _ in 0..3 {
+                let cur_ext_time: f64 = paths
+                    .iter()
+                    .map(|p| estimate_path_kinematic_time_s(layer_idx, p, config))
+                    .sum();
+                if cur_ext_time >= needed_ext * 0.99 || cur_ext_time <= 1e-9 {
+                    break;
+                }
+                let scale = (cur_ext_time / needed_ext).clamp(0.0, 0.999);
+                let mut any_changed = false;
+                for path in paths.iter_mut() {
+                    let floor_speed = config
+                        .filament
+                        .slow_down_min_speed_mm_s
+                        .min(path.speed_mm_s);
+                    let next_s = (path.speed_mm_s * scale).max(floor_speed);
+                    if (next_s - path.speed_mm_s).abs() > 1e-6 {
+                        path.speed_mm_s = next_s;
+                        any_changed = true;
+                    }
+                }
+                if !any_changed {
+                    break;
+                }
             }
         }
     }
@@ -1101,8 +1394,7 @@ fn apply_flow_and_cooling(
 
     let final_ext_time_s: f64 = paths
         .iter()
-        .zip(path_lengths.iter())
-        .map(|(p, &len)| len / p.speed_mm_s.max(1e-6))
+        .map(|p| estimate_path_kinematic_time_s(layer_idx, p, config))
         .sum();
     let fan_u8 = fan_pct.round().clamp(0.0, 100.0) as u8;
     (fan_u8, final_ext_time_s + travel_time_s)
@@ -1762,6 +2054,38 @@ fn region_aabb(region: &[ExPolygon]) -> Option<Aabb2> {
     bounds
 }
 
+fn segment_inside_same_region(
+    region: &[ExPolygon],
+    a: Point2,
+    b: Point2,
+    check_endpoints: bool,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    let ax = a.x as f64;
+    let ay = a.y as f64;
+    let dx = (b.x as f64) - ax;
+    let dy = (b.y as f64) - ay;
+    let (start_step, end_step) = if check_endpoints { (0, 6) } else { (1, 5) };
+    for ex in region {
+        let mut all_in = true;
+        for step in start_step..=end_step {
+            let t = (step as f64) / 6.0;
+            let px = (ax + t * dx).round() as i64;
+            let py = (ay + t * dy).round() as i64;
+            if !ex.contains_point(Point2::new(px, py)) {
+                all_in = false;
+                break;
+            }
+        }
+        if all_in {
+            return true;
+        }
+    }
+    false
+}
+
 fn generate_gyroid_infill(
     region: &[ExPolygon],
     z_mm: f64,
@@ -1853,14 +2177,103 @@ fn generate_gyroid_infill(
     }
 
     let clipped = clip_polylines(&raw_waves, region)?;
-    let mut paths = Vec::with_capacity(clipped.len());
-    for (i, mut pts) in clipped.into_iter().enumerate() {
-        if pts.len() < 2 {
+    let mut waves: Vec<Vec<Point2>> = clipped.into_iter().filter(|pts| pts.len() >= 2).collect();
+    if waves.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chain_region_owned = match offset(region, mm_to_nm(0.02)?, JoinType::Miter { limit: 2.0 }) {
+        Ok(expanded) if !expanded.is_empty() => Some(expanded),
+        _ => None,
+    };
+    let chain_region: &[ExPolygon] = chain_region_owned.as_deref().unwrap_or(region);
+    let check_endpoints = chain_region_owned.is_some();
+
+    let max_link_mm = (1.15 * l).max(2.0 * width_mm);
+    let mut start_idx = 0usize;
+    let mut start_rev = false;
+    let mut start_dist = f64::INFINITY;
+    for (idx, w) in waves.iter().enumerate() {
+        if let Some(&s) = w.first() {
+            let d = aabb.min.distance_mm(s);
+            if d < start_dist {
+                start_dist = d;
+                start_idx = idx;
+                start_rev = false;
+            }
+        }
+        if let Some(&e) = w.last() {
+            let d = aabb.min.distance_mm(e);
+            if d < start_dist {
+                start_dist = d;
+                start_idx = idx;
+                start_rev = true;
+            }
+        }
+    }
+    let mut cur_pts = waves.remove(start_idx);
+    if start_rev {
+        cur_pts.reverse();
+    }
+    let mut paths = Vec::new();
+    while !waves.is_empty() {
+        let Some(&last_pt) = cur_pts.last() else {
+            cur_pts = waves.remove(0);
             continue;
+        };
+        let mut best_chain: Option<(usize, bool, f64)> = None;
+        let mut best_jump: Option<(usize, bool, f64)> = None;
+        for (idx, w) in waves.iter().enumerate() {
+            for (rev, pt_opt) in [(false, w.first().copied()), (true, w.last().copied())] {
+                let Some(pt) = pt_opt else {
+                    continue;
+                };
+                let d = last_pt.distance_mm(pt);
+                if best_jump.is_none_or(|(_, _, bd)| d < bd) {
+                    best_jump = Some((idx, rev, d));
+                }
+                if d <= max_link_mm
+                    && best_chain.is_none_or(|(_, _, bd)| d < bd)
+                    && segment_inside_same_region(chain_region, last_pt, pt, check_endpoints)
+                {
+                    best_chain = Some((idx, rev, d));
+                }
+            }
         }
-        if i % 2 == 1 {
-            pts.reverse();
+        if let Some((idx, rev, _)) = best_chain {
+            let mut chosen = waves.remove(idx);
+            if rev {
+                chosen.reverse();
+            }
+            if let Some(&first_pt) = chosen.first() {
+                if first_pt != last_pt {
+                    cur_pts.push(first_pt);
+                }
+                cur_pts.extend(chosen.into_iter().skip(1));
+            }
+        } else {
+            paths.push(ExtrusionPath {
+                role: ExtrusionRole::SparseInfill,
+                width_mm,
+                point_widths_mm: Vec::new(),
+                height_mm,
+                speed_mm_s,
+                flow_ratio: 1.0,
+                points: std::mem::take(&mut cur_pts),
+                closed: false,
+            });
+            if let Some((idx, rev, _)) = best_jump {
+                let mut chosen = waves.remove(idx);
+                if rev {
+                    chosen.reverse();
+                }
+                cur_pts = chosen;
+            } else {
+                cur_pts = waves.remove(0);
+            }
         }
+    }
+    if cur_pts.len() >= 2 {
         paths.push(ExtrusionPath {
             role: ExtrusionRole::SparseInfill,
             width_mm,
@@ -1868,7 +2281,7 @@ fn generate_gyroid_infill(
             height_mm,
             speed_mm_s,
             flow_ratio: 1.0,
-            points: pts,
+            points: cur_pts,
             closed: false,
         });
     }
@@ -2281,7 +2694,9 @@ fn order_layer_paths_by_island(
                             bucket.surfaces.push(path);
                         }
                         ExtrusionRole::InternalSolidInfill => bucket.internal_solid.push(path),
-                        ExtrusionRole::Bridge => bucket.bridges.push(path),
+                        ExtrusionRole::Bridge | ExtrusionRole::InternalBridge => {
+                            bucket.bridges.push(path)
+                        }
                         ExtrusionRole::SparseInfill => bucket.sparse.push(path),
                         ExtrusionRole::Ironing => bucket.ironing.push(path),
                         ExtrusionRole::Support
@@ -2545,12 +2960,13 @@ pub(crate) fn generate_rectilinear_hatch(
         return Ok(Vec::new());
     }
 
+    let min_seg_mm = (0.2 * width_mm).min(0.08);
     let mut tagged: Vec<(i64, f64, Point2, Point2)> = Vec::with_capacity(clipped.len());
     for seg in clipped {
         let (Some(&p0), Some(&p1)) = (seg.first(), seg.last()) else {
             continue;
         };
-        if p0 == p1 {
+        if p0.distance_mm(p1) < min_seg_mm {
             continue;
         }
         let (x0, y0) = p0.to_mm();
@@ -4156,5 +4572,155 @@ mod tests {
             "expected 2 grouped islands, got {:?}",
             sides
         );
+    }
+
+    #[test]
+    fn internal_bridge_detected_over_sparse_infill_and_skipped_over_solid() {
+        let cube = make_box_mesh(20.0, 20.0, 8.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.top_shell_layers = 4;
+        cfg.process.bottom_shell_layers = 3;
+        cfg.process.sparse_infill_density = 0.15;
+        cfg.process.detect_bridges = true;
+
+        let plate = slice_single_mesh(&cube, &cfg).unwrap();
+        let ib_layers: Vec<usize> = plate
+            .layers
+            .iter()
+            .filter(|l| {
+                l.paths
+                    .iter()
+                    .any(|p| p.role == ExtrusionRole::InternalBridge)
+            })
+            .map(|l| l.index)
+            .collect();
+        assert_eq!(
+            ib_layers.len(),
+            1,
+            "expected 1 internal bridge layer: {ib_layers:?}"
+        );
+
+        // Stepped block (30x30x6 base + 16x16x6 top) has two top-shell transitions.
+        let mut tris = Vec::new();
+        tris.extend(make_box_mesh(30.0, 30.0, 6.0).triangles);
+        let top = make_box_mesh(16.0, 16.0, 6.0);
+        for t in top.triangles {
+            tris.push(layercraft_geom::Triangle::new(
+                Point3::new(t.a.x + 7.0, t.a.y + 7.0, t.a.z + 6.0),
+                Point3::new(t.b.x + 7.0, t.b.y + 7.0, t.b.z + 6.0),
+                Point3::new(t.c.x + 7.0, t.c.y + 7.0, t.c.z + 6.0),
+            ));
+        }
+        let stepped = TriangleMesh::new(tris).unwrap();
+        let stepped_plate = slice_single_mesh(&stepped, &cfg).unwrap();
+        let stepped_ib_layers: usize = stepped_plate
+            .layers
+            .iter()
+            .filter(|l| {
+                l.paths
+                    .iter()
+                    .any(|p| p.role == ExtrusionRole::InternalBridge)
+            })
+            .count();
+        assert_eq!(stepped_ib_layers, 2);
+
+        // 100% sparse infill density has no sparse voids to bridge over.
+        let mut solid_cfg = cfg.clone();
+        solid_cfg.process.sparse_infill_density = 1.0;
+        let solid_plate = slice_single_mesh(&cube, &solid_cfg).unwrap();
+        let solid_ib: usize = solid_plate
+            .layers
+            .iter()
+            .filter(|l| {
+                l.paths
+                    .iter()
+                    .any(|p| p.role == ExtrusionRole::InternalBridge)
+            })
+            .count();
+        assert_eq!(solid_ib, 0);
+    }
+
+    #[test]
+    fn gyroid_waves_chain_cleanly_inside_region_without_crossing_holes() {
+        let reg = vec![ExPolygon::new(
+            Polygon::new(vec![
+                Point2::from_mm(0.0, 0.0).unwrap(),
+                Point2::from_mm(20.0, 0.0).unwrap(),
+                Point2::from_mm(20.0, 20.0).unwrap(),
+                Point2::from_mm(0.0, 20.0).unwrap(),
+            ]),
+            Vec::new(),
+        )];
+        let chained = generate_gyroid_infill(&reg, 1.0, 0.15, 0.45, 0.20, 120.0).unwrap();
+        assert!(
+            !chained.is_empty() && chained.len() <= 3,
+            "expected gyroid waves to chain into <=3 paths on solid 20x20, got {}",
+            chained.len()
+        );
+
+        let hole_center = Point2::from_mm(10.0, 10.0).unwrap();
+        let holed = vec![ExPolygon::new(
+            Polygon::new(vec![
+                Point2::from_mm(0.0, 0.0).unwrap(),
+                Point2::from_mm(20.0, 0.0).unwrap(),
+                Point2::from_mm(20.0, 20.0).unwrap(),
+                Point2::from_mm(0.0, 20.0).unwrap(),
+            ]),
+            vec![Polygon::new(vec![
+                Point2::from_mm(6.0, 6.0).unwrap(),
+                Point2::from_mm(6.0, 14.0).unwrap(),
+                Point2::from_mm(14.0, 14.0).unwrap(),
+                Point2::from_mm(14.0, 6.0).unwrap(),
+            ])],
+        )];
+        let holed_paths = generate_gyroid_infill(&holed, 1.0, 0.25, 0.45, 0.20, 120.0).unwrap();
+        assert!(!holed_paths.is_empty());
+        for p in &holed_paths {
+            for w in p.points.windows(2) {
+                let mid = Point2::new((w[0].x + w[1].x) / 2, (w[0].y + w[1].y) / 2);
+                assert!(
+                    (mid.x - hole_center.x).abs() > 2_000_000
+                        || (mid.y - hole_center.y).abs() > 2_000_000,
+                    "gyroid segment crossed central hole at {:?}",
+                    mid.to_mm()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kinematic_time_estimator_matches_analytical_trapezoid_and_corner_physics() {
+        // Triangular move: d = 4 < v^2/a = 100^2 / 1000 = 10 -> 2*sqrt(4/1000)
+        let tri_t = estimate_trapezoid_move_time_s(4.0, 100.0, 1000.0);
+        assert!((tri_t - 2.0 * (4.0_f64 / 1000.0).sqrt()).abs() < 1e-9);
+
+        // Trapezoidal move: d = 50 >= 10 -> 50/100 + 100/1000 = 0.6s
+        let trap_t = estimate_trapezoid_move_time_s(50.0, 100.0, 1000.0);
+        assert!((trap_t - 0.6).abs() < 1e-9);
+
+        let straight = estimate_polyline_kinematic_time_s(
+            &[(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+            &[100.0, 100.0],
+            2000.0,
+            0.05,
+        );
+        let corner = estimate_polyline_kinematic_time_s(
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+            &[100.0, 100.0],
+            2000.0,
+            0.05,
+        );
+        assert!(
+            corner > straight,
+            "90 deg corner ({corner}) must take longer than straight ({straight})"
+        );
+
+        let corner_slow_accel = estimate_polyline_kinematic_time_s(
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+            &[100.0, 100.0],
+            500.0,
+            0.05,
+        );
+        assert!(corner_slow_accel > corner);
     }
 }

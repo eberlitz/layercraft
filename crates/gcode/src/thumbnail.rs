@@ -123,6 +123,7 @@ fn role_rgb(role: ExtrusionRole, z_frac: f64) -> [u8; 3] {
         ExtrusionRole::InnerWall => [0x5B, 0x9B, 0xD5],
         ExtrusionRole::OverhangWall => [0xF5, 0x9E, 0x0B],
         ExtrusionRole::Bridge => [0x22, 0xD3, 0xEE],
+        ExtrusionRole::InternalBridge => [0x38, 0xBD, 0xF8],
         ExtrusionRole::TopSurface => [0x94, 0xA3, 0xB8],
         ExtrusionRole::BottomSurface => [0x64, 0x74, 0x8B],
         ExtrusionRole::InternalSolidInfill => [0x7C, 0x8B, 0xA1],

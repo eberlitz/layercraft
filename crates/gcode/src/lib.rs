@@ -9,8 +9,12 @@ use base64::Engine as _;
 use combing::CombingLayer;
 use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition, ThumbnailFormat};
 use layercraft_geom::{ExPolygon, Point2};
-pub use layercraft_slice::bead_area_mm2;
-use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
+pub use layercraft_slice::{
+    DEFAULT_EXTRUSION_ACCEL_MM_S2, DEFAULT_JUNCTION_DEVIATION_MM, DEFAULT_Z_ACCEL_MM_S2,
+    ExtrusionPath, ExtrusionRole, SlicedLayer, SlicedPlate, bead_area_mm2,
+    effective_role_accel_mm_s2, effective_travel_accel_mm_s2, estimate_polyline_kinematic_time_s,
+    estimate_trapezoid_move_time_s,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -325,6 +329,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let retract_len = config.machine.retraction_length_mm;
     let retract_f = config.machine.retraction_speed_mm_s * 60.0;
     let zhop_f = config.machine.z_hop_speed_mm_s * 60.0;
+    let travel_accel = effective_travel_accel_mm_s2(config);
 
     let mut cur_x = 0.0;
     let mut cur_y = 0.0;
@@ -417,361 +422,99 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         let mut z_hopped = if layer.index == 0 && config.machine.start_gcode.is_some() {
             let travel_z = layer.z_top_mm + config.machine.z_hop_mm.max(1.8);
             writeln!(out, "G0 Z{travel_z:.3} F{zhop_f:.0}").map_err(|_| GcodeError::FormatError)?;
-            total_time_s += (travel_z - cur_z).abs() / config.machine.z_hop_speed_mm_s;
+            total_time_s += estimate_trapezoid_move_time_s(
+                (travel_z - cur_z).abs(),
+                config.machine.z_hop_speed_mm_s,
+                DEFAULT_Z_ACCEL_MM_S2,
+            );
             cur_z = travel_z;
             true
         } else {
             writeln!(out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
                 .map_err(|_| GcodeError::FormatError)?;
-            total_time_s += (layer.z_top_mm - cur_z).abs() / config.machine.z_hop_speed_mm_s;
+            total_time_s += estimate_trapezoid_move_time_s(
+                (layer.z_top_mm - cur_z).abs(),
+                config.machine.z_hop_speed_mm_s,
+                DEFAULT_Z_ACCEL_MM_S2,
+            );
             cur_z = layer.z_top_mm;
             false
         };
         let mut prev_role: Option<ExtrusionRole> = None;
 
-        for (path_idx, path) in layer.paths.iter().enumerate() {
-            if path.points.len() < 2 {
-                continue;
-            }
+        let mut layer_state = LayerEmitState {
+            out: &mut out,
+            config,
+            layer,
+            combing: combing.as_ref(),
+            travel_f,
+            retract_len,
+            retract_f,
+            zhop_f,
+            travel_accel,
+            cur_x: &mut cur_x,
+            cur_y: &mut cur_y,
+            cur_z: &mut cur_z,
+            cur_e: &mut cur_e,
+            retracted: &mut retracted,
+            z_hopped: &mut z_hopped,
+            has_extruded: &mut has_extruded,
+            total_e_mm: &mut total_e_mm,
+            total_travel_mm: &mut total_travel_mm,
+            total_time_s: &mut total_time_s,
+            current_accel_mm_s2: &mut current_accel_mm_s2,
+            feature_stats: &mut feature_stats,
+            current_role: &mut current_role,
+            prev_role: &mut prev_role,
+            cur_layer_seams: &mut cur_layer_seams,
+            prev_layer_seams: &prev_layer_seams,
+            last_path_trail: &mut last_path_trail,
+            fil_area,
+        };
 
-            let (ordered, ordered_widths) = orient_path_with_seam(
-                path,
-                layer.index,
-                path_idx,
-                cur_x,
-                cur_y,
-                &prev_layer_seams,
-                config,
-            );
-            let Some(&first_pt) = ordered.first() else {
-                continue;
+        let mut i = 0usize;
+        while i < layer.paths.len() {
+            let Some(first_path) = layer.paths.get(i) else {
+                break;
             };
-            let iter_pts: Vec<Point2> = if path.closed {
-                ordered
-                    .iter()
-                    .copied()
-                    .skip(1)
-                    .chain(std::iter::once(first_pt))
-                    .collect()
-            } else {
-                ordered.iter().copied().skip(1).collect()
-            };
-            if !has_nonzero_segment(first_pt, &iter_pts) {
-                continue;
-            }
-
-            let widths_mm = if !ordered_widths.is_empty() && ordered_widths.len() == ordered.len() {
-                let mut w = Vec::with_capacity(ordered_widths.len() + usize::from(path.closed));
-                w.extend_from_slice(&ordered_widths);
-                if path.closed
-                    && let Some(&fw) = ordered_widths.first()
+            if is_post_seam_reorderable(first_path) {
+                let run_role = first_path.role;
+                let mut end = i + 1;
+                while let Some(next_p) = layer.paths.get(end)
+                    && next_p.role == run_role
+                    && is_post_seam_reorderable(next_p)
                 {
-                    w.push(fw);
+                    end += 1;
                 }
-                w
+                let mut pending: Vec<usize> = (i..end).collect();
+                while !pending.is_empty() {
+                    let mut best_pos = 0usize;
+                    let mut best_d = f64::INFINITY;
+                    let nx = *layer_state.cur_x;
+                    let ny = *layer_state.cur_y;
+                    for (pos, &p_idx) in pending.iter().enumerate() {
+                        if let Some(cand) = layer.paths.get(p_idx)
+                            && let (Some(&s), Some(&e)) = (cand.points.first(), cand.points.last())
+                        {
+                            let (sx, sy) = s.to_mm();
+                            let (ex, ey) = e.to_mm();
+                            let d = (sx - nx).hypot(sy - ny).min((ex - nx).hypot(ey - ny));
+                            if d < best_d {
+                                best_d = d;
+                                best_pos = pos;
+                            }
+                        }
+                    }
+                    let chosen_idx = pending.swap_remove(best_pos);
+                    if let Some(chosen_path) = layer.paths.get(chosen_idx) {
+                        emit_single_layer_path(&mut layer_state, chosen_path, chosen_idx)?;
+                    }
+                }
+                i = end;
             } else {
-                Vec::new()
-            };
-
-            if current_role != Some(path.role) {
-                writeln!(out, ";TYPE:{}", path.role.label())
-                    .map_err(|_| GcodeError::FormatError)?;
-                current_role = Some(path.role);
+                emit_single_layer_path(&mut layer_state, first_path, i)?;
+                i += 1;
             }
-
-            let desired_accel = if layer.index == 0 {
-                config
-                    .process
-                    .first_layer_acceleration_mm_s2
-                    .or(config.process.default_acceleration_mm_s2)
-            } else {
-                match path.role {
-                    ExtrusionRole::OuterWall | ExtrusionRole::OverhangWall => config
-                        .process
-                        .outer_wall_acceleration_mm_s2
-                        .or(config.process.default_acceleration_mm_s2),
-                    ExtrusionRole::InnerWall => config
-                        .process
-                        .inner_wall_acceleration_mm_s2
-                        .or(config.process.default_acceleration_mm_s2),
-                    _ => config.process.default_acceleration_mm_s2,
-                }
-            };
-            if let Some(accel) = desired_accel
-                && current_accel_mm_s2.is_none_or(|prev| (prev - accel).abs() > 0.5)
-            {
-                match config.machine.flavor {
-                    GcodeFlavor::Klipper => {
-                        writeln!(out, "SET_VELOCITY_LIMIT ACCEL={accel:.0}")
-                            .map_err(|_| GcodeError::FormatError)?;
-                    }
-                    GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => {
-                        if let Some(ta) = config.process.travel_acceleration_mm_s2 {
-                            writeln!(out, "M204 P{accel:.0} T{ta:.0}")
-                                .map_err(|_| GcodeError::FormatError)?;
-                        } else {
-                            writeln!(out, "M204 P{accel:.0}")
-                                .map_err(|_| GcodeError::FormatError)?;
-                        }
-                    }
-                }
-                current_accel_mm_s2 = Some(accel);
-            }
-
-            let (sx, sy) = first_pt.to_mm();
-            if path.closed && path.role == ExtrusionRole::OuterWall {
-                cur_layer_seams.push((sx, sy));
-            }
-
-            let is_internal_infill = |r: ExtrusionRole| {
-                matches!(
-                    r,
-                    ExtrusionRole::SparseInfill | ExtrusionRole::InternalSolidInfill
-                )
-            };
-            let skip_infill_retract = config.process.reduce_infill_retraction
-                && prev_role.is_some_and(is_internal_infill)
-                && is_internal_infill(path.role)
-                && travel_stays_inside_same_island(&layer.slice_regions, (cur_x, cur_y), (sx, sy));
-
-            let mut travel_dist = (sx - cur_x).hypot(sy - cur_y);
-            if !skip_infill_retract
-                && has_extruded
-                && travel_dist > config.machine.min_travel_for_retract_mm
-                && retract_len > 0.0
-                && !retracted
-            {
-                perform_retract(
-                    &mut out,
-                    config,
-                    &mut cur_x,
-                    &mut cur_y,
-                    &mut cur_e,
-                    &last_path_trail,
-                    retract_len,
-                    retract_f,
-                    &mut total_travel_mm,
-                    &mut total_time_s,
-                )?;
-                retracted = true;
-                travel_dist = (sx - cur_x).hypot(sy - cur_y);
-            }
-
-            if retracted && config.machine.z_hop_mm > 0.0 && !z_hopped {
-                let hop_z = cur_z + config.machine.z_hop_mm;
-                writeln!(out, "G0 Z{hop_z:.3} F{zhop_f:.0}")
-                    .map_err(|_| GcodeError::FormatError)?;
-                total_time_s += config.machine.z_hop_mm / config.machine.z_hop_speed_mm_s;
-                cur_z = hop_z;
-                z_hopped = true;
-            }
-
-            if travel_dist > 1e-4 {
-                if let Some(waypoints) = combing.as_ref().and_then(|c| {
-                    c.plan_travel(
-                        (cur_x, cur_y),
-                        (sx, sy),
-                        config.process.avoid_crossing_perimeters_max_detour_mm,
-                    )
-                }) {
-                    writeln!(out, ";COMBING_START").map_err(|_| GcodeError::FormatError)?;
-                    for (wx, wy) in waypoints {
-                        let step_d = (wx - cur_x).hypot(wy - cur_y);
-                        if step_d > 1e-4 {
-                            writeln!(out, "G0 X{wx:.3} Y{wy:.3} F{travel_f:.0}")
-                                .map_err(|_| GcodeError::FormatError)?;
-                            total_travel_mm += step_d;
-                            total_time_s += step_d / config.machine.travel_speed_mm_s;
-                            cur_x = wx;
-                            cur_y = wy;
-                        }
-                    }
-                    let rem_d = (sx - cur_x).hypot(sy - cur_y);
-                    if rem_d > 1e-4 {
-                        writeln!(out, "G0 X{sx:.3} Y{sy:.3} F{travel_f:.0}")
-                            .map_err(|_| GcodeError::FormatError)?;
-                        total_travel_mm += rem_d;
-                        total_time_s += rem_d / config.machine.travel_speed_mm_s;
-                        cur_x = sx;
-                        cur_y = sy;
-                    }
-                    writeln!(out, ";COMBING_END").map_err(|_| GcodeError::FormatError)?;
-                } else {
-                    writeln!(out, "G0 X{sx:.3} Y{sy:.3} F{travel_f:.0}")
-                        .map_err(|_| GcodeError::FormatError)?;
-                    total_travel_mm += travel_dist;
-                    total_time_s += travel_dist / config.machine.travel_speed_mm_s;
-                    cur_x = sx;
-                    cur_y = sy;
-                }
-            }
-
-            if z_hopped || (cur_z - layer.z_top_mm).abs() > 1e-4 {
-                writeln!(out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
-                    .map_err(|_| GcodeError::FormatError)?;
-                total_time_s += (cur_z - layer.z_top_mm).abs() / config.machine.z_hop_speed_mm_s;
-                cur_z = layer.z_top_mm;
-                z_hopped = false;
-            }
-
-            if retracted && retract_len > 0.0 {
-                emit_e_move(
-                    &mut out,
-                    config.machine.relative_extrusion,
-                    &mut cur_e,
-                    retract_len,
-                    retract_f,
-                )?;
-                retracted = false;
-                total_time_s += retract_len / config.machine.retraction_speed_mm_s;
-            }
-
-            let eff_flow = (path.flow_ratio * config.filament.flow_ratio).max(0.001);
-            let bead_area = bead_area_mm2(path.width_mm, path.height_mm) * eff_flow;
-            let eff_speed = if bead_area > 1e-9 {
-                path.speed_mm_s
-                    .min(config.filament.max_volumetric_speed_mm3_s / bead_area)
-            } else {
-                path.speed_mm_s
-            }
-            .max(1e-3);
-            let feed = (eff_speed * 60.0).floor().max(1.0);
-            let actual_speed = feed / 60.0;
-
-            let f_entry = feature_stats
-                .entry(path.role.label().to_owned())
-                .or_default();
-
-            let mut path_trail = Vec::with_capacity(iter_pts.len() + 2);
-            path_trail.push((cur_x, cur_y));
-
-            let mut pts_mm = Vec::with_capacity(iter_pts.len() + 1);
-            pts_mm.push((cur_x, cur_y));
-            for pt in iter_pts {
-                pts_mm.push(pt.to_mm());
-            }
-
-            let is_varying_w = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
-                let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
-                let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
-                max_w - min_w > 1e-4
-            };
-
-            let total_loop_len: f64 = pts_mm
-                .windows(2)
-                .filter_map(|w| Some((w.first()?, w.get(1)?)))
-                .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
-                .sum();
-            let scarf = &config.process.scarf_seam;
-            let use_scarf = scarf.enabled
-                && layer.index > 0
-                && path.closed
-                && path.role == ExtrusionRole::OuterWall
-                && !is_varying_w
-                && total_loop_len >= scarf.min_length_mm;
-
-            let mut emit_ctx = PathEmitCtx {
-                out: &mut out,
-                cur_x: &mut cur_x,
-                cur_y: &mut cur_y,
-                cur_e: &mut cur_e,
-                total_e_mm: &mut total_e_mm,
-                total_time_s: &mut total_time_s,
-                has_extruded: &mut has_extruded,
-                f_entry,
-                path_trail: &mut path_trail,
-                relative_e: config.machine.relative_extrusion,
-                fil_area,
-                fil_diam: config.filament.diameter_mm,
-                density: config.filament.density_g_cm3,
-                width_mm: path.width_mm,
-                height_mm: path.height_mm,
-                base_flow: eff_flow,
-                base_speed_mm_s: path.speed_mm_s,
-                max_vol_flow: config.filament.max_volumetric_speed_mm3_s,
-                feed,
-                actual_speed,
-            };
-
-            let mut scarf_done = false;
-            if use_scarf {
-                let target_len = if scarf.entire_loop {
-                    total_loop_len
-                } else {
-                    scarf.length_mm.min(0.45 * total_loop_len)
-                };
-                if target_len >= 1.0
-                    && let Some(sub) =
-                        subdivide_loop_for_scarf(&pts_mm, target_len, scarf.steps as usize)
-                {
-                    let z_base = layer.z_top_mm - path.height_mm;
-                    let z_start = z_base + scarf.start_height_ratio * path.height_mm;
-                    writeln!(emit_ctx.out, ";SCARF_START").map_err(|_| GcodeError::FormatError)?;
-                    writeln!(emit_ctx.out, "G0 Z{z_start:.3} F{zhop_f:.0}")
-                        .map_err(|_| GcodeError::FormatError)?;
-                    *emit_ctx.total_time_s +=
-                        (cur_z - z_start).abs() / config.machine.z_hop_speed_mm_s;
-
-                    // Phase A: ascending Z & flow ramp over [0..L].
-                    let mut ramp_z = z_start;
-                    for pair in sub.ramp_pts.windows(2) {
-                        let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) =
-                            (pair.first(), pair.get(1))
-                        else {
-                            continue;
-                        };
-                        let seg_len = (x1 - x0).hypot(y1 - y0);
-                        if seg_len <= 1e-6 {
-                            continue;
-                        }
-                        let t_end = (s1 / target_len).clamp(0.0, 1.0);
-                        let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
-                        let z1 = z_start + t_end * (layer.z_top_mm - z_start);
-                        let frac_a = (scarf.start_height_ratio
-                            + t_mid * (1.0 - scarf.start_height_ratio))
-                            * scarf.flow_ratio;
-                        emit_ctx.emit_linear((x1, y1), seg_len, Some(z1), frac_a)?;
-                        ramp_z = z1;
-                    }
-                    if (ramp_z - layer.z_top_mm).abs() > 1e-4 {
-                        writeln!(emit_ctx.out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
-                            .map_err(|_| GcodeError::FormatError)?;
-                    }
-                    cur_z = layer.z_top_mm;
-
-                    // Phase B: constant-Z body over [L..P].
-                    if sub.body_pts.len() >= 2 {
-                        emit_ctx.emit_xy_sequence(&sub.body_pts, config)?;
-                    }
-
-                    // Phase C: complementary flow overlap at constant Z = layer.z_top_mm over [0..L].
-                    for pair in sub.ramp_pts.windows(2) {
-                        let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) =
-                            (pair.first(), pair.get(1))
-                        else {
-                            continue;
-                        };
-                        let seg_len = (x1 - x0).hypot(y1 - y0);
-                        if seg_len <= 1e-6 {
-                            continue;
-                        }
-                        let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
-                        let height_frac =
-                            scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
-                        let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
-                        emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
-                    }
-                    writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
-                    scarf_done = true;
-                }
-            }
-
-            if !scarf_done {
-                emit_ctx.emit_xy_sequence_variable(&pts_mm, &widths_mm, config)?;
-            }
-
-            last_path_trail = path_trail;
-            prev_role = Some(path.role);
         }
 
         if !cur_layer_seams.is_empty() {
@@ -956,6 +699,440 @@ fn emit_e_mode(out: &mut String, relative: bool) -> Result<(), GcodeError> {
     }
 }
 
+fn is_post_seam_reorderable(path: &ExtrusionPath) -> bool {
+    !path.closed
+        && matches!(
+            path.role,
+            ExtrusionRole::SparseInfill
+                | ExtrusionRole::InternalSolidInfill
+                | ExtrusionRole::Bridge
+                | ExtrusionRole::InternalBridge
+                | ExtrusionRole::Support
+                | ExtrusionRole::SupportInterface
+        )
+}
+
+struct LayerEmitState<'a> {
+    out: &'a mut String,
+    config: &'a PrintConfig,
+    layer: &'a SlicedLayer,
+    combing: Option<&'a CombingLayer>,
+    travel_f: f64,
+    retract_len: f64,
+    retract_f: f64,
+    zhop_f: f64,
+    travel_accel: f64,
+    cur_x: &'a mut f64,
+    cur_y: &'a mut f64,
+    cur_z: &'a mut f64,
+    cur_e: &'a mut f64,
+    retracted: &'a mut bool,
+    z_hopped: &'a mut bool,
+    has_extruded: &'a mut bool,
+    total_e_mm: &'a mut f64,
+    total_travel_mm: &'a mut f64,
+    total_time_s: &'a mut f64,
+    current_accel_mm_s2: &'a mut Option<f64>,
+    feature_stats: &'a mut BTreeMap<String, FeatureStats>,
+    current_role: &'a mut Option<ExtrusionRole>,
+    prev_role: &'a mut Option<ExtrusionRole>,
+    cur_layer_seams: &'a mut Vec<(f64, f64)>,
+    prev_layer_seams: &'a [(f64, f64)],
+    last_path_trail: &'a mut Vec<(f64, f64)>,
+    fil_area: f64,
+}
+
+fn emit_single_layer_path(
+    st: &mut LayerEmitState<'_>,
+    path: &ExtrusionPath,
+    path_idx: usize,
+) -> Result<(), GcodeError> {
+    if path.points.len() < 2 {
+        return Ok(());
+    }
+    let config = st.config;
+    let layer = st.layer;
+
+    let (ordered, ordered_widths) = orient_path_with_seam(
+        path,
+        layer.index,
+        path_idx,
+        *st.cur_x,
+        *st.cur_y,
+        st.prev_layer_seams,
+        config,
+    );
+    let Some(&first_pt) = ordered.first() else {
+        return Ok(());
+    };
+    let iter_pts: Vec<Point2> = if path.closed {
+        ordered
+            .iter()
+            .copied()
+            .skip(1)
+            .chain(std::iter::once(first_pt))
+            .collect()
+    } else {
+        ordered.iter().copied().skip(1).collect()
+    };
+    if !has_nonzero_segment(first_pt, &iter_pts) {
+        return Ok(());
+    }
+
+    let widths_mm = if !ordered_widths.is_empty() && ordered_widths.len() == ordered.len() {
+        let mut w = Vec::with_capacity(ordered_widths.len() + usize::from(path.closed));
+        w.extend_from_slice(&ordered_widths);
+        if path.closed
+            && let Some(&fw) = ordered_widths.first()
+        {
+            w.push(fw);
+        }
+        w
+    } else {
+        Vec::new()
+    };
+
+    if *st.current_role != Some(path.role) {
+        writeln!(st.out, ";TYPE:{}", path.role.label()).map_err(|_| GcodeError::FormatError)?;
+        *st.current_role = Some(path.role);
+    }
+
+    let desired_accel = if layer.index == 0 {
+        config
+            .process
+            .first_layer_acceleration_mm_s2
+            .or(config.process.default_acceleration_mm_s2)
+    } else {
+        match path.role {
+            ExtrusionRole::OuterWall | ExtrusionRole::OverhangWall => config
+                .process
+                .outer_wall_acceleration_mm_s2
+                .or(config.process.default_acceleration_mm_s2),
+            ExtrusionRole::InnerWall => config
+                .process
+                .inner_wall_acceleration_mm_s2
+                .or(config.process.default_acceleration_mm_s2),
+            _ => config.process.default_acceleration_mm_s2,
+        }
+    };
+    if let Some(accel) = desired_accel
+        && st
+            .current_accel_mm_s2
+            .is_none_or(|prev| (prev - accel).abs() > 0.5)
+    {
+        match config.machine.flavor {
+            GcodeFlavor::Klipper => {
+                writeln!(st.out, "SET_VELOCITY_LIMIT ACCEL={accel:.0}")
+                    .map_err(|_| GcodeError::FormatError)?;
+            }
+            GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => {
+                if let Some(ta) = config.process.travel_acceleration_mm_s2 {
+                    writeln!(st.out, "M204 P{accel:.0} T{ta:.0}")
+                        .map_err(|_| GcodeError::FormatError)?;
+                } else {
+                    writeln!(st.out, "M204 P{accel:.0}").map_err(|_| GcodeError::FormatError)?;
+                }
+            }
+        }
+        *st.current_accel_mm_s2 = Some(accel);
+    }
+
+    let (sx_raw, sy_raw) = first_pt.to_mm();
+    let (sx, sy) = (round3(sx_raw), round3(sy_raw));
+    if path.closed && path.role == ExtrusionRole::OuterWall {
+        st.cur_layer_seams.push((sx, sy));
+    }
+
+    let is_internal_infill = |r: ExtrusionRole| {
+        matches!(
+            r,
+            ExtrusionRole::SparseInfill
+                | ExtrusionRole::InternalSolidInfill
+                | ExtrusionRole::InternalBridge
+        )
+    };
+    let skip_infill_retract = config.process.reduce_infill_retraction
+        && st.prev_role.is_some_and(is_internal_infill)
+        && is_internal_infill(path.role)
+        && travel_stays_inside_same_island(&layer.slice_regions, (*st.cur_x, *st.cur_y), (sx, sy));
+
+    let mut travel_dist = (sx - *st.cur_x).hypot(sy - *st.cur_y);
+    if !skip_infill_retract
+        && *st.has_extruded
+        && travel_dist > config.machine.min_travel_for_retract_mm
+        && st.retract_len > 0.0
+        && !*st.retracted
+    {
+        perform_retract(
+            st.out,
+            config,
+            st.cur_x,
+            st.cur_y,
+            st.cur_e,
+            st.last_path_trail,
+            st.retract_len,
+            st.retract_f,
+            st.total_travel_mm,
+            st.total_time_s,
+        )?;
+        *st.retracted = true;
+        travel_dist = (sx - *st.cur_x).hypot(sy - *st.cur_y);
+    }
+
+    if *st.retracted && config.machine.z_hop_mm > 0.0 && !*st.z_hopped {
+        let hop_z = *st.cur_z + config.machine.z_hop_mm;
+        writeln!(st.out, "G0 Z{hop_z:.3} F{:.0}", st.zhop_f)
+            .map_err(|_| GcodeError::FormatError)?;
+        *st.total_time_s += estimate_trapezoid_move_time_s(
+            config.machine.z_hop_mm,
+            config.machine.z_hop_speed_mm_s,
+            DEFAULT_Z_ACCEL_MM_S2,
+        );
+        *st.cur_z = hop_z;
+        *st.z_hopped = true;
+    }
+
+    if travel_dist > 1e-4 {
+        if let Some(waypoints) = st.combing.and_then(|c| {
+            c.plan_travel(
+                (*st.cur_x, *st.cur_y),
+                (sx, sy),
+                config.process.avoid_crossing_perimeters_max_detour_mm,
+            )
+        }) {
+            writeln!(st.out, ";COMBING_START").map_err(|_| GcodeError::FormatError)?;
+            let mut combed_pts = Vec::with_capacity(waypoints.len() + 2);
+            combed_pts.push((*st.cur_x, *st.cur_y));
+            for (wx_raw, wy_raw) in waypoints {
+                let (wx, wy) = (round3(wx_raw), round3(wy_raw));
+                let step_d = (wx - *st.cur_x).hypot(wy - *st.cur_y);
+                if step_d > 1e-4 {
+                    writeln!(st.out, "G0 X{wx:.3} Y{wy:.3} F{:.0}", st.travel_f)
+                        .map_err(|_| GcodeError::FormatError)?;
+                    *st.total_travel_mm += step_d;
+                    *st.cur_x = wx;
+                    *st.cur_y = wy;
+                    combed_pts.push((wx, wy));
+                }
+            }
+            let rem_d = (sx - *st.cur_x).hypot(sy - *st.cur_y);
+            if rem_d > 1e-4 {
+                writeln!(st.out, "G0 X{sx:.3} Y{sy:.3} F{:.0}", st.travel_f)
+                    .map_err(|_| GcodeError::FormatError)?;
+                *st.total_travel_mm += rem_d;
+                *st.cur_x = sx;
+                *st.cur_y = sy;
+                combed_pts.push((sx, sy));
+            }
+            let n_segs = combed_pts.len().saturating_sub(1);
+            if n_segs > 0 {
+                let speeds = vec![config.machine.travel_speed_mm_s; n_segs];
+                *st.total_time_s += estimate_polyline_kinematic_time_s(
+                    &combed_pts,
+                    &speeds,
+                    st.travel_accel,
+                    DEFAULT_JUNCTION_DEVIATION_MM,
+                );
+            }
+            writeln!(st.out, ";COMBING_END").map_err(|_| GcodeError::FormatError)?;
+        } else {
+            writeln!(st.out, "G0 X{sx:.3} Y{sy:.3} F{:.0}", st.travel_f)
+                .map_err(|_| GcodeError::FormatError)?;
+            *st.total_travel_mm += travel_dist;
+            *st.total_time_s += estimate_trapezoid_move_time_s(
+                travel_dist,
+                config.machine.travel_speed_mm_s,
+                st.travel_accel,
+            );
+            *st.cur_x = sx;
+            *st.cur_y = sy;
+        }
+    }
+
+    if *st.z_hopped || (*st.cur_z - layer.z_top_mm).abs() > 1e-4 {
+        writeln!(st.out, "G0 Z{:.3} F{:.0}", layer.z_top_mm, st.zhop_f)
+            .map_err(|_| GcodeError::FormatError)?;
+        *st.total_time_s += estimate_trapezoid_move_time_s(
+            (*st.cur_z - layer.z_top_mm).abs(),
+            config.machine.z_hop_speed_mm_s,
+            DEFAULT_Z_ACCEL_MM_S2,
+        );
+        *st.cur_z = layer.z_top_mm;
+        *st.z_hopped = false;
+    }
+
+    if *st.retracted && st.retract_len > 0.0 {
+        emit_e_move(
+            st.out,
+            config.machine.relative_extrusion,
+            st.cur_e,
+            st.retract_len,
+            st.retract_f,
+        )?;
+        *st.retracted = false;
+        *st.total_time_s += estimate_trapezoid_move_time_s(
+            st.retract_len,
+            config.machine.retraction_speed_mm_s,
+            DEFAULT_EXTRUSION_ACCEL_MM_S2,
+        );
+    }
+
+    let eff_flow = (path.flow_ratio * config.filament.flow_ratio).max(0.001);
+    let bead_area = bead_area_mm2(path.width_mm, path.height_mm) * eff_flow;
+    let eff_speed = if bead_area > 1e-9 {
+        path.speed_mm_s
+            .min(config.filament.max_volumetric_speed_mm3_s / bead_area)
+    } else {
+        path.speed_mm_s
+    }
+    .max(1e-3);
+    let feed = (eff_speed * 60.0).floor().max(1.0);
+    let actual_speed = feed / 60.0;
+
+    let f_entry = st
+        .feature_stats
+        .entry(path.role.label().to_owned())
+        .or_default();
+
+    let mut path_trail = Vec::with_capacity(iter_pts.len() + 2);
+    path_trail.push((*st.cur_x, *st.cur_y));
+
+    let mut pts_mm = Vec::with_capacity(iter_pts.len() + 1);
+    pts_mm.push((*st.cur_x, *st.cur_y));
+    for pt in iter_pts {
+        pts_mm.push(pt.to_mm());
+    }
+
+    let is_varying_w = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
+        let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
+        max_w - min_w > 1e-4
+    };
+
+    let total_loop_len: f64 = pts_mm
+        .windows(2)
+        .filter_map(|w| Some((w.first()?, w.get(1)?)))
+        .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
+        .sum();
+    let scarf = &config.process.scarf_seam;
+    let use_scarf = scarf.enabled
+        && layer.index > 0
+        && path.closed
+        && path.role == ExtrusionRole::OuterWall
+        && !is_varying_w
+        && total_loop_len >= scarf.min_length_mm;
+
+    let role_accel = effective_role_accel_mm_s2(layer.index, path.role, config);
+    let mut emitted_pts = Vec::with_capacity(pts_mm.len() + 4);
+    emitted_pts.push((*st.cur_x, *st.cur_y));
+    let emitted_speeds = Vec::with_capacity(pts_mm.len() + 4);
+
+    let mut emit_ctx = PathEmitCtx {
+        out: st.out,
+        cur_x: st.cur_x,
+        cur_y: st.cur_y,
+        cur_e: st.cur_e,
+        total_e_mm: st.total_e_mm,
+        total_time_s: st.total_time_s,
+        has_extruded: st.has_extruded,
+        f_entry,
+        path_trail: &mut path_trail,
+        emitted_pts,
+        emitted_speeds,
+        accel_mm_s2: role_accel,
+        relative_e: config.machine.relative_extrusion,
+        fil_area: st.fil_area,
+        fil_diam: config.filament.diameter_mm,
+        density: config.filament.density_g_cm3,
+        width_mm: path.width_mm,
+        height_mm: path.height_mm,
+        base_flow: eff_flow,
+        base_speed_mm_s: path.speed_mm_s,
+        max_vol_flow: config.filament.max_volumetric_speed_mm3_s,
+        feed,
+        actual_speed,
+    };
+
+    let mut scarf_done = false;
+    if use_scarf {
+        let target_len = if scarf.entire_loop {
+            total_loop_len
+        } else {
+            scarf.length_mm.min(0.45 * total_loop_len)
+        };
+        if target_len >= 1.0
+            && let Some(sub) = subdivide_loop_for_scarf(&pts_mm, target_len, scarf.steps as usize)
+        {
+            let z_base = layer.z_top_mm - path.height_mm;
+            let z_start = z_base + scarf.start_height_ratio * path.height_mm;
+            writeln!(emit_ctx.out, ";SCARF_START").map_err(|_| GcodeError::FormatError)?;
+            writeln!(emit_ctx.out, "G0 Z{z_start:.3} F{:.0}", st.zhop_f)
+                .map_err(|_| GcodeError::FormatError)?;
+            *emit_ctx.total_time_s += estimate_trapezoid_move_time_s(
+                (*st.cur_z - z_start).abs(),
+                config.machine.z_hop_speed_mm_s,
+                DEFAULT_Z_ACCEL_MM_S2,
+            );
+
+            // Phase A: ascending Z & flow ramp over [0..L].
+            let mut ramp_z = z_start;
+            for pair in sub.ramp_pts.windows(2) {
+                let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
+                    continue;
+                };
+                let seg_len = (x1 - x0).hypot(y1 - y0);
+                if seg_len <= 1e-6 {
+                    continue;
+                }
+                let t_end = (s1 / target_len).clamp(0.0, 1.0);
+                let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+                let z1 = z_start + t_end * (layer.z_top_mm - z_start);
+                let frac_a = (scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio))
+                    * scarf.flow_ratio;
+                emit_ctx.emit_linear((x1, y1), seg_len, Some(z1), frac_a)?;
+                ramp_z = z1;
+            }
+            if (ramp_z - layer.z_top_mm).abs() > 1e-4 {
+                writeln!(emit_ctx.out, "G0 Z{:.3} F{:.0}", layer.z_top_mm, st.zhop_f)
+                    .map_err(|_| GcodeError::FormatError)?;
+            }
+            *st.cur_z = layer.z_top_mm;
+
+            // Phase B: constant-Z body over [L..P].
+            if sub.body_pts.len() >= 2 {
+                emit_ctx.emit_xy_sequence(&sub.body_pts, config)?;
+            }
+
+            // Phase C: complementary flow overlap at constant Z = layer.z_top_mm over [0..L].
+            for pair in sub.ramp_pts.windows(2) {
+                let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
+                    continue;
+                };
+                let seg_len = (x1 - x0).hypot(y1 - y0);
+                if seg_len <= 1e-6 {
+                    continue;
+                }
+                let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+                let height_frac =
+                    scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
+                let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
+                emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
+            }
+            writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
+            scarf_done = true;
+        }
+    }
+
+    if !scarf_done {
+        emit_ctx.emit_xy_sequence_variable(&pts_mm, &widths_mm, config)?;
+    }
+    emit_ctx.finish_kinematic_time();
+
+    *st.last_path_trail = path_trail;
+    *st.prev_role = Some(path.role);
+    Ok(())
+}
+
 struct PathEmitCtx<'a> {
     out: &'a mut String,
     cur_x: &'a mut f64,
@@ -966,6 +1143,9 @@ struct PathEmitCtx<'a> {
     has_extruded: &'a mut bool,
     f_entry: &'a mut FeatureStats,
     path_trail: &'a mut Vec<(f64, f64)>,
+    emitted_pts: Vec<(f64, f64)>,
+    emitted_speeds: Vec<f64>,
+    accel_mm_s2: f64,
     relative_e: bool,
     fil_area: f64,
     fil_diam: f64,
@@ -1003,67 +1183,81 @@ impl PathEmitCtx<'_> {
         &mut self,
         len_mm: f64,
         width_mm: f64,
-        speed_mm_s: f64,
+        _speed_mm_s: f64,
         flow_mult: f64,
     ) -> f64 {
         let de = extrusion_delta_mm(len_mm, width_mm, self.height_mm, self.fil_diam)
             * self.base_flow
             * flow_mult;
         let vol = de * self.fil_area;
-        let dt = len_mm / speed_mm_s.max(1e-6);
         *self.total_e_mm += de;
-        *self.total_time_s += dt;
         self.f_entry.volume_mm3 += vol;
         self.f_entry.weight_g += vol * 0.001 * self.density;
-        self.f_entry.estimated_time_s += dt;
         *self.has_extruded = true;
         de
+    }
+
+    fn finish_kinematic_time(&mut self) {
+        let dt = estimate_polyline_kinematic_time_s(
+            &self.emitted_pts,
+            &self.emitted_speeds,
+            self.accel_mm_s2,
+            DEFAULT_JUNCTION_DEVIATION_MM,
+        );
+        *self.total_time_s += dt;
+        self.f_entry.estimated_time_s += dt;
     }
 
     fn emit_linear(
         &mut self,
         to: (f64, f64),
-        len_mm: f64,
+        _len_mm: f64,
         z_override: Option<f64>,
         flow_mult: f64,
     ) -> Result<(), GcodeError> {
         let width_mm = self.width_mm;
         let feed = self.feed;
         let speed = self.actual_speed;
-        self.emit_linear_with_width(to, len_mm, width_mm, feed, speed, z_override, flow_mult)
+        self.emit_linear_with_width(to, _len_mm, width_mm, feed, speed, z_override, flow_mult)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn emit_linear_with_width(
         &mut self,
         to: (f64, f64),
-        len_mm: f64,
+        _len_mm: f64,
         width_mm: f64,
         feed: f64,
         speed_mm_s: f64,
         z_override: Option<f64>,
         flow_mult: f64,
     ) -> Result<(), GcodeError> {
-        let de = self.account_segment_with_width(len_mm, width_mm, speed_mm_s, flow_mult);
+        let qx0 = round3(*self.cur_x);
+        let qy0 = round3(*self.cur_y);
+        let qx1 = round3(to.0);
+        let qy1 = round3(to.1);
+        let actual_len = (qx1 - qx0).hypot(qy1 - qy0);
+        if actual_len <= 1e-6 && z_override.is_none() {
+            return Ok(());
+        }
+        let de = self.account_segment_with_width(actual_len, width_mm, speed_mm_s, flow_mult);
         let e_val = next_e_val(self.relative_e, self.cur_e, de);
         if let Some(z) = z_override {
             writeln!(
                 self.out,
-                "G1 X{:.3} Y{:.3} Z{z:.3} E{e_val:.5} F{:.0}",
-                to.0, to.1, feed
+                "G1 X{qx1:.3} Y{qy1:.3} Z{z:.3} E{e_val:.5} F{feed:.0}"
             )
             .map_err(|_| GcodeError::FormatError)?;
         } else {
-            writeln!(
-                self.out,
-                "G1 X{:.3} Y{:.3} E{e_val:.5} F{:.0}",
-                to.0, to.1, feed
-            )
-            .map_err(|_| GcodeError::FormatError)?;
+            writeln!(self.out, "G1 X{qx1:.3} Y{qy1:.3} E{e_val:.5} F{feed:.0}")
+                .map_err(|_| GcodeError::FormatError)?;
         }
-        *self.cur_x = to.0;
-        *self.cur_y = to.1;
-        self.path_trail.push(to);
+        *self.cur_x = qx1;
+        *self.cur_y = qy1;
+        let q_pt = (qx1, qy1);
+        self.path_trail.push(q_pt);
+        self.emitted_pts.push(q_pt);
+        self.emitted_speeds.push(speed_mm_s);
         Ok(())
     }
 
@@ -1076,7 +1270,9 @@ impl PathEmitCtx<'_> {
         sweep_rad: f64,
         len_mm: f64,
     ) -> Result<(), GcodeError> {
-        let from = (*self.cur_x, *self.cur_y);
+        let from = (round3(*self.cur_x), round3(*self.cur_y));
+        let qx1 = round3(to.0);
+        let qy1 = round3(to.1);
         let i_off = center.0 - from.0;
         let j_off = center.1 - from.1;
         let de = self.account_segment(len_mm, 1.0);
@@ -1084,14 +1280,18 @@ impl PathEmitCtx<'_> {
         let cmd = if cw { "G2" } else { "G3" };
         writeln!(
             self.out,
-            "{cmd} X{:.3} Y{:.3} I{i_off:.4} J{j_off:.4} E{e_val:.5} F{:.0}",
-            to.0, to.1, self.feed
+            "{cmd} X{qx1:.3} Y{qy1:.3} I{i_off:.4} J{j_off:.4} E{e_val:.5} F{:.0}",
+            self.feed
         )
         .map_err(|_| GcodeError::FormatError)?;
         let samples = arc::sample_arc_points(from, center, radius, cw, sweep_rad, 0.25);
+        for &sp in &samples {
+            self.emitted_pts.push(sp);
+            self.emitted_speeds.push(self.actual_speed);
+        }
         self.path_trail.extend(samples);
-        *self.cur_x = to.0;
-        *self.cur_y = to.1;
+        *self.cur_x = qx1;
+        *self.cur_y = qy1;
         Ok(())
     }
 
@@ -1281,6 +1481,12 @@ fn subdivide_loop_for_scarf(
 }
 
 #[inline]
+fn round3(v: f64) -> f64 {
+    let r = (v * 1000.0).round() * 0.001;
+    if r == 0.0 { 0.0 } else { r }
+}
+
+#[inline]
 fn next_e_val(relative: bool, cur_e: &mut f64, delta_e: f64) -> f64 {
     if relative {
         delta_e
@@ -1377,8 +1583,13 @@ fn perform_retract(
                 .min(config.machine.retraction_speed_mm_s * (total_wiped / wipe_e_total.max(1e-6)))
                 .max(1e-3);
             let wipe_f = (wipe_speed * 60.0).floor().max(1.0);
+            let actual_wipe_speed = wipe_f / 60.0;
+            let mut wipe_pts = Vec::with_capacity(wipe_segs.len() + 1);
+            wipe_pts.push((*cur_x, *cur_y));
             let mut e_emitted = 0.0;
-            for (idx, &(wx, wy, seg_len)) in wipe_segs.iter().enumerate() {
+            for (idx, &(wx_raw, wy_raw, seg_len)) in wipe_segs.iter().enumerate() {
+                let wx = round3(wx_raw);
+                let wy = round3(wy_raw);
                 let step_mag = if idx + 1 == wipe_segs.len() {
                     wipe_e_total - e_emitted
                 } else {
@@ -1391,8 +1602,15 @@ fn perform_retract(
                 *cur_x = wx;
                 *cur_y = wy;
                 *total_travel_mm += seg_len;
-                *total_time_s += seg_len / (wipe_f / 60.0);
+                wipe_pts.push((wx, wy));
             }
+            let wipe_speeds = vec![actual_wipe_speed; wipe_pts.len().saturating_sub(1)];
+            *total_time_s += estimate_polyline_kinematic_time_s(
+                &wipe_pts,
+                &wipe_speeds,
+                DEFAULT_EXTRUSION_ACCEL_MM_S2,
+                DEFAULT_JUNCTION_DEVIATION_MM,
+            );
             let in_place_e = retract_len - wipe_e_total;
             if in_place_e > 1e-6 {
                 emit_e_move(
@@ -1402,7 +1620,11 @@ fn perform_retract(
                     -in_place_e,
                     retract_f,
                 )?;
-                *total_time_s += in_place_e / config.machine.retraction_speed_mm_s;
+                *total_time_s += estimate_trapezoid_move_time_s(
+                    in_place_e,
+                    config.machine.retraction_speed_mm_s,
+                    DEFAULT_EXTRUSION_ACCEL_MM_S2,
+                );
             }
             writeln!(out, ";WIPE_END").map_err(|_| GcodeError::FormatError)?;
             return Ok(());
@@ -1416,7 +1638,11 @@ fn perform_retract(
         -retract_len,
         retract_f,
     )?;
-    *total_time_s += retract_len / config.machine.retraction_speed_mm_s;
+    *total_time_s += estimate_trapezoid_move_time_s(
+        retract_len,
+        config.machine.retraction_speed_mm_s,
+        DEFAULT_EXTRUSION_ACCEL_MM_S2,
+    );
     Ok(())
 }
 
@@ -3703,7 +3929,7 @@ mod tests {
         base.machine.z_hop_mm = 0.2;
         base.machine.wipe_on_retract = true;
         base.machine.wipe_distance_mm = 1.5;
-        base.process.sparse_infill_pattern = layercraft_config::InfillPattern::Gyroid;
+        base.process.sparse_infill_pattern = layercraft_config::InfillPattern::Grid;
         base.process.sparse_infill_density = 0.20;
 
         let cube = make_box(20.0, 20.0, 6.0);
@@ -3822,5 +4048,67 @@ mod tests {
             }
         }
         assert!(seen_lift_z && seen_xy_travel_at_lift);
+    }
+
+    #[test]
+    fn gyroid_chaining_and_post_seam_ordering_cut_cube_travel() {
+        let lib = layercraft_config::ProfileLibrary::with_builtin_presets();
+        let cfg = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PLA (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap()
+            .config;
+        let out = emit_gcode(
+            &slice_single_mesh(&make_box(20.0, 20.0, 20.0), &cfg).unwrap(),
+            &cfg,
+        )
+        .unwrap();
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert!(
+            rep.total_travel_mm < 4200.0,
+            "expected travel < 4200 mm after chaining + post-seam ordering, got {:.1}",
+            rep.total_travel_mm
+        );
+    }
+
+    #[test]
+    fn internal_bridge_emits_type_and_kinematic_time_responds_to_accel() {
+        let cube = make_box(20.0, 20.0, 8.0);
+        let mut cfg_low = PrintConfig::default();
+        cfg_low.process.top_shell_layers = 4;
+        cfg_low.process.bottom_shell_layers = 3;
+        cfg_low.process.sparse_infill_density = 0.15;
+        cfg_low.process.detect_bridges = true;
+        cfg_low.filament.slow_down_layer_time_s = 0.0;
+        cfg_low.process.outer_wall_speed_mm_s = 120.0;
+        cfg_low.process.inner_wall_speed_mm_s = 160.0;
+        cfg_low.process.infill_speed_mm_s = 200.0;
+        cfg_low.process.default_acceleration_mm_s2 = Some(1000.0);
+
+        let mut cfg_high = cfg_low.clone();
+        cfg_high.process.default_acceleration_mm_s2 = Some(10000.0);
+
+        let out_low = emit_gcode(&slice_single_mesh(&cube, &cfg_low).unwrap(), &cfg_low).unwrap();
+        let out_high =
+            emit_gcode(&slice_single_mesh(&cube, &cfg_high).unwrap(), &cfg_high).unwrap();
+
+        assert!(out_low.gcode.contains(";TYPE:Internal Bridge"));
+        assert!(
+            out_low.stats.estimated_time_s > out_high.stats.estimated_time_s + 5.0,
+            "expected kinematic accel to materially change print time: low={} high={}",
+            out_low.stats.estimated_time_s,
+            out_high.stats.estimated_time_s
+        );
     }
 }

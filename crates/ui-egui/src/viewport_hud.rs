@@ -260,6 +260,7 @@ fn draw_preview_summary_hud(
                             ExtrusionRole::BottomSurface,
                             ExtrusionRole::InternalSolidInfill,
                             ExtrusionRole::Bridge,
+                            ExtrusionRole::InternalBridge,
                             ExtrusionRole::SparseInfill,
                             ExtrusionRole::Support,
                             ExtrusionRole::SupportInterface,
