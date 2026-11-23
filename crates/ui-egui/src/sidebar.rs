@@ -1388,13 +1388,19 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
             toggle_switch(ui, p, &mut m.emit_progress_m73);
         });
         let mut thumb_enabled = !m.thumbnails.is_empty();
-        setting_row(ui, p, "Embed PNG thumbnail", |ui| {
+        setting_row(ui, p, "Embed G-code thumbnails", |ui| {
             if toggle_switch(ui, p, &mut thumb_enabled).changed() {
                 if thumb_enabled {
-                    m.thumbnails = vec![ThumbnailSize {
-                        width: 160,
-                        height: 120,
-                    }];
+                    if m.flavor == GcodeFlavor::MarlinBuddy {
+                        m.thumbnails = vec![
+                            ThumbnailSize::qoi(16, 16),
+                            ThumbnailSize::qoi(313, 173),
+                            ThumbnailSize::qoi(440, 240),
+                            ThumbnailSize::png(160, 120),
+                        ];
+                    } else {
+                        m.thumbnails = vec![ThumbnailSize::png(160, 120)];
+                    }
                 } else {
                     m.thumbnails.clear();
                 }
@@ -1414,6 +1420,9 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         });
         setting_row(ui, p, "Bed temp", |ui| {
             unit_drag(ui, &mut f.bed_temp_c, 0..=130, 1.0, "°C");
+        });
+        setting_row(ui, p, "Flow ratio", |ui| {
+            unit_drag(ui, &mut f.flow_ratio, 0.5..=1.5, 0.01, "×");
         });
         let mut ch_val = f.chamber_temp_c.unwrap_or(0);
         setting_row(ui, p, "Chamber (0=off)", |ui| {
@@ -1449,6 +1458,9 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         });
         setting_row(ui, p, "Wipe distance", |ui| {
             unit_drag(ui, &mut cfg.machine.wipe_distance_mm, 0.0..=10.0, 0.1, "mm");
+        });
+        setting_row(ui, p, "Reduce infill retractions", |ui| {
+            toggle_switch(ui, p, &mut cfg.process.reduce_infill_retraction);
         });
         setting_row(ui, p, "Avoid crossing walls", |ui| {
             toggle_switch(ui, p, &mut cfg.process.avoid_crossing_perimeters);

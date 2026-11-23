@@ -1007,6 +1007,7 @@ fn apply_flow_and_cooling(
     let mut prev_end: Option<Point2> = None;
     let mut has_bridge_or_overhang = false;
 
+    let fil_flow = config.filament.flow_ratio.max(0.001);
     for path in paths.iter_mut() {
         if matches!(
             path.role,
@@ -1015,7 +1016,7 @@ fn apply_flow_and_cooling(
             has_bridge_or_overhang = true;
         }
         let min_w = path.min_width_mm();
-        let eff_area = bead_area_mm2(min_w, path.height_mm) * path.flow_ratio.max(0.001);
+        let eff_area = bead_area_mm2(min_w, path.height_mm) * path.flow_ratio.max(0.001) * fil_flow;
         if eff_area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
             path.speed_mm_s = path.speed_mm_s.min(max_vol_flow / eff_area);
         }
@@ -1024,7 +1025,7 @@ fn apply_flow_and_cooling(
         if path.has_variable_width() && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
             let n = path.points.len();
             let segs = if path.closed { n } else { n.saturating_sub(1) };
-            let flow = path.flow_ratio.max(0.001);
+            let flow = path.flow_ratio.max(0.001) * fil_flow;
             for si in 0..segs {
                 let (Some(&a), Some(&b)) = (path.points.get(si), path.points.get((si + 1) % n))
                 else {

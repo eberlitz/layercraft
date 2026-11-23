@@ -1,4 +1,4 @@
-//! Embedded PNG thumbnail renderer and base64 G-code comment block formatter.
+//! Embedded PNG and QOI thumbnail renderer and base64 G-code comment block formatter.
 
 use std::fmt::Write as _;
 
@@ -201,8 +201,7 @@ impl ThumbCanvas {
     }
 }
 
-/// Render an isometric studio RGB8 PNG thumbnail of the sliced plate toolpaths.
-pub fn render_gcode_thumbnail_png(
+fn render_gcode_thumbnail_rgb_canvas(
     plate: &SlicedPlate,
     config: &PrintConfig,
     width: u32,
@@ -278,6 +277,17 @@ pub fn render_gcode_thumbnail_png(
         }
     }
 
+    Ok(canvas.color_buf)
+}
+
+/// Render an isometric studio RGB8 PNG thumbnail of the sliced plate toolpaths.
+pub fn render_gcode_thumbnail_png(
+    plate: &SlicedPlate,
+    config: &PrintConfig,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, GcodeError> {
+    let rgb = render_gcode_thumbnail_rgb_canvas(plate, config, width, height)?;
     let mut png_out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut png_out, width, height);
@@ -287,10 +297,97 @@ pub fn render_gcode_thumbnail_png(
             .write_header()
             .map_err(|_| GcodeError::FormatError)?;
         writer
-            .write_image_data(&canvas.color_buf)
+            .write_image_data(&rgb)
             .map_err(|_| GcodeError::FormatError)?;
     }
     Ok(png_out)
+}
+
+/// Encode raw RGB8 pixel buffer into the Quite OK Image (QOI) lossless format.
+pub fn encode_qoi_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, GcodeError> {
+    if width == 0 || height == 0 {
+        return Err(GcodeError::InvalidParameter("machine.thumbnails"));
+    }
+    let px_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(GcodeError::InvalidParameter("machine.thumbnails"))?;
+    let expected_len = px_count
+        .checked_mul(3)
+        .ok_or(GcodeError::InvalidParameter("machine.thumbnails"))?;
+    if rgb.len() != expected_len {
+        return Err(GcodeError::InvalidParameter("machine.thumbnails"));
+    }
+
+    let mut out = Vec::with_capacity(14 + px_count + 8);
+    out.extend_from_slice(b"qoif");
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    out.push(3u8); // RGB channels
+    out.push(0u8); // sRGB with linear alpha
+
+    let mut index = [[0u8; 4]; 64];
+    let mut prev = [0u8, 0, 0, 255];
+    let mut run: u8 = 0;
+
+    for (idx, &[r, g, b]) in rgb.as_chunks::<3>().0.iter().enumerate() {
+        let px = [r, g, b, 255];
+        let is_last = idx + 1 == px_count;
+
+        if px == prev {
+            run += 1;
+            if run == 62 || is_last {
+                out.push(0xC0 | (run - 1));
+                run = 0;
+            }
+        } else {
+            if run > 0 {
+                out.push(0xC0 | (run - 1));
+                run = 0;
+            }
+            let hash = ((r as usize) * 3 + (g as usize) * 5 + (b as usize) * 7 + 255 * 11) & 63;
+            if index.get(hash) == Some(&px) {
+                out.push(hash as u8);
+            } else {
+                if let Some(slot) = index.get_mut(hash) {
+                    *slot = px;
+                }
+                let [pr, pg, pb, _pa] = prev;
+                let vr = r.wrapping_sub(pr) as i8;
+                let vg = g.wrapping_sub(pg) as i8;
+                let vb = b.wrapping_sub(pb) as i8;
+                let vg_r = vr.wrapping_sub(vg);
+                let vg_b = vb.wrapping_sub(vg);
+                if (-2..=1).contains(&vr) && (-2..=1).contains(&vg) && (-2..=1).contains(&vb) {
+                    out.push(
+                        0x40 | (((vr + 2) as u8) << 4) | (((vg + 2) as u8) << 2) | ((vb + 2) as u8),
+                    );
+                } else if (-32..=31).contains(&vg)
+                    && (-8..=7).contains(&vg_r)
+                    && (-8..=7).contains(&vg_b)
+                {
+                    out.push(0x80 | ((vg + 32) as u8));
+                    out.push((((vg_r + 8) as u8) << 4) | ((vg_b + 8) as u8));
+                } else {
+                    out.extend_from_slice(&[0xFE, r, g, b]);
+                }
+            }
+            prev = px;
+        }
+    }
+
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+    Ok(out)
+}
+
+/// Render an isometric studio RGB8 QOI thumbnail of the sliced plate toolpaths (Prusa Buddy LCD).
+pub fn render_gcode_thumbnail_qoi(
+    plate: &SlicedPlate,
+    config: &PrintConfig,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, GcodeError> {
+    let rgb = render_gcode_thumbnail_rgb_canvas(plate, config, width, height)?;
+    encode_qoi_rgb(width, height, &rgb)
 }
 
 /// Format raw PNG bytes into a Prusa / Klipper / Mainsail G-code thumbnail comment block.
@@ -299,14 +396,138 @@ pub fn format_thumbnail_block(
     height: u32,
     png_bytes: &[u8],
 ) -> Result<String, GcodeError> {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    format_thumbnail_block_with_tag("thumbnail", width, height, png_bytes)
+}
+
+/// Format raw QOI bytes into a Prusa Buddy firmware G-code thumbnail comment block.
+pub fn format_qoi_thumbnail_block(
+    width: u32,
+    height: u32,
+    qoi_bytes: &[u8],
+) -> Result<String, GcodeError> {
+    format_thumbnail_block_with_tag("thumbnail_QOI", width, height, qoi_bytes)
+}
+
+fn format_thumbnail_block_with_tag(
+    tag: &str,
+    width: u32,
+    height: u32,
+    payload_bytes: &[u8],
+) -> Result<String, GcodeError> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(payload_bytes);
     let mut out = String::with_capacity(b64.len() + 128);
-    writeln!(out, "; thumbnail begin {width}x{height} {}", b64.len())
+    writeln!(out, "; {tag} begin {width}x{height} {}", b64.len())
         .map_err(|_| GcodeError::FormatError)?;
     for chunk in b64.as_bytes().chunks(78) {
         let s = std::str::from_utf8(chunk).map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "; {s}").map_err(|_| GcodeError::FormatError)?;
     }
-    writeln!(out, "; thumbnail end").map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; {tag} end").map_err(|_| GcodeError::FormatError)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use layercraft_slice::slice_single_mesh;
+
+    fn decode_qoi_rgb(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        assert!(bytes.len() >= 22);
+        assert_eq!(&bytes[..4], b"qoif");
+        let w = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        let h = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(bytes[12], 3);
+        assert_eq!(bytes[13], 0);
+        assert_eq!(&bytes[bytes.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let px_count = (w as usize) * (h as usize);
+        let data = &bytes[14..bytes.len() - 8];
+        let mut p = 0usize;
+        let mut index = [[0u8; 4]; 64];
+        let mut prev = [0u8, 0, 0, 255];
+        let mut run = 0usize;
+        let mut out = Vec::with_capacity(px_count * 3);
+
+        for _ in 0..px_count {
+            if run > 0 {
+                run -= 1;
+            } else {
+                let tag = data[p];
+                p += 1;
+                if tag == 0xFE {
+                    prev = [data[p], data[p + 1], data[p + 2], prev[3]];
+                    p += 3;
+                } else if tag == 0xFF {
+                    prev = [data[p], data[p + 1], data[p + 2], data[p + 3]];
+                    p += 4;
+                } else if (tag & 0xC0) == 0x00 {
+                    prev = index[tag as usize];
+                } else if (tag & 0xC0) == 0x40 {
+                    let dr = ((tag >> 4) & 0x03) as i8 - 2;
+                    let dg = ((tag >> 2) & 0x03) as i8 - 2;
+                    let db = (tag & 0x03) as i8 - 2;
+                    prev[0] = prev[0].wrapping_add(dr as u8);
+                    prev[1] = prev[1].wrapping_add(dg as u8);
+                    prev[2] = prev[2].wrapping_add(db as u8);
+                } else if (tag & 0xC0) == 0x80 {
+                    let dg = (tag & 0x3F) as i8 - 32;
+                    let b2 = data[p];
+                    p += 1;
+                    let vg_r = ((b2 >> 4) & 0x0F) as i8 - 8;
+                    let vg_b = (b2 & 0x0F) as i8 - 8;
+                    prev[0] = prev[0].wrapping_add((dg + vg_r) as u8);
+                    prev[1] = prev[1].wrapping_add(dg as u8);
+                    prev[2] = prev[2].wrapping_add((dg + vg_b) as u8);
+                } else if (tag & 0xC0) == 0xC0 {
+                    run = (tag & 0x3F) as usize;
+                }
+                let hash = ((prev[0] as usize) * 3
+                    + (prev[1] as usize) * 5
+                    + (prev[2] as usize) * 7
+                    + (prev[3] as usize) * 11)
+                    & 63;
+                index[hash] = prev;
+            }
+            out.extend_from_slice(&prev[..3]);
+        }
+        assert_eq!(p, data.len());
+        (w, h, out)
+    }
+
+    #[test]
+    fn qoi_encoder_roundtrips_synthetic_and_plate_thumbnails_bit_exact() {
+        // Synthetic grid exercising RUN (>62 identical), DIFF, LUMA, INDEX, and raw RGB.
+        let w = 24u32;
+        let h = 12u32;
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let p = if y < 3 {
+                    [17, 22, 31] // >62-pixel uniform run
+                } else if y == 3 {
+                    [17 + (x as u8 % 3), 22 + (x as u8 % 2), 31] // small DIFF
+                } else if y == 4 {
+                    [100, 100u8.wrapping_add((x as u8).saturating_mul(2)), 105] // LUMA
+                } else if y % 2 == 0 {
+                    [((x * 37) & 255) as u8, ((y * 73) & 255) as u8, 200] // raw RGB
+                } else {
+                    [17, 22, 31] // INDEX hit
+                };
+                rgb.extend_from_slice(&p);
+            }
+        }
+        let encoded = encode_qoi_rgb(w, h, &rgb).unwrap();
+        let (dw, dh, decoded) = decode_qoi_rgb(&encoded);
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(decoded, rgb);
+
+        let box_mesh = layercraft_testkit::make_box(20.0, 20.0, 4.0).unwrap();
+        let cfg = PrintConfig::default();
+        let plate = slice_single_mesh(&box_mesh, &cfg).unwrap();
+        let raw_canvas = render_gcode_thumbnail_rgb_canvas(&plate, &cfg, 160, 120).unwrap();
+        let qoi_plate = render_gcode_thumbnail_qoi(&plate, &cfg, 160, 120).unwrap();
+        let (pw, ph, pdec) = decode_qoi_rgb(&qoi_plate);
+        assert_eq!((pw, ph), (160, 120));
+        assert_eq!(pdec, raw_canvas);
+    }
 }

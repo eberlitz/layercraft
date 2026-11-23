@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     ConfigError, GcodeFlavor, InfillPattern, IroningType, PrintConfig, SeamPosition, SupportStyle,
-    SurfacePattern, ThumbnailSize, WallGenerator, WallOrder,
+    SurfacePattern, ThumbnailFormat, ThumbnailSize, WallGenerator, WallOrder,
 };
 
 /// Maximum inheritance chain length allowed when resolving profiles.
@@ -836,7 +836,15 @@ fn parse_thumbnails_val(key: &str, val: &Value) -> Result<Vec<ThumbnailSize>, Pr
             if clean.is_empty() || clean.eq_ignore_ascii_case("nil") {
                 continue;
             }
-            let dims = clean.split('/').next().unwrap_or(clean).trim();
+            let (dims, fmt_opt) = match clean.split_once('/') {
+                Some((d, f)) => (d.trim(), Some(f.trim())),
+                None => (clean, None),
+            };
+            let format = if fmt_opt.is_some_and(|f| f.eq_ignore_ascii_case("qoi")) {
+                ThumbnailFormat::Qoi
+            } else {
+                ThumbnailFormat::Png
+            };
             let Some((w_str, h_str)) = dims.split_once(['x', 'X']) else {
                 return Err(ProfileError::InvalidValue {
                     key: key.to_owned(),
@@ -863,7 +871,11 @@ fn parse_thumbnails_val(key: &str, val: &Value) -> Result<Vec<ThumbnailSize>, Pr
                     reason: format!("thumbnail size `{width}x{height}` must be within 16..=640"),
                 });
             }
-            sizes.push(ThumbnailSize { width, height });
+            sizes.push(ThumbnailSize {
+                width,
+                height,
+                format,
+            });
         }
     }
     if sizes.len() > 4 {
@@ -1584,6 +1596,13 @@ fn apply_filament_settings(
         cfg.filament.first_layer_bed_temp_c = Some(temp);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["filament_flow_ratio", "extrusion_multiplier"])
+        && !is_nil_value(v)
+    {
+        cfg.filament.flow_ratio = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["filament_max_volumetric_speed"])
         && !is_nil_value(v)
     {
@@ -2146,6 +2165,13 @@ fn apply_process_settings_pass1(
         && !is_nil_value(v)
     {
         cfg.process.avoid_crossing_perimeters = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["reduce_infill_retraction"])
+        && !is_nil_value(v)
+    {
+        cfg.process.reduce_infill_retraction = parse_bool_val(k, v)?;
         ctx.mark_applied(k);
     }
 
@@ -2744,25 +2770,30 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "wipe_distance": ["1.5"],
                 "travel_speed": "250",
                 "remaining_times": "1",
-                "thumbnails": ["160x120"],
+                "thumbnails": ["16x16/QOI", "313x173/QOI", "440x240/QOI", "160x120/PNG"],
                 "machine_start_gcode": concat!(
+                    "M17\n",
                     "M862.3 P \"[printer_model]\"\n",
-                    "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M862.1 P[nozzle_diameter] A0 F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M862.5 P2\n",
                     "M555 X[first_layer_print_min_x] Y[first_layer_print_min_y] W[first_layer_print_size_x] H[first_layer_print_size_y]\n",
                     "G90\n",
                     "M83\n",
                     "M104 S170\n",
                     "M140 S[first_layer_bed_temperature]\n",
-                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{else}M141 S0{endif}\n",
+                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{elsif filament_type == \"PLA\"}M141 S0\nM106 P3 S127{else}M141 S0{endif}\n",
                     "M190 S[first_layer_bed_temperature]\n",
                     "M109 S170\n",
                     "G28\n",
+                    "G29 P9 X208 Y-2.5 W32 H4\n",
                     "G29\n",
-                    "G1 X5 Y5 Z10 F6000\n",
+                    "G1 X5 Y-2.5 Z10 F6000\n",
                     "M109 S[first_layer_temperature]\n",
                     "G1 Z0.2 F1200\n",
                     "G1 X65 E1.8 F600\n",
                     "G1 X75 E0.2 F600\n",
+                    "G1 X80 F6000\n",
+                    "G1 Z2.0 F1200\n",
                     "G92 E0"
                 ),
                 "machine_end_gcode": concat!(
@@ -2770,8 +2801,9 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                     "M104 S0\n",
                     "M140 S0\n",
                     "M141 S0\n",
+                    "M106 P3 R\n",
                     "M107\n",
-                    "G1 Z{min(max_z + 15, bed_height)} F900\n",
+                    "G1 Z{min(max(max_z + 15, 100), bed_height)} F900\n",
                     "G1 X{bed_width - 10} Y{bed_depth - 10} F9000\n",
                     "M84"
                 )
@@ -2797,25 +2829,30 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "wipe_distance": ["1.5"],
                 "travel_speed": "300",
                 "remaining_times": "1",
-                "thumbnails": ["160x120"],
+                "thumbnails": ["16x16/QOI", "313x173/QOI", "440x240/QOI", "160x120/PNG"],
                 "machine_start_gcode": concat!(
+                    "M17\n",
                     "M862.3 P \"[printer_model]\"\n",
-                    "M862.1 P[nozzle_diameter] F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M862.1 P[nozzle_diameter] A0 F{if nozzle_high_flow}1{else}0{endif}\n",
+                    "M862.5 P2\n",
                     "M555 X[first_layer_print_min_x] Y[first_layer_print_min_y] W[first_layer_print_size_x] H[first_layer_print_size_y]\n",
                     "G90\n",
                     "M83\n",
                     "M104 S170\n",
                     "M140 S[first_layer_bed_temperature]\n",
-                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{else}M141 S0{endif}\n",
+                    "{if chamber_temperature > 0}M141 S[chamber_temperature]{elsif filament_type == \"PLA\"}M141 S0\nM106 P3 S127{else}M141 S0{endif}\n",
                     "M190 S[first_layer_bed_temperature]\n",
                     "M109 S170\n",
                     "G28\n",
+                    "G29 P9 X208 Y-2.5 W32 H4\n",
                     "G29\n",
-                    "G1 X5 Y5 Z10 F6000\n",
+                    "G1 X5 Y-2.5 Z10 F6000\n",
                     "M109 S[first_layer_temperature]\n",
                     "G1 Z0.2 F1200\n",
                     "G1 X65 E3.0 F800\n",
                     "G1 X75 E0.4 F800\n",
+                    "G1 X80 F6000\n",
+                    "G1 Z2.0 F1200\n",
                     "G92 E0"
                 ),
                 "machine_end_gcode": concat!(
@@ -2823,8 +2860,9 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                     "M104 S0\n",
                     "M140 S0\n",
                     "M141 S0\n",
+                    "M106 P3 R\n",
                     "M107\n",
-                    "G1 Z{min(max_z + 15, bed_height)} F900\n",
+                    "G1 Z{min(max(max_z + 15, 100), bed_height)} F900\n",
                     "G1 X{bed_width - 10} Y{bed_depth - 10} F9000\n",
                     "M84"
                 )
@@ -3725,16 +3763,7 @@ mod tests {
         assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
         assert_eq!(
             res.config.machine.thumbnails,
-            vec![
-                ThumbnailSize {
-                    width: 160,
-                    height: 120
-                },
-                ThumbnailSize {
-                    width: 220,
-                    height: 124
-                }
-            ]
+            vec![ThumbnailSize::png(160, 120), ThumbnailSize::png(220, 124),]
         );
         assert!((res.config.process.elephant_foot_compensation_mm - 0.2).abs() < 1e-9);
         assert!((res.config.process.xy_contour_compensation_mm - (-0.1)).abs() < 1e-9);
@@ -3750,5 +3779,53 @@ mod tests {
         );
         assert!(res.config.process.avoid_crossing_perimeters);
         assert!((res.config.process.avoid_crossing_perimeters_max_detour_mm - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn core_one_qoi_flow_and_infill_retract_profile_keys_map_cleanly() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"[
+              {
+                "type": "machine",
+                "name": "qoi_machine",
+                "thumbnails": ["16x16/QOI", "313x173/QOI", "440x240/QOI", "160x120/PNG"]
+              },
+              {
+                "type": "filament",
+                "name": "flow_fil",
+                "filament_flow_ratio": ["0.96"]
+              },
+              {
+                "type": "process",
+                "name": "no_retract_proc",
+                "reduce_infill_retraction": "0"
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("qoi_machine"),
+                Some("flow_fil"),
+                Some("no_retract_proc"),
+            )
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert_eq!(
+            res.config.machine.thumbnails,
+            vec![
+                ThumbnailSize::qoi(16, 16),
+                ThumbnailSize::qoi(313, 173),
+                ThumbnailSize::qoi(440, 240),
+                ThumbnailSize::png(160, 120),
+            ]
+        );
+        assert!((res.config.filament.flow_ratio - 0.96).abs() < 1e-9);
+        assert!(!res.config.process.reduce_infill_retraction);
     }
 }

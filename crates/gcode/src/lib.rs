@@ -7,14 +7,17 @@ use std::fmt::Write as _;
 
 use base64::Engine as _;
 use combing::CombingLayer;
-use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition};
-use layercraft_geom::Point2;
+use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition, ThumbnailFormat};
+use layercraft_geom::{ExPolygon, Point2};
 pub use layercraft_slice::bead_area_mm2;
 use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use thumbnail::{format_thumbnail_block, render_gcode_thumbnail_png};
+use thumbnail::{
+    format_qoi_thumbnail_block, format_thumbnail_block, render_gcode_thumbnail_png,
+    render_gcode_thumbnail_qoi,
+};
 
 pub mod arc;
 pub mod combing;
@@ -254,8 +257,18 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     .map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "; max_z_height: {max_z:.3}").map_err(|_| GcodeError::FormatError)?;
     for thumb in &config.machine.thumbnails {
-        let png_bytes = render_gcode_thumbnail_png(plate, config, thumb.width, thumb.height)?;
-        let block = format_thumbnail_block(thumb.width, thumb.height, &png_bytes)?;
+        let block = match thumb.format {
+            ThumbnailFormat::Png => {
+                let png_bytes =
+                    render_gcode_thumbnail_png(plate, config, thumb.width, thumb.height)?;
+                format_thumbnail_block(thumb.width, thumb.height, &png_bytes)?
+            }
+            ThumbnailFormat::Qoi => {
+                let qoi_bytes =
+                    render_gcode_thumbnail_qoi(plate, config, thumb.width, thumb.height)?;
+                format_qoi_thumbnail_block(thumb.width, thumb.height, &qoi_bytes)?
+            }
+        };
         out.push_str(&block);
     }
 
@@ -339,6 +352,9 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         writeln!(out, ";LAYER_CHANGE").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";Z:{:.3}", layer.z_top_mm).map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";HEIGHT:{:.3}", layer.height_mm).map_err(|_| GcodeError::FormatError)?;
+        if config.machine.relative_extrusion && layer.index > 0 {
+            writeln!(out, "G92 E0").map_err(|_| GcodeError::FormatError)?;
+        }
         if config.machine.emit_progress_m73 {
             let pct = if total_est_time_s > 1e-6 {
                 ((elapsed_est_s / total_est_time_s) * 99.0)
@@ -398,11 +414,20 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             current_fan_percent = Some(layer.fan_percent);
         }
 
-        writeln!(out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
-            .map_err(|_| GcodeError::FormatError)?;
-        total_time_s += (layer.z_top_mm - cur_z).abs() / config.machine.z_hop_speed_mm_s;
-        cur_z = layer.z_top_mm;
-        let mut z_hopped = false;
+        let mut z_hopped = if layer.index == 0 && config.machine.start_gcode.is_some() {
+            let travel_z = layer.z_top_mm + config.machine.z_hop_mm.max(1.8);
+            writeln!(out, "G0 Z{travel_z:.3} F{zhop_f:.0}").map_err(|_| GcodeError::FormatError)?;
+            total_time_s += (travel_z - cur_z).abs() / config.machine.z_hop_speed_mm_s;
+            cur_z = travel_z;
+            true
+        } else {
+            writeln!(out, "G0 Z{:.3} F{zhop_f:.0}", layer.z_top_mm)
+                .map_err(|_| GcodeError::FormatError)?;
+            total_time_s += (layer.z_top_mm - cur_z).abs() / config.machine.z_hop_speed_mm_s;
+            cur_z = layer.z_top_mm;
+            false
+        };
+        let mut prev_role: Option<ExtrusionRole> = None;
 
         for (path_idx, path) in layer.paths.iter().enumerate() {
             if path.points.len() < 2 {
@@ -498,8 +523,20 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 cur_layer_seams.push((sx, sy));
             }
 
+            let is_internal_infill = |r: ExtrusionRole| {
+                matches!(
+                    r,
+                    ExtrusionRole::SparseInfill | ExtrusionRole::InternalSolidInfill
+                )
+            };
+            let skip_infill_retract = config.process.reduce_infill_retraction
+                && prev_role.is_some_and(is_internal_infill)
+                && is_internal_infill(path.role)
+                && travel_stays_inside_same_island(&layer.slice_regions, (cur_x, cur_y), (sx, sy));
+
             let mut travel_dist = (sx - cur_x).hypot(sy - cur_y);
-            if has_extruded
+            if !skip_infill_retract
+                && has_extruded
                 && travel_dist > config.machine.min_travel_for_retract_mm
                 && retract_len > 0.0
                 && !retracted
@@ -589,7 +626,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                 total_time_s += retract_len / config.machine.retraction_speed_mm_s;
             }
 
-            let eff_flow = path.flow_ratio.max(0.001);
+            let eff_flow = (path.flow_ratio * config.filament.flow_ratio).max(0.001);
             let bead_area = bead_area_mm2(path.width_mm, path.height_mm) * eff_flow;
             let eff_speed = if bead_area > 1e-9 {
                 path.speed_mm_s
@@ -734,6 +771,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             }
 
             last_path_trail = path_trail;
+            prev_role = Some(path.role);
         }
 
         if !cur_layer_seams.is_empty() {
@@ -798,6 +836,42 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let total_vol = total_e_mm * fil_area;
     let total_weight = total_vol * 0.001 * config.filament.density_g_cm3;
 
+    writeln!(out, "; filament used [mm] = {total_e_mm:.2}").map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; filament used [cm3] = {:.2}", total_vol * 0.001)
+        .map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; filament used [g] = {total_weight:.2}")
+        .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; estimated printing time (normal mode) = {}",
+        format_duration_hms(total_time_s)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    if let Some(ft) = config
+        .filament
+        .filament_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        writeln!(out, "; filament_type = {ft}").map_err(|_| GcodeError::FormatError)?;
+    }
+    writeln!(
+        out,
+        "; nozzle_diameter = {:.2}",
+        config.machine.nozzle_diameter_mm
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    if let Some(pm) = config
+        .machine
+        .printer_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        writeln!(out, "; printer_model = {pm}").map_err(|_| GcodeError::FormatError)?;
+    }
+
     Ok(GcodeOutput {
         gcode: out,
         stats: PrintStatistics {
@@ -811,6 +885,67 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             features: feature_stats,
         },
     })
+}
+
+fn format_duration_hms(total_seconds: f64) -> String {
+    let secs = total_seconds.max(0.0).round() as u64;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn travel_stays_inside_same_island(
+    regions: &[ExPolygon],
+    from_mm: (f64, f64),
+    to_mm: (f64, f64),
+) -> bool {
+    let len = (to_mm.0 - from_mm.0).hypot(to_mm.1 - from_mm.1);
+    if len <= 1e-6 {
+        return true;
+    }
+    let steps = ((len / 0.5).ceil() as usize).clamp(5, 64);
+    for ex in regions {
+        let Some(aabb) = ex.aabb() else {
+            continue;
+        };
+        let (min_x, min_y) = aabb.min.to_mm();
+        let (max_x, max_y) = aabb.max.to_mm();
+        let margin = 0.5;
+        let in_bb = |p: (f64, f64)| {
+            p.0 >= min_x - margin
+                && p.0 <= max_x + margin
+                && p.1 >= min_y - margin
+                && p.1 <= max_y + margin
+        };
+        if !in_bb(from_mm) || !in_bb(to_mm) {
+            continue;
+        }
+        let mut all_inside = true;
+        for i in 1..=steps {
+            let t = (i as f64) / ((steps + 1) as f64);
+            let mx = from_mm.0 + t * (to_mm.0 - from_mm.0);
+            let my = from_mm.1 + t * (to_mm.1 - from_mm.1);
+            let Ok(pt) = Point2::from_mm(mx, my) else {
+                all_inside = false;
+                break;
+            };
+            if !ex.contains_point(pt) {
+                all_inside = false;
+                break;
+            }
+        }
+        if all_inside {
+            return true;
+        }
+    }
+    false
 }
 
 fn emit_e_mode(out: &mut String, relative: bool) -> Result<(), GcodeError> {
@@ -1741,10 +1876,11 @@ struct PendingThumbnail {
     width: u32,
     height: u32,
     declared_len: usize,
+    is_qoi: bool,
     b64: String,
 }
 
-fn parse_thumbnail_header(rest: &str) -> Option<PendingThumbnail> {
+fn parse_thumbnail_header(rest: &str, is_qoi: bool) -> Option<PendingThumbnail> {
     let mut parts = rest.split_whitespace();
     let dims = parts.next()?;
     let len_str = parts.next()?;
@@ -1756,6 +1892,7 @@ fn parse_thumbnail_header(rest: &str) -> Option<PendingThumbnail> {
         width,
         height,
         declared_len,
+        is_qoi,
         b64: String::with_capacity(declared_len),
     })
 }
@@ -1767,16 +1904,33 @@ fn verify_pending_thumbnail(thumb: &PendingThumbnail) -> bool {
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&thumb.b64) else {
         return false;
     };
-    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
-        return false;
+    if thumb.is_qoi {
+        if bytes.len() < 22 || bytes.get(..4) != Some(b"qoif") {
+            return false;
+        }
+        let Some(w_bytes) = bytes.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+            return false;
+        };
+        let Some(h_bytes) = bytes.get(8..12).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+            return false;
+        };
+        let end_idx = bytes.len().saturating_sub(8);
+        u32::from_be_bytes(w_bytes) == thumb.width
+            && u32::from_be_bytes(h_bytes) == thumb.height
+            && bytes.get(12) == Some(&3)
+            && bytes.get(end_idx..) == Some(&[0u8, 0, 0, 0, 0, 0, 0, 1])
+    } else {
+        if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+            return false;
+        }
+        let Some(w_bytes) = bytes.get(16..20).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+            return false;
+        };
+        let Some(h_bytes) = bytes.get(20..24).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+            return false;
+        };
+        u32::from_be_bytes(w_bytes) == thumb.width && u32::from_be_bytes(h_bytes) == thumb.height
     }
-    let Some(w_bytes) = bytes.get(16..20).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
-        return false;
-    };
-    let Some(h_bytes) = bytes.get(20..24).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
-        return false;
-    };
-    u32::from_be_bytes(w_bytes) == thumb.width && u32::from_be_bytes(h_bytes) == thumb.height
 }
 
 /// Evaluate physical invariants from any Marlin/Klipper G-code file (LayerCraft or external oracle).
@@ -1847,11 +2001,15 @@ pub fn evaluate_gcode(
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("; thumbnail begin ") {
-            pending_thumb = parse_thumbnail_header(rest);
+        if let Some(rest) = trimmed.strip_prefix("; thumbnail_QOI begin ") {
+            pending_thumb = parse_thumbnail_header(rest, true);
             continue;
         }
-        if trimmed == "; thumbnail end" {
+        if let Some(rest) = trimmed.strip_prefix("; thumbnail begin ") {
+            pending_thumb = parse_thumbnail_header(rest, false);
+            continue;
+        }
+        if trimmed == "; thumbnail end" || trimmed == "; thumbnail_QOI end" {
             if let Some(thumb) = pending_thumb.take()
                 && verify_pending_thumbnail(&thumb)
             {
@@ -1923,24 +2081,37 @@ pub fn evaluate_gcode(
             "M82" => abs_e = true,
             "M83" => abs_e = false,
             "M106" => {
-                fan_commands_count += 1;
-                let mut pwm = 255u8;
+                let mut fan_idx: u32 = 0;
+                let mut has_r = false;
+                let mut pwm_opt: Option<u8> = None;
                 for tok in tokens {
-                    if let Some(rest) = tok.strip_prefix('S')
+                    if let Some(rest) = tok.strip_prefix('P')
+                        && let Ok(p) = rest.parse::<u32>()
+                    {
+                        fan_idx = p;
+                    } else if tok == "R" {
+                        has_r = true;
+                    } else if let Some(rest) = tok.strip_prefix('S')
                         && let Ok(v) = rest.parse::<f64>()
                         && v.is_finite()
                     {
-                        pwm = v.round().clamp(0.0, 255.0) as u8;
+                        pwm_opt = Some(v.round().clamp(0.0, 255.0) as u8);
                     }
                 }
-                max_fan_pwm = max_fan_pwm.max(pwm);
-                let in_first_layer = if layer_change_count > 0 {
-                    layer_change_count == 1
-                } else {
-                    layer_z_mm.len() <= 1
-                };
-                if in_first_layer {
-                    first_layer_max_fan_pwm = first_layer_max_fan_pwm.max(pwm);
+                if fan_idx == 0 {
+                    fan_commands_count += 1;
+                    if !has_r {
+                        let pwm = pwm_opt.unwrap_or(255);
+                        max_fan_pwm = max_fan_pwm.max(pwm);
+                        let in_first_layer = if layer_change_count > 0 {
+                            layer_change_count == 1
+                        } else {
+                            layer_z_mm.len() <= 1
+                        };
+                        if in_first_layer {
+                            first_layer_max_fan_pwm = first_layer_max_fan_pwm.max(pwm);
+                        }
+                    }
                 }
             }
             "M107" => {
@@ -3409,9 +3580,21 @@ mod tests {
         let plate = slice_single_mesh(&make_box(20.0, 20.0, 4.0), &cfg).unwrap();
         let out = emit_gcode(&plate, &cfg).unwrap();
         assert!(out.gcode.contains(r#"M862.3 P "COREONE""#));
-        assert!(out.gcode.contains("M862.1 P0.4 F1"));
+        assert!(out.gcode.contains("M862.1 P0.4 A0 F1"));
+        assert!(out.gcode.contains("M862.5 P2"));
+        assert!(out.gcode.contains("G29 P9 X208 Y-2.5 W32 H4"));
+        assert!(out.gcode.contains("G1 X5 Y-2.5 Z10"));
+        assert!(out.gcode.contains("M106 P3 S127"));
+        assert!(out.gcode.contains("M106 P3 R"));
+        assert!(out.gcode.contains("G1 Z100 F900"));
         assert!(out.gcode.contains("M555 "));
         assert!(out.gcode.contains("M73 P"));
+        assert!(out.gcode.contains("; thumbnail_QOI begin 440x240 "));
+        assert!(out.gcode.contains("; thumbnail begin 160x120 "));
+        assert!(
+            out.gcode
+                .contains("; estimated printing time (normal mode) = ")
+        );
 
         let (rep, _) = evaluate_gcode(
             &out.gcode,
@@ -3422,6 +3605,8 @@ mod tests {
         .unwrap();
         assert!(rep.safety.is_clean(), "{:?}", rep.safety);
         assert_eq!(rep.active_layer_count, 20);
+        assert_eq!(rep.thumbnail_count, 4);
+        assert_eq!(rep.first_layer_max_fan_pwm, 0);
     }
 
     #[test]
@@ -3461,14 +3646,8 @@ mod tests {
         let mesh = make_box(20.0, 20.0, 4.0);
         let mut cfg = PrintConfig::default();
         cfg.machine.thumbnails = vec![
-            layercraft_config::ThumbnailSize {
-                width: 160,
-                height: 120,
-            },
-            layercraft_config::ThumbnailSize {
-                width: 220,
-                height: 124,
-            },
+            layercraft_config::ThumbnailSize::png(160, 120),
+            layercraft_config::ThumbnailSize::png(220, 124),
         ];
         let plate = slice_single_mesh(&mesh, &cfg).unwrap();
         let out = emit_gcode(&plate, &cfg).unwrap();
@@ -3514,5 +3693,134 @@ mod tests {
         )
         .unwrap();
         assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+    }
+
+    #[test]
+    fn reduce_infill_retraction_cuts_gyroid_retractions_while_retracting_across_holes() {
+        let mut base = PrintConfig::default();
+        base.machine.relative_extrusion = true;
+        base.machine.retraction_length_mm = 0.8;
+        base.machine.z_hop_mm = 0.2;
+        base.machine.wipe_on_retract = true;
+        base.machine.wipe_distance_mm = 1.5;
+        base.process.sparse_infill_pattern = layercraft_config::InfillPattern::Gyroid;
+        base.process.sparse_infill_density = 0.20;
+
+        let cube = make_box(20.0, 20.0, 6.0);
+        let mut reduced = base.clone();
+        reduced.process.reduce_infill_retraction = true;
+        let mut unreduced = base.clone();
+        unreduced.process.reduce_infill_retraction = false;
+
+        let out_red = emit_gcode(&slice_single_mesh(&cube, &reduced).unwrap(), &reduced).unwrap();
+        let out_unred =
+            emit_gcode(&slice_single_mesh(&cube, &unreduced).unwrap(), &unreduced).unwrap();
+
+        let count_retracts = |gcode: &str| {
+            gcode
+                .lines()
+                .filter(|l| l.starts_with("G1 ") && l.contains(" E-"))
+                .count()
+        };
+        let red_ret = count_retracts(&out_red.gcode);
+        let unred_ret = count_retracts(&out_unred.gcode);
+        assert!(
+            red_ret * 2 < unred_ret,
+            "expected >50% retraction reduction: reduced={red_ret}, unreduced={unred_ret}"
+        );
+
+        let (rep_red, _) = evaluate_gcode(&out_red.gcode, 1.75, 250.0, 250.0).unwrap();
+        let (rep_unred, _) = evaluate_gcode(&out_unred.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(rep_red.safety.is_clean(), "{:?}", rep_red.safety);
+        assert!(rep_red.z_hop_count > 0);
+        assert!(rep_red.wipe_moves_count > 0);
+        assert!(
+            rep_red.z_hop_count * 2 < rep_unred.z_hop_count,
+            "expected >50% Z-hop reduction: reduced={}, unreduced={}",
+            rep_red.z_hop_count,
+            rep_unred.z_hop_count
+        );
+
+        // Hollow tube still retracts across the central air hole.
+        let tube = layercraft_testkit::make_hollow_cylinder(16.0, 8.0, 3.0, 48).unwrap();
+        let out_tube = emit_gcode(&slice_single_mesh(&tube, &reduced).unwrap(), &reduced).unwrap();
+        let tube_retracts = count_retracts(&out_tube.gcode);
+        assert!(
+            tube_retracts > 5,
+            "tube retractions too low: {tube_retracts}"
+        );
+    }
+
+    #[test]
+    fn filament_flow_ratio_scales_extruded_volume() {
+        let mesh = make_box(16.0, 16.0, 3.0);
+        let mut cfg_full = PrintConfig::default();
+        cfg_full.filament.flow_ratio = 1.0;
+        let mut cfg_scaled = PrintConfig::default();
+        cfg_scaled.filament.flow_ratio = 0.90;
+
+        let out_full =
+            emit_gcode(&slice_single_mesh(&mesh, &cfg_full).unwrap(), &cfg_full).unwrap();
+        let out_scaled =
+            emit_gcode(&slice_single_mesh(&mesh, &cfg_scaled).unwrap(), &cfg_scaled).unwrap();
+
+        let (rep_full, _) = evaluate_gcode(&out_full.gcode, 1.75, 250.0, 250.0).unwrap();
+        let (rep_scaled, _) = evaluate_gcode(&out_scaled.gcode, 1.75, 250.0, 250.0).unwrap();
+        let ratio = rep_scaled.total_filament_volume_mm3 / rep_full.total_filament_volume_mm3;
+        assert!(
+            (ratio - 0.90).abs() < 0.01,
+            "expected ~0.90 flow ratio, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn layer_zero_clears_bed_before_first_xy_travel_after_start_gcode() {
+        let lib = layercraft_config::ProfileLibrary::with_builtin_presets();
+        let cfg = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PLA (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap()
+            .config;
+        let out = emit_gcode(
+            &slice_single_mesh(&make_box(20.0, 20.0, 2.0), &cfg).unwrap(),
+            &cfg,
+        )
+        .unwrap();
+
+        let after_l0 = out.gcode.split(";LAYER_CHANGE").nth(1).unwrap();
+        let mut seen_lift_z = false;
+        let mut seen_xy_travel_at_lift = false;
+        for line in after_l0.lines() {
+            if line.starts_with("G0 Z") {
+                let z: f64 = line
+                    .strip_prefix("G0 Z")
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if !seen_lift_z {
+                    assert!(z >= 1.9, "expected lifted layer-0 Z clearance, got {z}");
+                    seen_lift_z = true;
+                } else if seen_xy_travel_at_lift {
+                    assert!((z - 0.2).abs() < 1e-3, "expected drop to Z0.200, got {z}");
+                    break;
+                }
+            } else if seen_lift_z && line.starts_with("G0 X") {
+                seen_xy_travel_at_lift = true;
+            } else if line.starts_with("G1 ") && line.contains(" X") && line.contains(" E") {
+                assert!(
+                    seen_lift_z && seen_xy_travel_at_lift,
+                    "started extruding layer 0 before lifted XY travel"
+                );
+                break;
+            }
+        }
+        assert!(seen_lift_z && seen_xy_travel_at_lift);
     }
 }

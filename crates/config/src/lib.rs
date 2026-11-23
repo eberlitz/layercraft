@@ -143,11 +143,42 @@ impl SurfacePattern {
     }
 }
 
-/// Dimensions (in pixels) of a PNG preview thumbnail embedded into G-code headers.
+/// Image encoding format for embedded G-code preview thumbnails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbnailFormat {
+    #[default]
+    Png,
+    Qoi,
+}
+
+/// Dimensions (in pixels) and encoding format of a preview thumbnail embedded into G-code headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ThumbnailSize {
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub format: ThumbnailFormat,
+}
+
+impl ThumbnailSize {
+    /// Construct a PNG thumbnail descriptor.
+    pub const fn png(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            format: ThumbnailFormat::Png,
+        }
+    }
+
+    /// Construct a QOI thumbnail descriptor (Prusa Buddy LCD).
+    pub const fn qoi(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            format: ThumbnailFormat::Qoi,
+        }
+    }
 }
 
 /// Machine hardware parameters.
@@ -219,6 +250,7 @@ pub struct FilamentConfig {
     pub chamber_temp_c: Option<u16>,
     pub wait_for_chamber_temp: bool,
     pub pressure_advance: Option<f64>,
+    pub flow_ratio: f64,
     pub max_volumetric_speed_mm3_s: f64,
     pub fan_min_percent: u8,
     pub fan_max_percent: u8,
@@ -242,6 +274,7 @@ impl Default for FilamentConfig {
             chamber_temp_c: None,
             wait_for_chamber_temp: false,
             pressure_advance: None,
+            flow_ratio: 1.0,
             max_volumetric_speed_mm3_s: 15.0,
             fan_min_percent: 35,
             fan_max_percent: 100,
@@ -579,6 +612,7 @@ pub struct ProcessConfig {
     pub xy_hole_compensation_mm: f64,
     pub avoid_crossing_perimeters: bool,
     pub avoid_crossing_perimeters_max_detour_mm: f64,
+    pub reduce_infill_retraction: bool,
     pub adaptive_layer_height: AdaptiveLayerConfig,
     pub height_ranges: Vec<HeightRangeModifier>,
     /// Fraction in `0.0..=1.0` (e.g. `0.20` for 20%).
@@ -808,6 +842,7 @@ impl Default for ProcessConfig {
             xy_hole_compensation_mm: 0.0,
             avoid_crossing_perimeters: false,
             avoid_crossing_perimeters_max_detour_mm: 0.0,
+            reduce_infill_retraction: true,
             adaptive_layer_height: AdaptiveLayerConfig::default(),
             height_ranges: Vec::new(),
             sparse_infill_density: 0.20,
@@ -970,6 +1005,13 @@ impl PrintConfig {
 
         check_pos("filament.diameter_mm", self.filament.diameter_mm)?;
         check_pos("filament.density_g_cm3", self.filament.density_g_cm3)?;
+        if !self.filament.flow_ratio.is_finite() || !(0.5..=1.5).contains(&self.filament.flow_ratio)
+        {
+            return Err(ConfigError::Invalid {
+                field: "filament.flow_ratio",
+                reason: "must be finite and within 0.5..=1.5",
+            });
+        }
         if let Some(pa) = self.filament.pressure_advance
             && (!pa.is_finite() || !(0.0..=2.0).contains(&pa))
         {
@@ -1778,16 +1820,7 @@ mod tests {
         assert_eq!(WallOrder::InnerOuterInner.label(), "Inner / Outer / Inner");
         assert_eq!(SurfacePattern::Concentric.label(), "Concentric");
         let mut p5b = PrintConfig::default();
-        p5b.machine.thumbnails = vec![
-            ThumbnailSize {
-                width: 160,
-                height: 120,
-            },
-            ThumbnailSize {
-                width: 220,
-                height: 124,
-            },
-        ];
+        p5b.machine.thumbnails = vec![ThumbnailSize::png(160, 120), ThumbnailSize::png(220, 124)];
         p5b.process.elephant_foot_compensation_mm = 0.2;
         p5b.process.xy_contour_compensation_mm = -0.15;
         p5b.process.xy_hole_compensation_mm = 0.1;
@@ -1829,18 +1862,26 @@ mod tests {
         bad_p5b.process.avoid_crossing_perimeters_max_detour_mm = -1.0;
         assert!(bad_p5b.validate().is_err());
         bad_p5b.process.avoid_crossing_perimeters_max_detour_mm = 0.0;
-        bad_p5b.machine.thumbnails = vec![ThumbnailSize {
-            width: 8,
-            height: 8,
-        }];
+        bad_p5b.machine.thumbnails = vec![ThumbnailSize::png(8, 8)];
         assert!(bad_p5b.validate().is_err());
-        bad_p5b.machine.thumbnails = vec![
-            ThumbnailSize {
-                width: 64,
-                height: 64
-            };
-            5
-        ];
+        bad_p5b.machine.thumbnails = vec![ThumbnailSize::png(64, 64); 5];
         assert!(bad_p5b.validate().is_err());
+
+        let mut flow_cfg = PrintConfig::default();
+        flow_cfg.filament.flow_ratio = 0.96;
+        flow_cfg.machine.thumbnails = vec![ThumbnailSize::qoi(440, 240)];
+        assert!(flow_cfg.validate().is_ok());
+
+        for bad_flow in [0.4, 1.6, f64::NAN] {
+            let mut c = PrintConfig::default();
+            c.filament.flow_ratio = bad_flow;
+            assert!(matches!(
+                c.validate(),
+                Err(ConfigError::Invalid {
+                    field: "filament.flow_ratio",
+                    ..
+                })
+            ));
+        }
     }
 }
