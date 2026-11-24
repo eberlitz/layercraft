@@ -255,6 +255,7 @@ fn draw_preview_summary_hud(
                             ExtrusionRole::OuterWall,
                             ExtrusionRole::InnerWall,
                             ExtrusionRole::OverhangWall,
+                            ExtrusionRole::GapFill,
                             ExtrusionRole::TopSurface,
                             ExtrusionRole::Ironing,
                             ExtrusionRole::BottomSurface,

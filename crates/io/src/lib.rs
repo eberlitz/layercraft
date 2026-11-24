@@ -30,6 +30,9 @@ pub const LAYERCRAFT_PROJECT_PATH: &str = "Metadata/layercraft_project.json";
 /// Archive entry path storing plate assignments and slicer object metadata inside a `.3mf` package.
 pub const MODEL_SETTINGS_PATH: &str = "Metadata/model_settings.config";
 
+/// Archive entry path storing third-party slicer project process settings JSON inside a `.3mf` package.
+pub const PROJECT_SETTINGS_PATH: &str = "Metadata/project_settings.config";
+
 const MAX_3MF_COMPONENT_DEPTH: usize = 32;
 const MAX_3MF_ARCHIVE_ENTRIES: usize = 4096;
 
@@ -376,13 +379,35 @@ pub struct ThreeMfExportPlate {
     pub instances: Vec<(u32, u32)>,
 }
 
-/// Full parsed 3MF package: transformed parts, root model resource meshes, plates, and optional project JSON.
+/// Role tagged on a sub-part inside third-party 3MF `Metadata/model_settings.config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreeMfPartRole {
+    NegativePart,
+    Modifier,
+    SupportBlocker,
+    SupportEnforcer,
+}
+
+/// Extracted modifier or negative-volume sub-mesh instantiated from a 3MF archive.
+#[derive(Debug, Clone)]
+pub struct ThreeMfModifierPart {
+    pub name: String,
+    pub role: ThreeMfPartRole,
+    pub mesh: TriangleMesh,
+    pub parent_object_id: u32,
+    pub instance_id: u32,
+    pub plate_index: usize,
+}
+
+/// Full parsed 3MF package: transformed parts, modifier sub-meshes, root resource meshes, plates, and optional project JSON.
 #[derive(Debug, Clone)]
 pub struct ThreeMfDocument {
     pub parts: Vec<ThreeMfPart>,
+    pub modifier_parts: Vec<ThreeMfModifierPart>,
     pub resources: Vec<ThreeMfResourceMesh>,
     pub plates: Vec<ThreeMfPlateMeta>,
     pub project_json: Option<String>,
+    pub project_settings_json: Option<String>,
 }
 
 /// Complete 3MF package payload to serialize as a standard ZIP container.
@@ -862,9 +887,130 @@ fn find_root_model_path(archive_files: &HashMap<String, Vec<u8>>) -> Result<Stri
         })
 }
 
+#[derive(Debug, Clone)]
+struct PendingModifierExtract {
+    name: String,
+    role: ThreeMfPartRole,
+    triangles: Vec<Triangle>,
+}
+
+struct CollectedObjectParts {
+    name: String,
+    triangles: Vec<Triangle>,
+    modifiers: Vec<PendingModifierExtract>,
+}
+
+fn collect_root_object_with_modifiers(
+    archive_files: &HashMap<String, Vec<u8>>,
+    cache: &mut HashMap<String, ParsedModelFile>,
+    model_path_norm: &str,
+    object_id: u32,
+    parent_xf: ThreeMfMatrix,
+    model_settings: Option<&ParsedModelSettings>,
+) -> Result<CollectedObjectParts, IoError> {
+    let mut out_tris = Vec::new();
+    let mut out_mods = Vec::new();
+    let obj = {
+        let model = load_parsed_model(archive_files, cache, model_path_norm)?;
+        model
+            .objects
+            .get(&object_id)
+            .ok_or_else(|| {
+                IoError::Malformed3mf(format!(
+                    "object id {object_id} not found in {model_path_norm}"
+                ))
+            })?
+            .clone()
+    };
+
+    if !obj.triangles.is_empty() {
+        let flip_winding = parent_xf.determinant() < 0.0;
+        let transformed_verts: Vec<Point3> = obj
+            .vertices
+            .iter()
+            .copied()
+            .map(|p| parent_xf.apply(p))
+            .collect();
+        out_tris.reserve(obj.triangles.len());
+        for &(i1, i2, i3) in &obj.triangles {
+            let (Some(&a), Some(&b), Some(&c)) = (
+                transformed_verts.get(i1),
+                transformed_verts.get(i2),
+                transformed_verts.get(i3),
+            ) else {
+                return Err(IoError::Malformed3mf(
+                    "triangle vertex index out of range".to_owned(),
+                ));
+            };
+            if flip_winding {
+                out_tris.push(Triangle::new(a, c, b));
+            } else {
+                out_tris.push(Triangle::new(a, b, c));
+            }
+        }
+    }
+
+    for comp in &obj.components {
+        let child_model = comp.path.as_deref().unwrap_or(model_path_norm);
+        let child_xf = comp.transform.then(parent_xf);
+        if let Some(ms) = model_settings
+            && let Some(&role) = ms.part_roles.get(&(object_id, comp.object_id))
+        {
+            let mut mod_tris = Vec::new();
+            let comp_name = collect_object_triangles(
+                archive_files,
+                cache,
+                child_model,
+                comp.object_id,
+                child_xf,
+                1,
+                &mut mod_tris,
+            )?;
+            if !mod_tris.is_empty() {
+                let fallback_label = match role {
+                    ThreeMfPartRole::NegativePart => "Negative part",
+                    ThreeMfPartRole::Modifier => "Modifier",
+                    ThreeMfPartRole::SupportBlocker => "Support blocker",
+                    ThreeMfPartRole::SupportEnforcer => "Support enforcer",
+                };
+                let name = ms
+                    .part_names
+                    .get(&(object_id, comp.object_id))
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| (!comp_name.trim().is_empty()).then_some(comp_name))
+                    .unwrap_or_else(|| fallback_label.to_owned());
+                out_mods.push(PendingModifierExtract {
+                    name,
+                    role,
+                    triangles: mod_tris,
+                });
+            }
+        } else {
+            let _ = collect_object_triangles(
+                archive_files,
+                cache,
+                child_model,
+                comp.object_id,
+                child_xf,
+                1,
+                &mut out_tris,
+            )?;
+        }
+    }
+
+    Ok(CollectedObjectParts {
+        name: obj.name,
+        triangles: out_tris,
+        modifiers: out_mods,
+    })
+}
+
 #[derive(Debug, Default)]
 struct ParsedModelSettings {
     object_names: HashMap<u32, String>,
+    part_roles: HashMap<(u32, u32), ThreeMfPartRole>,
+    part_names: HashMap<(u32, u32), String>,
     plates: Vec<ThreeMfPlateMeta>,
     instance_plate: HashMap<(u32, u32), usize>,
 }
@@ -894,12 +1040,39 @@ fn read_metadata_key_value(e: &quick_xml::events::BytesStart<'_>) -> Option<(Str
     Some((key?, value.unwrap_or_default()))
 }
 
+fn parse_part_attrs(
+    e: &quick_xml::events::BytesStart<'_>,
+) -> (Option<u32>, Option<ThreeMfPartRole>) {
+    let mut part_id = None;
+    let mut role = None;
+    for attr in e.attributes().flatten() {
+        let Some(val) = attr_value_utf8(&attr) else {
+            continue;
+        };
+        match attr.key.local_name().as_ref() {
+            "id" => part_id = val.trim().parse::<u32>().ok(),
+            "subtype" => {
+                role = match val.trim().to_ascii_lowercase().as_str() {
+                    "negative_part" => Some(ThreeMfPartRole::NegativePart),
+                    "modifier_part" => Some(ThreeMfPartRole::Modifier),
+                    "support_blocker" => Some(ThreeMfPartRole::SupportBlocker),
+                    "support_enforcer" => Some(ThreeMfPartRole::SupportEnforcer),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    (part_id, role)
+}
+
 fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
     let mut out = ParsedModelSettings::default();
     let mut current_object_id: Option<u32> = None;
+    let mut current_part_id: Option<u32> = None;
     let mut object_part_depth: usize = 0;
     let mut in_plate = false;
     let mut current_plater_id: Option<u32> = None;
@@ -914,6 +1087,7 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
                 "object" => {
                     object_part_depth = 0;
+                    current_part_id = None;
                     current_object_id = e
                         .attributes()
                         .flatten()
@@ -923,6 +1097,15 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
                 }
                 "part" if current_object_id.is_some() => {
                     object_part_depth += 1;
+                    if object_part_depth == 1
+                        && let Some(obj_id) = current_object_id
+                    {
+                        let (pid, role) = parse_part_attrs(e);
+                        current_part_id = pid;
+                        if let (Some(part_id), Some(part_role)) = (pid, role) {
+                            out.part_roles.insert((obj_id, part_id), part_role);
+                        }
+                    }
                 }
                 "plate" => {
                     in_plate = true;
@@ -941,6 +1124,7 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
                             &key,
                             val,
                             current_object_id,
+                            current_part_id,
                             object_part_depth,
                             in_plate,
                             in_model_instance,
@@ -949,6 +1133,8 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
                             &mut inst_object_id,
                             &mut inst_instance_id,
                             &mut out.object_names,
+                            &out.part_roles,
+                            &mut out.part_names,
                         );
                     }
                 }
@@ -962,6 +1148,7 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
                         &key,
                         val,
                         current_object_id,
+                        current_part_id,
                         object_part_depth,
                         in_plate,
                         in_model_instance,
@@ -970,7 +1157,17 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
                         &mut inst_object_id,
                         &mut inst_instance_id,
                         &mut out.object_names,
+                        &out.part_roles,
+                        &mut out.part_names,
                     );
+                } else if e.local_name().as_ref() == "part"
+                    && let Some(obj_id) = current_object_id
+                    && object_part_depth == 0
+                {
+                    let (pid, role) = parse_part_attrs(e);
+                    if let (Some(part_id), Some(part_role)) = (pid, role) {
+                        out.part_roles.insert((obj_id, part_id), part_role);
+                    }
                 } else if e.local_name().as_ref() == "plate" {
                     let id = u32::try_from(out.plates.len() + 1).unwrap_or(u32::MAX);
                     out.plates.push(ThreeMfPlateMeta {
@@ -982,10 +1179,14 @@ fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError
             Ok(Event::End(ref e)) => match e.local_name().as_ref() {
                 "object" => {
                     current_object_id = None;
+                    current_part_id = None;
                     object_part_depth = 0;
                 }
                 "part" => {
                     object_part_depth = object_part_depth.saturating_sub(1);
+                    if object_part_depth == 0 {
+                        current_part_id = None;
+                    }
                 }
                 "model_instance" => {
                     if in_model_instance && let Some(obj_id) = inst_object_id.take() {
@@ -1040,6 +1241,7 @@ fn apply_model_settings_metadata(
     key: &str,
     val: String,
     current_object_id: Option<u32>,
+    current_part_id: Option<u32>,
     object_part_depth: usize,
     in_plate: bool,
     in_model_instance: bool,
@@ -1048,6 +1250,8 @@ fn apply_model_settings_metadata(
     inst_object_id: &mut Option<u32>,
     inst_instance_id: &mut Option<u32>,
     object_names: &mut HashMap<u32, String>,
+    part_roles: &HashMap<(u32, u32), ThreeMfPartRole>,
+    part_names: &mut HashMap<(u32, u32), String>,
 ) {
     if in_model_instance {
         match key {
@@ -1072,6 +1276,13 @@ fn apply_model_settings_metadata(
         if !trimmed.is_empty() {
             if object_part_depth == 0 {
                 object_names.insert(obj_id, trimmed.to_owned());
+            } else if let Some(pid) = current_part_id {
+                part_names.insert((obj_id, pid), trimmed.to_owned());
+                if !part_roles.contains_key(&(obj_id, pid)) {
+                    object_names
+                        .entry(obj_id)
+                        .or_insert_with(|| trimmed.to_owned());
+                }
             } else {
                 object_names
                     .entry(obj_id)
@@ -1135,6 +1346,11 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
         })
         .transpose()?;
 
+    let project_settings_json = archive_files
+        .get(&normalize_archive_path(PROJECT_SETTINGS_PATH))
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .map(str::to_owned);
+
     let mut plates = model_settings
         .as_ref()
         .map(|ms| ms.plates.clone())
@@ -1182,6 +1398,7 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
     }
 
     let mut parts = Vec::new();
+    let mut modifier_parts = Vec::new();
     let mut instance_counts: HashMap<u32, u32> = HashMap::new();
     if !root_model.build_items.is_empty() {
         for (idx, item) in root_model.build_items.iter().enumerate() {
@@ -1190,16 +1407,37 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
             *inst_counter += 1;
 
             let target_model = item.path.as_deref().unwrap_or(&root_path);
-            let mut tris = Vec::new();
-            let obj_name = collect_object_triangles(
+            let collected = collect_root_object_with_modifiers(
                 &archive_files,
                 &mut cache,
                 target_model,
                 item.object_id,
                 item.transform,
-                0,
-                &mut tris,
+                model_settings.as_ref(),
             )?;
+            let obj_name = collected.name;
+            let tris = collected.triangles;
+            let item_mods = collected.modifiers;
+            let plate_index = model_settings
+                .as_ref()
+                .and_then(|ms| {
+                    ms.instance_plate
+                        .get(&(item.object_id, instance_id))
+                        .copied()
+                })
+                .unwrap_or(0);
+            for pm in item_mods {
+                if let Ok(mod_mesh) = TriangleMesh::new(pm.triangles) {
+                    modifier_parts.push(ThreeMfModifierPart {
+                        name: pm.name,
+                        role: pm.role,
+                        mesh: mod_mesh,
+                        parent_object_id: item.object_id,
+                        instance_id,
+                        plate_index,
+                    });
+                }
+            }
             if tris.is_empty() {
                 continue;
             }
@@ -1213,14 +1451,6 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
                 .map(str::to_owned)
                 .or_else(|| (!obj_name.trim().is_empty()).then_some(obj_name))
                 .unwrap_or_else(|| format!("Part {}", idx + 1));
-            let plate_index = model_settings
-                .as_ref()
-                .and_then(|ms| {
-                    ms.instance_plate
-                        .get(&(item.object_id, instance_id))
-                        .copied()
-                })
-                .unwrap_or(0);
             parts.push(ThreeMfPart {
                 name,
                 mesh,
@@ -1236,16 +1466,33 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
             if !ty.is_empty() && ty != "model" {
                 continue;
             }
-            let mut tris = Vec::new();
-            let obj_name = collect_object_triangles(
+            let collected = collect_root_object_with_modifiers(
                 &archive_files,
                 &mut cache,
                 &root_path,
                 obj.id,
                 ThreeMfMatrix::IDENTITY,
-                0,
-                &mut tris,
+                model_settings.as_ref(),
             )?;
+            let obj_name = collected.name;
+            let tris = collected.triangles;
+            let obj_mods = collected.modifiers;
+            let plate_index = model_settings
+                .as_ref()
+                .and_then(|ms| ms.instance_plate.get(&(obj.id, 0)).copied())
+                .unwrap_or(0);
+            for pm in obj_mods {
+                if let Ok(mod_mesh) = TriangleMesh::new(pm.triangles) {
+                    modifier_parts.push(ThreeMfModifierPart {
+                        name: pm.name,
+                        role: pm.role,
+                        mesh: mod_mesh,
+                        parent_object_id: obj.id,
+                        instance_id: 0,
+                        plate_index,
+                    });
+                }
+            }
             if tris.is_empty() {
                 continue;
             }
@@ -1259,10 +1506,6 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
                 .map(str::to_owned)
                 .or_else(|| (!obj_name.trim().is_empty()).then_some(obj_name))
                 .unwrap_or_else(|| format!("Part {}", idx + 1));
-            let plate_index = model_settings
-                .as_ref()
-                .and_then(|ms| ms.instance_plate.get(&(obj.id, 0)).copied())
-                .unwrap_or(0);
             parts.push(ThreeMfPart {
                 name,
                 mesh,
@@ -1289,9 +1532,11 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
 
     Ok(ThreeMfDocument {
         parts,
+        modifier_parts,
         resources,
         plates,
         project_json,
+        project_settings_json,
     })
 }
 
@@ -1969,5 +2214,81 @@ mod tests {
         assert_eq!(re_doc.plates[1].name, "Bolts");
         assert_eq!(re_doc.parts[0].plate_index, 0);
         assert_eq!(re_doc.parts[1].plate_index, 1);
+    }
+
+    #[test]
+    fn read_3mf_extracts_negative_part_and_project_settings() {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="2" type="model" name="Body">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/><vertex x="20" y="0" z="0"/>
+          <vertex x="20" y="20" z="0"/><vertex x="0" y="20" z="0"/>
+          <vertex x="0" y="0" z="10"/><vertex x="20" y="0" z="10"/>
+          <vertex x="20" y="20" z="10"/><vertex x="0" y="20" z="10"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="3" type="model" name="NegCutter">
+      <mesh>
+        <vertices>
+          <vertex x="7" y="7" z="-1"/><vertex x="13" y="7" z="-1"/>
+          <vertex x="13" y="13" z="-1"/><vertex x="7" y="13" z="-1"/>
+          <vertex x="7" y="7" z="11"/><vertex x="13" y="7" z="11"/>
+          <vertex x="13" y="13" z="11"/><vertex x="7" y="13" z="11"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="1" type="model" name="MountedBlock">
+      <components>
+        <component objectid="2"/>
+        <component objectid="3"/>
+      </components>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1" transform="1 0 0 0 1 0 0 0 1 100 100 0"/>
+  </build>
+</model>"#;
+        let model_settings = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="1">
+    <metadata key="name" value="MountedBlock"/>
+    <part id="2" subtype="normal_part"><metadata key="name" value="Body"/></part>
+    <part id="3" subtype="negative_part"><metadata key="name" value="CenterVoid"/></part>
+  </object>
+</config>"#;
+        let project_settings = r#"{"layer_height": "0.16", "wall_loops": "4"}"#;
+
+        let bytes = make_zip(&[
+            ("3D/3dmodel.model", model),
+            ("Metadata/model_settings.config", model_settings),
+            ("Metadata/project_settings.config", project_settings),
+        ]);
+        let doc = read_3mf_document_bytes(&bytes).unwrap();
+        assert_eq!(doc.parts.len(), 1);
+        assert_eq!(doc.parts[0].mesh.triangles.len(), 12);
+        assert_eq!(doc.modifier_parts.len(), 1);
+        assert_eq!(doc.modifier_parts[0].role, ThreeMfPartRole::NegativePart);
+        assert_eq!(doc.modifier_parts[0].name, "CenterVoid");
+        assert!(doc.project_settings_json.is_some());
     }
 }

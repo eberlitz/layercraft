@@ -1460,6 +1460,13 @@ fn apply_machine_settings(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["label_objects", "exclude_object"])
+        && !is_nil_value(v)
+    {
+        cfg.machine.label_objects = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["retraction_length"])
         && !is_nil_value(v)
     {
@@ -2173,20 +2180,34 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
-    if let Some((k, v)) = ctx.get_primary(
-        s,
-        &[
-            "overhang_3_4_speed",
-            "overhang_4_4_speed",
-            "overhang_2_4_speed",
-            "overhang_speed",
-        ],
-    ) && !is_nil_value(v)
+    if let Some((k, v)) = ctx.get_primary(s, &["overhang_3_4_speed", "overhang_speed"])
+        && !is_nil_value(v)
     {
         let spd = parse_speed_val(k, v, cfg.process.outer_wall_speed_mm_s)?;
         if spd != 0.0 {
             cfg.process.overhang_speed_mm_s = spd;
         }
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["overhang_1_4_speed"])
+        && !is_nil_value(v)
+    {
+        let spd = parse_speed_val(k, v, cfg.process.outer_wall_speed_mm_s)?;
+        cfg.process.overhang_1_4_speed_mm_s = if spd == 0.0 { None } else { Some(spd) };
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["overhang_2_4_speed"])
+        && !is_nil_value(v)
+    {
+        let spd = parse_speed_val(k, v, cfg.process.outer_wall_speed_mm_s)?;
+        cfg.process.overhang_2_4_speed_mm_s = if spd == 0.0 { None } else { Some(spd) };
+        ctx.mark_applied(k);
+    }
+    if let Some((k, v)) = ctx.get_primary(s, &["overhang_4_4_speed"])
+        && !is_nil_value(v)
+    {
+        let spd = parse_speed_val(k, v, cfg.process.outer_wall_speed_mm_s)?;
+        cfg.process.overhang_4_4_speed_mm_s = if spd == 0.0 { None } else { Some(spd) };
         ctx.mark_applied(k);
     }
 
@@ -2718,6 +2739,85 @@ fn apply_process_settings_pass1(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["infill_wall_overlap", "infill_overlap"])
+        && !is_nil_value(v)
+    {
+        cfg.process.infill_wall_overlap_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    let explicit_gap_flag = ctx
+        .get_primary(s, &["gap_fill_enabled", "enable_gap_fill"])
+        .is_some_and(|(_, v)| !is_nil_value(v));
+    if let Some((k, v)) = ctx.get_primary(s, &["gap_fill_enabled", "enable_gap_fill"])
+        && !is_nil_value(v)
+    {
+        cfg.process.gap_fill_enabled = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["gap_infill_speed", "gap_fill_speed"])
+        && !is_nil_value(v)
+    {
+        let spd = parse_speed_val(k, v, cfg.process.inner_wall_speed_mm_s)?;
+        if spd == 0.0 {
+            cfg.process.gap_fill_speed_mm_s = None;
+        } else {
+            cfg.process.gap_fill_speed_mm_s = Some(spd);
+            if !explicit_gap_flag {
+                cfg.process.gap_fill_enabled = true;
+            }
+        }
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["gap_fill_min_width"])
+        && !is_nil_value(v)
+    {
+        cfg.process.gap_fill_min_width_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["print_sequence"])
+        && !is_nil_value(v)
+    {
+        let raw = parse_string_val(k, v)?;
+        let norm = raw.trim().to_ascii_lowercase();
+        cfg.process.print_sequence = match norm.as_str() {
+            "by_layer" | "by layer" | "by_layer_print" => crate::PrintSequence::ByLayer,
+            "by_object" | "by object" | "complete_individual" => crate::PrintSequence::ByObject,
+            _ => {
+                ctx.warn(
+                    &process.name,
+                    k,
+                    format!("print_sequence `{raw}` approximated using `by_layer`"),
+                );
+                crate::PrintSequence::ByLayer
+            }
+        };
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(s, &["extruder_clearance_radius"])
+        && !is_nil_value(v)
+    {
+        cfg.process.extruder_clearance_radius_mm = parse_f64_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
+    if let Some((k, v)) = ctx.get_primary(
+        s,
+        &["extruder_clearance_height", "extruder_clearance_max_radius"],
+    ) && !is_nil_value(v)
+    {
+        if k == "extruder_clearance_height" {
+            cfg.process.extruder_clearance_height_mm = parse_f64_val(k, v)?;
+        } else {
+            cfg.process.extruder_clearance_radius_mm = parse_f64_val(k, v)?;
+        }
+        ctx.mark_applied(k);
+    }
+
     Ok(())
 }
 
@@ -2943,6 +3043,7 @@ fn populate_machine_profile_settings(
     insert_bool_flag(settings, "use_relative_e_distances", m.relative_extrusion);
     insert_bool_flag(settings, "remaining_times", m.emit_progress_m73);
     insert_bool_flag(settings, "binary_gcode", m.binary_gcode);
+    insert_bool_flag(settings, "label_objects", m.label_objects);
     if !m.thumbnails.is_empty() {
         settings.insert(
             "thumbnails".to_owned(),
@@ -3552,6 +3653,59 @@ fn populate_process_profile_settings(
         settings,
         "tree_support_brim_width",
         fmt_profile_f64(p.support.tree.trunk_base_flare_mm),
+    );
+    insert_str(
+        settings,
+        "overhang_1_4_speed",
+        p.overhang_1_4_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "overhang_2_4_speed",
+        p.overhang_2_4_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "overhang_4_4_speed",
+        p.overhang_4_4_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "infill_wall_overlap",
+        fmt_profile_pct(p.infill_wall_overlap_ratio),
+    );
+    insert_bool_flag(settings, "gap_fill_enabled", p.gap_fill_enabled);
+    insert_str(
+        settings,
+        "gap_infill_speed",
+        p.gap_fill_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "gap_fill_min_width",
+        fmt_profile_f64(p.gap_fill_min_width_mm),
+    );
+    insert_str(
+        settings,
+        "print_sequence",
+        match p.print_sequence {
+            crate::PrintSequence::ByLayer => "by_layer",
+            crate::PrintSequence::ByObject => "by_object",
+        },
+    );
+    insert_str(
+        settings,
+        "extruder_clearance_radius",
+        fmt_profile_f64(p.extruder_clearance_radius_mm),
+    );
+    insert_str(
+        settings,
+        "extruder_clearance_height",
+        fmt_profile_f64(p.extruder_clearance_height_mm),
     );
 }
 
@@ -4280,7 +4434,11 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "internal_solid_infill_speed": "180",
                 "initial_layer_speed": "40",
                 "bridge_speed": "35",
+                "overhang_1_4_speed": "60",
+                "overhang_2_4_speed": "40",
                 "overhang_3_4_speed": "30",
+                "overhang_4_4_speed": "18",
+                "gap_fill_enabled": "1",
                 "default_acceleration": "4000",
                 "outer_wall_acceleration": "2500",
                 "inner_wall_acceleration": "3500",
@@ -5232,5 +5390,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn phase6b_profile_keys_map_and_roundtrip_without_warnings() {
+        let mut cfg = PrintConfig::default();
+        cfg.machine.label_objects = false;
+        cfg.process.infill_wall_overlap_ratio = 0.25;
+        cfg.process.gap_fill_enabled = true;
+        cfg.process.gap_fill_speed_mm_s = Some(55.0);
+        cfg.process.gap_fill_min_width_mm = 0.12;
+        cfg.process.overhang_1_4_speed_mm_s = Some(60.0);
+        cfg.process.overhang_2_4_speed_mm_s = Some(40.0);
+        cfg.process.overhang_4_4_speed_mm_s = Some(15.0);
+        cfg.process.print_sequence = crate::PrintSequence::ByObject;
+        cfg.process.extruder_clearance_radius_mm = 42.0;
+        cfg.process.extruder_clearance_height_mm = 30.0;
+
+        let m_doc = profile_document_from_config(ProfileKind::Machine, "P6B Mach", &cfg).unwrap();
+        let p_doc = profile_document_from_config(ProfileKind::Process, "P6B Proc", &cfg).unwrap();
+
+        let mut lib = ProfileLibrary::with_builtin_presets();
+        lib.upsert_user_profile(m_doc).unwrap();
+        lib.upsert_user_profile(p_doc).unwrap();
+
+        let applied = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("P6B Mach"),
+                None,
+                Some("P6B Proc"),
+            )
+            .unwrap();
+        assert!(applied.warnings.is_empty(), "{:?}", applied.warnings);
+        assert!(
+            applied.unmapped_keys.is_empty(),
+            "{:?}",
+            applied.unmapped_keys
+        );
+        assert!(!applied.config.machine.label_objects);
+        assert!((applied.config.process.infill_wall_overlap_ratio - 0.25).abs() < 1e-9);
+        assert!(applied.config.process.gap_fill_enabled);
+        assert_eq!(applied.config.process.gap_fill_speed_mm_s, Some(55.0));
+        assert!((applied.config.process.gap_fill_min_width_mm - 0.12).abs() < 1e-9);
+        assert_eq!(applied.config.process.overhang_1_4_speed_mm_s, Some(60.0));
+        assert_eq!(applied.config.process.overhang_2_4_speed_mm_s, Some(40.0));
+        assert_eq!(applied.config.process.overhang_4_4_speed_mm_s, Some(15.0));
+        assert_eq!(
+            applied.config.process.print_sequence,
+            crate::PrintSequence::ByObject
+        );
+        assert!((applied.config.process.extruder_clearance_radius_mm - 42.0).abs() < 1e-9);
+        assert!((applied.config.process.extruder_clearance_height_mm - 30.0).abs() < 1e-9);
     }
 }

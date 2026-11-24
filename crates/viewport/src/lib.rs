@@ -347,6 +347,7 @@ pub fn role_color(role: ExtrusionRole) -> [f32; 4] {
         ExtrusionRole::OuterWall => [0.96, 0.45, 0.16, 1.0],
         ExtrusionRole::InnerWall => [0.95, 0.77, 0.22, 1.0],
         ExtrusionRole::OverhangWall => [0.98, 0.22, 0.62, 1.0],
+        ExtrusionRole::GapFill => [0.98, 0.90, 0.25, 1.0],
         ExtrusionRole::TopSurface => [0.92, 0.28, 0.30, 1.0],
         ExtrusionRole::Ironing => [0.84, 0.88, 0.96, 1.0],
         ExtrusionRole::BottomSurface => [0.22, 0.72, 0.88, 1.0],
@@ -978,6 +979,7 @@ pub fn role_z_bias_mm(role: ExtrusionRole) -> f32 {
         | ExtrusionRole::Brim => 0.000,
         ExtrusionRole::InnerWall => -0.004,
         ExtrusionRole::SupportInterface => -0.005,
+        ExtrusionRole::GapFill => -0.006,
         ExtrusionRole::TopSurface | ExtrusionRole::BottomSurface => -0.007,
         ExtrusionRole::Support => -0.008,
         ExtrusionRole::Bridge | ExtrusionRole::InternalBridge => -0.009,
@@ -1895,6 +1897,7 @@ mod tests {
                 height_mm: 0.2,
                 fan_percent: 0,
                 estimated_time_s: 1.0,
+                object_id: None,
                 slice_regions: Vec::new(),
                 paths: vec![ExtrusionPath {
                     role: ExtrusionRole::OuterWall,
@@ -1910,8 +1913,12 @@ mod tests {
                     height_mm: 0.2,
                     speed_mm_s: 40.0,
                     flow_ratio: 1.0,
+                    object_id: None,
+                    fan_percent: None,
                 }],
             }],
+            objects: Vec::new(),
+            print_sequence: Default::default(),
         };
         let path_geom = build_toolpath_mesh(&path_plate, ColorMode::Feature);
         // 4 segments * 8 quads * 6 vertices = 192 vertices (no open caps on closed path).

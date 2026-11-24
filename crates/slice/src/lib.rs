@@ -16,11 +16,12 @@ use layercraft_clip::{
     ClipError, JoinType, clip_polylines, difference, intersection, offset, union,
 };
 use layercraft_config::{
-    InfillPattern, IroningType, PrintConfig, SupportStyle, SurfacePattern, WallGenerator, WallOrder,
+    InfillPattern, IroningType, ModifierOverrides, PrintConfig, PrintSequence, SupportStyle,
+    SurfacePattern, WallGenerator, WallOrder,
 };
 use layercraft_geom::{Aabb2, ExPolygon, GeomError, Point2, Polygon, TriangleMesh, mm_to_nm};
 use layercraft_mesh::{
-    ExplicitHeightRange, MeshError, RawSliceLayer, VariableScheduleParams,
+    ExplicitHeightRange, MeshError, RawSliceLayer, VariableScheduleParams, build_layer_schedule,
     build_variable_layer_schedule, prepare_for_plate, slice_mesh, slice_mesh_with_schedule,
 };
 use modifiers::{EffectiveLayerParams, partition_regions, slice_modifier_volumes};
@@ -39,6 +40,23 @@ pub enum SliceError {
     Mesh(#[from] MeshError),
     #[error("configuration error: {0}")]
     Config(#[from] layercraft_config::ConfigError),
+    #[error(
+        "sequential print clearance violation between `{object_a}` and `{object_b}` ({clearance_mm:.1} mm < required {required_mm:.1} mm)"
+    )]
+    SequentialClearanceViolation {
+        object_a: String,
+        object_b: String,
+        clearance_mm: f64,
+        required_mm: f64,
+    },
+    #[error(
+        "sequential print height violation on `{object}` ({height_mm:.1} mm > gantry clearance {max_clearance_height_mm:.1} mm)"
+    )]
+    SequentialHeightViolation {
+        object: String,
+        height_mm: f64,
+        max_clearance_height_mm: f64,
+    },
 }
 
 /// Classification of an extruded toolpath segment.
@@ -49,6 +67,7 @@ pub enum ExtrusionRole {
     OuterWall,
     InnerWall,
     OverhangWall,
+    GapFill,
     BottomSurface,
     TopSurface,
     Ironing,
@@ -69,6 +88,7 @@ impl ExtrusionRole {
             Self::OuterWall => "Outer wall",
             Self::InnerWall => "Inner wall",
             Self::OverhangWall => "Overhang wall",
+            Self::GapFill => "Gap fill",
             Self::BottomSurface => "Bottom surface",
             Self::TopSurface => "Top surface",
             Self::Ironing => "Ironing",
@@ -101,6 +121,10 @@ pub struct ExtrusionPath {
     pub flow_ratio: f64,
     pub points: Vec<Point2>,
     pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_percent: Option<u8>,
 }
 
 impl ExtrusionPath {
@@ -162,6 +186,27 @@ impl ExtrusionPath {
     }
 }
 
+/// Metadata describing one logical print object for Cancel-Object (`EXCLUDE_OBJECT` / `M486`) output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SlicedObjectInfo {
+    pub id: u64,
+    pub name: String,
+    pub gcode_id: String,
+    pub center_xy_mm: [f64; 2],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub polygon_xy_mm: Vec<[f64; 2]>,
+    pub max_z_mm: f64,
+}
+
+/// Prepared world-space plate object passed to [`slice_plate_objects`].
+#[derive(Debug, Clone, Copy)]
+pub struct PlateSliceObject<'a> {
+    pub id: u64,
+    pub name: &'a str,
+    pub prepared_mesh: &'a TriangleMesh,
+    pub overrides: &'a ModifierOverrides,
+}
+
 /// One sliced layer with cross-section regions and generated extrusion paths.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SlicedLayer {
@@ -174,12 +219,18 @@ pub struct SlicedLayer {
     pub fan_percent: u8,
     #[serde(default)]
     pub estimated_time_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<u64>,
 }
 
 /// Output of slicing a single plate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SlicedPlate {
     pub layers: Vec<SlicedLayer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<SlicedObjectInfo>,
+    #[serde(default)]
+    pub print_sequence: PrintSequence,
 }
 
 /// Stadium cross-sectional area (`mm^2`) of an extrusion bead of width `w` and height `h`.
@@ -298,6 +349,291 @@ pub fn slice_meshes_with_modifiers(
     config.validate()?;
     let combined = TriangleMesh::merge(prepared_meshes)?;
     slice_prepared_mesh_with_modifiers(&combined, config, modifiers)
+}
+
+fn sanitize_gcode_object_id(id: u64, name: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_underscore = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore && !slug.is_empty() {
+            slug.push('_');
+            prev_underscore = true;
+        }
+        if slug.len() >= 32 {
+            break;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        format!("obj_{id}")
+    } else {
+        format!("obj_{id}_{slug}")
+    }
+}
+
+fn effective_object_config(base: &PrintConfig, overrides: &ModifierOverrides) -> PrintConfig {
+    if overrides.is_empty() {
+        return base.clone();
+    }
+    let mut params = EffectiveLayerParams::from_config(base);
+    params.apply_overrides(overrides);
+    params.to_layer_config(base)
+}
+
+fn build_sliced_object_info(obj: &PlateSliceObject<'_>) -> Result<SlicedObjectInfo, SliceError> {
+    let bb = obj
+        .prepared_mesh
+        .aabb()
+        .ok_or(SliceError::Geom(GeomError::EmptyMesh))?;
+    let center_xy_mm = [0.5 * (bb.min.x + bb.max.x), 0.5 * (bb.min.y + bb.max.y)];
+    let polygon_xy_mm = vec![
+        [bb.min.x, bb.min.y],
+        [bb.max.x, bb.min.y],
+        [bb.max.x, bb.max.y],
+        [bb.min.x, bb.max.y],
+    ];
+    Ok(SlicedObjectInfo {
+        id: obj.id,
+        name: obj.name.to_owned(),
+        gcode_id: sanitize_gcode_object_id(obj.id, obj.name),
+        center_xy_mm,
+        polygon_xy_mm,
+        max_z_mm: (bb.max.z - bb.min.z).max(0.0),
+    })
+}
+
+fn validate_sequential_clearances(
+    ordered: &[(&PlateSliceObject<'_>, layercraft_geom::Aabb3)],
+    config: &PrintConfig,
+) -> Result<(), SliceError> {
+    if ordered.len() <= 1 {
+        return Ok(());
+    }
+    let max_h = config.process.extruder_clearance_height_mm;
+    let req_r = config.process.extruder_clearance_radius_mm;
+
+    for (idx, (obj, bb)) in ordered.iter().enumerate() {
+        let obj_h = (bb.max.z - bb.min.z).max(0.0);
+        if idx + 1 < ordered.len() && obj_h > max_h + 1e-4 {
+            return Err(SliceError::SequentialHeightViolation {
+                object: obj.name.to_owned(),
+                height_mm: obj_h,
+                max_clearance_height_mm: max_h,
+            });
+        }
+        for (other, other_bb) in ordered.iter().skip(idx + 1) {
+            let dx = (bb.min.x - other_bb.max.x)
+                .max(other_bb.min.x - bb.max.x)
+                .max(0.0);
+            let dy = (bb.min.y - other_bb.max.y)
+                .max(other_bb.min.y - bb.max.y)
+                .max(0.0);
+            let clearance = dx.hypot(dy);
+            if clearance + 1e-4 < req_r {
+                return Err(SliceError::SequentialClearanceViolation {
+                    object_a: obj.name.to_owned(),
+                    object_b: other.name.to_owned(),
+                    clearance_mm: clearance,
+                    required_mm: req_r,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Slice a collection of distinct build-plate objects, preserving per-object IDs, overrides, and sequence mode.
+pub fn slice_plate_objects(
+    objects: &[PlateSliceObject<'_>],
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+) -> Result<SlicedPlate, SliceError> {
+    if objects.is_empty() {
+        return Err(SliceError::Geom(GeomError::EmptyMesh));
+    }
+    config.validate()?;
+    for m in modifiers {
+        m.overrides.validate()?;
+    }
+    for obj in objects {
+        obj.overrides.validate()?;
+    }
+
+    let mut obj_infos = Vec::with_capacity(objects.len());
+    for obj in objects {
+        obj_infos.push(build_sliced_object_info(obj)?);
+    }
+
+    match config.process.print_sequence {
+        PrintSequence::ByObject => {
+            let mut ranked: Vec<(&PlateSliceObject<'_>, layercraft_geom::Aabb3)> =
+                Vec::with_capacity(objects.len());
+            for obj in objects {
+                let bb = obj
+                    .prepared_mesh
+                    .aabb()
+                    .ok_or(SliceError::Geom(GeomError::EmptyMesh))?;
+                ranked.push((obj, bb));
+            }
+            ranked.sort_by(|(a, a_bb), (b, b_bb)| {
+                let az = a_bb.max.z - a_bb.min.z;
+                let bz = b_bb.max.z - b_bb.min.z;
+                az.total_cmp(&bz)
+                    .then_with(|| a_bb.min.y.total_cmp(&b_bb.min.y))
+                    .then_with(|| a_bb.min.x.total_cmp(&b_bb.min.x))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            validate_sequential_clearances(&ranked, config)?;
+
+            let mut all_layers = Vec::new();
+            for (obj, _) in ranked {
+                let obj_cfg = effective_object_config(config, obj.overrides);
+                let mut sub_plate =
+                    slice_prepared_mesh_with_modifiers(obj.prepared_mesh, &obj_cfg, modifiers)?;
+                for layer in &mut sub_plate.layers {
+                    layer.object_id = Some(obj.id);
+                    for path in &mut layer.paths {
+                        path.object_id = Some(obj.id);
+                    }
+                }
+                all_layers.extend(sub_plate.layers);
+            }
+            Ok(SlicedPlate {
+                layers: all_layers,
+                objects: obj_infos,
+                print_sequence: PrintSequence::ByObject,
+            })
+        }
+        PrintSequence::ByLayer => {
+            if objects.len() == 1
+                && let Some(obj) = objects.first()
+            {
+                let obj_cfg = effective_object_config(config, obj.overrides);
+                let mut plate =
+                    slice_prepared_mesh_with_modifiers(obj.prepared_mesh, &obj_cfg, modifiers)?;
+                for layer in &mut plate.layers {
+                    for path in &mut layer.paths {
+                        if !matches!(path.role, ExtrusionRole::Skirt | ExtrusionRole::Brim) {
+                            path.object_id = Some(obj.id);
+                        }
+                    }
+                }
+                plate.objects = obj_infos;
+                plate.print_sequence = PrintSequence::ByLayer;
+                return Ok(plate);
+            }
+
+            let al = &config.process.adaptive_layer_height;
+            let explicit_ranges: Vec<ExplicitHeightRange> = config
+                .process
+                .height_ranges
+                .iter()
+                .filter_map(|hr| {
+                    hr.layer_height_mm.map(|h| ExplicitHeightRange {
+                        min_z_mm: hr.min_z_mm,
+                        max_z_mm: hr.max_z_mm,
+                        layer_height_mm: h,
+                    })
+                })
+                .collect();
+
+            let max_z = obj_infos.iter().map(|o| o.max_z_mm).fold(0.0_f64, f64::max);
+            let schedule = if al.enabled || !explicit_ranges.is_empty() {
+                let merged_tris: Vec<layercraft_geom::Triangle> = objects
+                    .iter()
+                    .flat_map(|o| o.prepared_mesh.triangles.iter().copied())
+                    .collect();
+                let merged_mesh = TriangleMesh::new(merged_tris)?;
+                let nozzle_d = config.machine.nozzle_diameter_mm;
+                let nom_h = config.process.layer_height_mm;
+                let sched_params = VariableScheduleParams {
+                    first_layer_height_mm: config.process.first_layer_height_mm,
+                    nominal_layer_height_mm: nom_h,
+                    adaptive: al.enabled,
+                    min_layer_height_mm: al.effective_min_layer_height_mm(nozzle_d, nom_h),
+                    max_layer_height_mm: al.effective_max_layer_height_mm(nozzle_d, nom_h),
+                    quality: al.quality,
+                    smooth_radius_mm: al.smooth_radius_mm,
+                    max_step_ratio: al.max_step_ratio,
+                    explicit_ranges,
+                };
+                build_variable_layer_schedule(&merged_mesh, &sched_params)?
+            } else {
+                build_layer_schedule(
+                    max_z,
+                    config.process.first_layer_height_mm,
+                    config.process.layer_height_mm,
+                )?
+            };
+
+            let n_layers = schedule.len();
+            let mut per_obj_layers: Vec<(u64, Vec<SlicedLayer>)> =
+                Vec::with_capacity(objects.len());
+            for obj in objects {
+                let obj_cfg = effective_object_config(config, obj.overrides);
+                let mut raw = slice_mesh_with_schedule(obj.prepared_mesh, &schedule)?;
+                while raw.last().is_some_and(|l| l.regions.is_empty()) {
+                    raw.pop();
+                }
+                if raw.is_empty() {
+                    continue;
+                }
+                let sliced_layers =
+                    slice_raw_layers_internal(&raw, &obj_cfg, modifiers, false, Some(obj.id))?;
+                per_obj_layers.push((obj.id, sliced_layers));
+            }
+
+            let mut combined_layers = Vec::with_capacity(n_layers);
+            for idx in 0..n_layers {
+                let Some(plane) = schedule.get(idx) else {
+                    continue;
+                };
+                let mut slice_regions = Vec::new();
+                let mut layer_paths = Vec::new();
+                for (_id, obj_layers) in &per_obj_layers {
+                    if let Some(ol) = obj_layers.get(idx) {
+                        slice_regions.extend(ol.slice_regions.iter().cloned());
+                        layer_paths.extend(ol.paths.iter().cloned());
+                    }
+                }
+                if idx == 0 && !slice_regions.is_empty() {
+                    let mut adhesion = Vec::new();
+                    append_adhesion_paths(&slice_regions, plane.height_mm, config, &mut adhesion)?;
+                    adhesion.extend(layer_paths);
+                    layer_paths = adhesion;
+                }
+                let (fan_percent, estimated_time_s) =
+                    apply_flow_and_cooling(idx, &mut layer_paths, config);
+                combined_layers.push(SlicedLayer {
+                    index: plane.index,
+                    z_top_mm: plane.z_top_mm,
+                    height_mm: plane.height_mm,
+                    slice_regions,
+                    paths: layer_paths,
+                    fan_percent,
+                    estimated_time_s,
+                    object_id: None,
+                });
+            }
+            while combined_layers
+                .last()
+                .is_some_and(|l| l.slice_regions.is_empty() && l.paths.is_empty())
+            {
+                combined_layers.pop();
+            }
+
+            Ok(SlicedPlate {
+                layers: combined_layers,
+                objects: obj_infos,
+                print_sequence: PrintSequence::ByLayer,
+            })
+        }
+    }
 }
 
 fn parallel_try_map<T, R, E, F>(items: Vec<T>, f: &F) -> Result<Vec<R>, E>
@@ -536,6 +872,21 @@ pub fn slice_from_raw_layers_with_modifiers(
     config: &PrintConfig,
     modifiers: &[ModifierVolume],
 ) -> Result<SlicedPlate, SliceError> {
+    let layers = slice_raw_layers_internal(raw_layers, config, modifiers, true, None)?;
+    Ok(SlicedPlate {
+        layers,
+        objects: Vec::new(),
+        print_sequence: PrintSequence::ByLayer,
+    })
+}
+
+fn slice_raw_layers_internal(
+    raw_layers: &[RawSliceLayer],
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+    emit_adhesion: bool,
+    object_id: Option<u64>,
+) -> Result<Vec<SlicedLayer>, SliceError> {
     config.validate()?;
     for m in modifiers {
         m.overrides.validate()?;
@@ -561,8 +912,8 @@ pub fn slice_from_raw_layers_with_modifiers(
     } else {
         None
     };
-    let comp_layers: &[RawSliceLayer] = comp_raw_holder.as_deref().unwrap_or(raw_layers);
-    let layer0_effective: Option<Vec<ExPolygon>> = if elephant_comp.abs() > 1e-6 {
+    let base_comp_layers: &[RawSliceLayer] = comp_raw_holder.as_deref().unwrap_or(raw_layers);
+    let mut layer0_effective: Option<Vec<ExPolygon>> = if elephant_comp.abs() > 1e-6 {
         raw_layers
             .first()
             .map(|raw0| {
@@ -573,7 +924,42 @@ pub fn slice_from_raw_layers_with_modifiers(
         None
     };
 
-    let sliced_mods = slice_modifier_volumes(modifiers, comp_layers)?;
+    let sliced_mods = slice_modifier_volumes(modifiers, base_comp_layers)?;
+    let has_negatives = sliced_mods.negative_masks.iter().any(|m| !m.is_empty());
+    let cut_layers_holder: Option<Vec<RawSliceLayer>> = if has_negatives {
+        let indices: Vec<usize> = (0..n).collect();
+        let cut_vec = parallel_try_map(indices, &|idx| -> Result<RawSliceLayer, SliceError> {
+            let Some(raw) = base_comp_layers.get(idx) else {
+                return Err(SliceError::Geom(GeomError::EmptyMesh));
+            };
+            let neg = sliced_mods
+                .negative_masks
+                .get(idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let regions = if neg.is_empty() || raw.regions.is_empty() {
+                raw.regions.clone()
+            } else {
+                difference(&raw.regions, neg)?
+            };
+            Ok(RawSliceLayer {
+                plane: raw.plane,
+                regions,
+            })
+        })?;
+        if let Some(l0) = &mut layer0_effective
+            && let Some(neg0) = sliced_mods.negative_masks.first()
+            && !neg0.is_empty()
+            && !l0.is_empty()
+        {
+            *l0 = difference(l0, neg0)?;
+        }
+        Some(cut_vec)
+    } else {
+        None
+    };
+    let comp_layers: &[RawSliceLayer] = cut_layers_holder.as_deref().unwrap_or(base_comp_layers);
+
     let support_paths_per_layer = generate_support_paths(
         comp_layers,
         config,
@@ -926,7 +1312,7 @@ pub fn slice_from_raw_layers_with_modifiers(
         let is_first = idx == 0;
         let mut paths = Vec::new();
 
-        if is_first {
+        if is_first && emit_adhesion {
             append_adhesion_paths(effective_regions, h, config, &mut paths)?;
         }
         if let Some(spaths) = support_paths_per_layer.get(idx) {
@@ -1169,6 +1555,13 @@ pub fn slice_from_raw_layers_with_modifiers(
         let ordered =
             order_layer_paths_by_island(idx, raw_paths, effective_regions, &mut cursor_xy, config);
         let mut paths = ordered;
+        if let Some(oid) = object_id {
+            for path in &mut paths {
+                if !matches!(path.role, ExtrusionRole::Skirt | ExtrusionRole::Brim) {
+                    path.object_id = Some(oid);
+                }
+            }
+        }
         let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
 
         layers.push(SlicedLayer {
@@ -1179,10 +1572,11 @@ pub fn slice_from_raw_layers_with_modifiers(
             paths,
             fan_percent,
             estimated_time_s,
+            object_id: None,
         });
     }
 
-    Ok(SlicedPlate { layers })
+    Ok(layers)
 }
 
 #[cfg(test)]
@@ -1447,16 +1841,9 @@ fn apply_flow_and_cooling(
     let mut extrusion_time_s = 0.0;
     let mut travel_time_s = 0.0;
     let mut prev_end: Option<Point2> = None;
-    let mut has_bridge_or_overhang = false;
 
     let fil_flow = config.filament.flow_ratio.max(0.001);
     for path in paths.iter_mut() {
-        if matches!(
-            path.role,
-            ExtrusionRole::Bridge | ExtrusionRole::InternalBridge | ExtrusionRole::OverhangWall
-        ) {
-            has_bridge_or_overhang = true;
-        }
         let min_w = path.min_width_mm();
         let eff_area = bead_area_mm2(min_w, path.height_mm) * path.flow_ratio.max(0.001) * fil_flow;
         if eff_area > 1e-9 && max_vol_flow.is_finite() && max_vol_flow > 0.0 {
@@ -1532,16 +1919,27 @@ fn apply_flow_and_cooling(
         }
     }
 
-    if layer_idx >= disable_first && has_bridge_or_overhang {
-        fan_pct = fan_pct.max(config.filament.bridge_fan_percent as f64);
+    let base_fan_u8 = fan_pct.round().clamp(0.0, 100.0) as u8;
+    let boost_fan = config.filament.bridge_fan_percent;
+    for path in paths.iter_mut() {
+        if layer_idx >= disable_first
+            && boost_fan > base_fan_u8
+            && matches!(
+                path.role,
+                ExtrusionRole::Bridge | ExtrusionRole::InternalBridge | ExtrusionRole::OverhangWall
+            )
+        {
+            path.fan_percent = Some(boost_fan);
+        } else {
+            path.fan_percent = None;
+        }
     }
 
     let final_ext_time_s: f64 = paths
         .iter()
         .map(|p| estimate_path_kinematic_time_s(layer_idx, p, config))
         .sum();
-    let fan_u8 = fan_pct.round().clamp(0.0, 100.0) as u8;
-    (fan_u8, final_ext_time_s + travel_time_s)
+    (base_fan_u8, final_ext_time_s + travel_time_s)
 }
 
 fn is_midair_bridge_segment(bridge_wall_mask: &MaskClipIndex, a: Point2, b: Point2) -> bool {
@@ -1592,6 +1990,8 @@ fn flush_split_wall_segment(
             flow_ratio: prev_flow,
             points: pts,
             closed: false,
+            object_id: None,
+            fan_percent: None,
         });
     } else {
         active_pts.clear();
@@ -1608,6 +2008,166 @@ struct SplitWallPiece {
     w0: f64,
     p1: Point2,
     w1: f64,
+}
+
+struct ProgressiveOverhangMasks {
+    m10: MaskClipIndex,
+    m25: MaskClipIndex,
+    m50: MaskClipIndex,
+    m75: MaskClipIndex,
+}
+
+fn build_progressive_overhang_masks(
+    below: &[ExPolygon],
+    outer_w: f64,
+) -> Result<ProgressiveOverhangMasks, SliceError> {
+    let join = JoinType::Miter { limit: 2.0 };
+    let make_idx = |delta_mm: f64| -> Result<MaskClipIndex, SliceError> {
+        let polys = if delta_mm.abs() <= 1e-4 {
+            below.to_vec()
+        } else {
+            offset(below, mm_to_nm(delta_mm)?, join)?
+        };
+        Ok(MaskClipIndex::from_regions(&polys))
+    };
+    Ok(ProgressiveOverhangMasks {
+        m10: make_idx(-0.40 * outer_w + 0.015)?,
+        m25: make_idx(-0.25 * outer_w + 0.015)?,
+        m50: make_idx(0.015)?,
+        m75: make_idx(0.25 * outer_w + 0.015)?,
+    })
+}
+
+fn refine_subsegment_with_mask(
+    segs: Vec<(Point2, Point2, bool)>,
+    mask: &MaskClipIndex,
+) -> Vec<(Point2, Point2, bool)> {
+    let mut out = Vec::new();
+    for (p0, p1, _prev_inside) in segs {
+        for (sa, sb, inside) in mask.split_segment(p0, p1) {
+            if sa.distance_mm(sb) > 1e-6 {
+                out.push((sa, sb, inside));
+            }
+        }
+    }
+    out
+}
+
+struct ProgressiveOverhangContext<'a> {
+    masks: ProgressiveOverhangMasks,
+    outer_support: &'a MaskClipIndex,
+    bridge_mask: &'a MaskClipIndex,
+    bridge_wall_speed: f64,
+}
+
+fn split_outer_edge_progressive(
+    a: Point2,
+    b: Point2,
+    nominal_speed: f64,
+    nominal_flow: f64,
+    ctx: &ProgressiveOverhangContext<'_>,
+    config: &PrintConfig,
+) -> Vec<(Point2, Point2, ExtrusionRole, f64, f64)> {
+    let s1 = config.process.overhang_1_4_speed_mm_s;
+    let s2 = config.process.overhang_2_4_speed_mm_s;
+    let s3 = config.process.overhang_speed_mm_s;
+    let s4 = config.process.overhang_4_4_speed_mm_s;
+    let bridge_flow = config.process.bridge_flow_ratio;
+    let prog = &ctx.masks;
+    let outer_support_mask = ctx.outer_support;
+    let bridge_mask_idx = ctx.bridge_mask;
+    let bridge_wall_speed = ctx.bridge_wall_speed;
+
+    let band4_speed = s4.unwrap_or(s3);
+    let band2_speed = s2.unwrap_or_else(|| s1.unwrap_or(nominal_speed));
+    let band1_speed = s1.unwrap_or(nominal_speed);
+
+    let mut out = Vec::new();
+    for (p0, p1, in_m10) in prog.m10.split_segment(a, b) {
+        if p0.distance_mm(p1) <= 1e-6 {
+            continue;
+        }
+        if in_m10 {
+            out.push((
+                p0,
+                p1,
+                ExtrusionRole::OuterWall,
+                nominal_speed,
+                nominal_flow,
+            ));
+            continue;
+        }
+        for (q0, q1, in_m25) in refine_subsegment_with_mask(vec![(p0, p1, false)], &prog.m25) {
+            if in_m25 {
+                let is_supported = outer_support_mask
+                    .split_segment(q0, q1)
+                    .into_iter()
+                    .all(|(_, _, sup)| sup);
+                let (role, spd) = if let Some(sp) = s1 {
+                    (ExtrusionRole::OverhangWall, sp.min(nominal_speed))
+                } else if !is_supported {
+                    (ExtrusionRole::OverhangWall, s3)
+                } else {
+                    (ExtrusionRole::OuterWall, band1_speed)
+                };
+                out.push((q0, q1, role, spd, nominal_flow));
+                continue;
+            }
+            for (r0, r1, in_m50) in refine_subsegment_with_mask(vec![(q0, q1, false)], &prog.m50) {
+                if in_m50 {
+                    let is_supported = outer_support_mask
+                        .split_segment(r0, r1)
+                        .into_iter()
+                        .all(|(_, _, sup)| sup);
+                    let (role, spd) = if let Some(sp) = s2 {
+                        (ExtrusionRole::OverhangWall, sp.min(nominal_speed))
+                    } else if !is_supported {
+                        (ExtrusionRole::OverhangWall, s3)
+                    } else {
+                        (ExtrusionRole::OuterWall, band2_speed)
+                    };
+                    out.push((r0, r1, role, spd, nominal_flow));
+                    continue;
+                }
+                for (u0, u1, in_m75) in
+                    refine_subsegment_with_mask(vec![(r0, r1, false)], &prog.m75)
+                {
+                    if in_m75 {
+                        out.push((
+                            u0,
+                            u1,
+                            ExtrusionRole::OverhangWall,
+                            s3.min(nominal_speed),
+                            nominal_flow,
+                        ));
+                        continue;
+                    }
+                    for (v0, v1, in_bridge) in
+                        refine_subsegment_with_mask(vec![(u0, u1, false)], bridge_mask_idx)
+                    {
+                        if in_bridge {
+                            out.push((
+                                v0,
+                                v1,
+                                ExtrusionRole::OverhangWall,
+                                band4_speed.min(nominal_speed),
+                                nominal_flow,
+                            ));
+                        } else {
+                            out.push((
+                                v0,
+                                v1,
+                                ExtrusionRole::OverhangWall,
+                                bridge_wall_speed.min(band4_speed),
+                                bridge_flow,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn split_overhang_wall_paths(
@@ -1649,6 +2209,19 @@ fn split_overhang_wall_paths(
     let outer_mask_idx = MaskClipIndex::from_regions(&outer_support_mask);
     let inner_mask_idx = MaskClipIndex::from_regions(&inner_support_mask);
     let bridge_mask_idx = MaskClipIndex::from_regions(&bridge_wall_mask);
+    let has_progressive = config.process.overhang_1_4_speed_mm_s.is_some()
+        || config.process.overhang_2_4_speed_mm_s.is_some()
+        || config.process.overhang_4_4_speed_mm_s.is_some();
+    let progressive_ctx = if has_progressive {
+        Some(ProgressiveOverhangContext {
+            masks: build_progressive_overhang_masks(below, config.process.outer_wall_width_mm)?,
+            outer_support: &outer_mask_idx,
+            bridge_mask: &bridge_mask_idx,
+            bridge_wall_speed,
+        })
+    } else {
+        None
+    };
 
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
@@ -1696,47 +2269,84 @@ fn split_overhang_wall_paths(
                 continue;
             }
 
-            let split_pieces = support_mask.split_segment(a, b);
-            let mut edge_pieces: Vec<SplitWallPiece> = Vec::with_capacity(split_pieces.len());
-            for (sp0, sp1, is_supported) in split_pieces {
-                if sp0.distance_mm(sp1) <= 1e-6 {
-                    continue;
-                }
-                let (role, speed, flow) = if is_supported {
-                    (supported_role, path.speed_mm_s, path.flow_ratio)
-                } else {
-                    any_overhang = true;
-                    if is_inner || is_midair_bridge_segment(&bridge_mask_idx, sp0, sp1) {
-                        (ExtrusionRole::OverhangWall, bridge_wall_speed, bridge_flow)
-                    } else {
-                        (
-                            ExtrusionRole::OverhangWall,
-                            config.process.overhang_speed_mm_s,
-                            path.flow_ratio,
-                        )
+            let mut edge_pieces: Vec<SplitWallPiece> = Vec::new();
+            if !is_inner && let Some(prog_ctx) = progressive_ctx.as_ref() {
+                for (sp0, sp1, role, speed, flow) in split_outer_edge_progressive(
+                    a,
+                    b,
+                    path.speed_mm_s,
+                    path.flow_ratio,
+                    prog_ctx,
+                    config,
+                ) {
+                    if role == ExtrusionRole::OverhangWall {
+                        any_overhang = true;
                     }
-                };
-                let (p0x, p0y) = sp0.to_mm();
-                let (p1x, p1y) = sp1.to_mm();
-                let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
-                let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
-                let w0 = wa + t0 * (wb - wa);
-                let w1 = wa + t1 * (wb - wa);
-                let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
-                    (t1, sp1, w1, sp0, w0)
-                } else {
-                    (t0, sp0, w0, sp1, w1)
-                };
-                edge_pieces.push(SplitWallPiece {
-                    t: ta,
-                    role,
-                    speed,
-                    flow,
-                    p0: pa,
-                    w0: w_pa,
-                    p1: pb,
-                    w1: w_pb,
-                });
+                    let (p0x, p0y) = sp0.to_mm();
+                    let (p1x, p1y) = sp1.to_mm();
+                    let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let w0 = wa + t0 * (wb - wa);
+                    let w1 = wa + t1 * (wb - wa);
+                    let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
+                        (t1, sp1, w1, sp0, w0)
+                    } else {
+                        (t0, sp0, w0, sp1, w1)
+                    };
+                    edge_pieces.push(SplitWallPiece {
+                        t: ta,
+                        role,
+                        speed,
+                        flow,
+                        p0: pa,
+                        w0: w_pa,
+                        p1: pb,
+                        w1: w_pb,
+                    });
+                }
+            } else {
+                let split_pieces = support_mask.split_segment(a, b);
+                edge_pieces.reserve(split_pieces.len());
+                for (sp0, sp1, is_supported) in split_pieces {
+                    if sp0.distance_mm(sp1) <= 1e-6 {
+                        continue;
+                    }
+                    let (role, speed, flow) = if is_supported {
+                        (supported_role, path.speed_mm_s, path.flow_ratio)
+                    } else {
+                        any_overhang = true;
+                        if is_inner || is_midair_bridge_segment(&bridge_mask_idx, sp0, sp1) {
+                            (ExtrusionRole::OverhangWall, bridge_wall_speed, bridge_flow)
+                        } else {
+                            (
+                                ExtrusionRole::OverhangWall,
+                                config.process.overhang_speed_mm_s,
+                                path.flow_ratio,
+                            )
+                        }
+                    };
+                    let (p0x, p0y) = sp0.to_mm();
+                    let (p1x, p1y) = sp1.to_mm();
+                    let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                    let w0 = wa + t0 * (wb - wa);
+                    let w1 = wa + t1 * (wb - wa);
+                    let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
+                        (t1, sp1, w1, sp0, w0)
+                    } else {
+                        (t0, sp0, w0, sp1, w1)
+                    };
+                    edge_pieces.push(SplitWallPiece {
+                        t: ta,
+                        role,
+                        speed,
+                        flow,
+                        p0: pa,
+                        w0: w_pa,
+                        p1: pb,
+                        w1: w_pb,
+                    });
+                }
             }
             edge_pieces.sort_by(|x, y| x.t.total_cmp(&y.t));
 
@@ -2480,6 +3090,8 @@ fn generate_gyroid_infill(
                 flow_ratio: 1.0,
                 points: std::mem::take(&mut cur_pts),
                 closed: false,
+                object_id: None,
+                fan_percent: None,
             });
             if let Some((idx, rev, _)) = best_jump {
                 let mut chosen = waves.remove(idx);
@@ -2502,6 +3114,8 @@ fn generate_gyroid_infill(
             flow_ratio: 1.0,
             points: cur_pts,
             closed: false,
+            object_id: None,
+            fan_percent: None,
         });
     }
     Ok(paths)
@@ -2582,10 +3196,11 @@ pub(crate) fn build_perimeters_classic(
     // already fills the cross-section completely, do not synthesize an overlap sliver of infill.
     let inner_edge_inset_mm = cumulative_inset_mm + 0.5 * prev_w;
     let true_interior = offset(regions, -mm_to_nm(inner_edge_inset_mm)?, join)?;
-    let infill_area = if true_interior.is_empty() {
+    let mut infill_area = if true_interior.is_empty() {
         Vec::new()
     } else {
-        let infill_overlap = 0.15 * config.process.solid_infill_width_mm;
+        let infill_overlap =
+            config.process.infill_wall_overlap_ratio * config.process.solid_infill_width_mm;
         offset(&true_interior, mm_to_nm(infill_overlap)?, join)?
     };
 
@@ -2611,6 +3226,49 @@ pub(crate) fn build_perimeters_classic(
                         *speed_mm_s,
                         &mut paths,
                     );
+                }
+            }
+        }
+    }
+
+    if config.process.gap_fill_enabled {
+        let mut wall_ribbons = Vec::new();
+        for (_, w_mm, _, poly_group) in &rings {
+            let half_w = 0.5 * *w_mm;
+            let outer_env = offset(poly_group, mm_to_nm(half_w)?, join)?;
+            let inner_void = offset(poly_group, -mm_to_nm(half_w)?, join)?;
+            wall_ribbons.extend(difference(&outer_env, &inner_void)?);
+        }
+        let covered_by_walls = union_if_multi(wall_ribbons)?;
+        let uncovered = difference(regions, &covered_by_walls)?;
+        if !uncovered.is_empty() {
+            let solid_w = config.process.solid_infill_width_mm;
+            let wide_eroded = offset(&infill_area, -mm_to_nm(0.5 * solid_w)?, join)?;
+            let wide_infill = if wide_eroded.is_empty() {
+                Vec::new()
+            } else {
+                offset(&wide_eroded, mm_to_nm(0.5 * solid_w)?, join)?
+            };
+            let gap_regions = if wide_infill.is_empty() {
+                uncovered
+            } else {
+                difference(&uncovered, &wide_infill)?
+            };
+            if !gap_regions.is_empty() {
+                let gap_speed = config
+                    .process
+                    .gap_fill_speed_mm_s
+                    .unwrap_or((0.6 * inner_speed).max(10.0));
+                let gap_paths = arachne::extract_gap_fill_paths(
+                    &gap_regions,
+                    config.process.gap_fill_min_width_mm,
+                    1.8 * inner_w,
+                    layer_height_mm,
+                    gap_speed,
+                )?;
+                if !gap_paths.is_empty() {
+                    infill_area = difference(&infill_area, &gap_regions)?;
+                    paths.extend(gap_paths);
                 }
             }
         }
@@ -2724,6 +3382,8 @@ fn generate_concentric_fill(
                     flow_ratio,
                     points: ex.outer.points,
                     closed: true,
+                    object_id: None,
+                    fan_percent: None,
                 });
             }
             for hole in ex.holes {
@@ -2737,6 +3397,8 @@ fn generate_concentric_fill(
                         flow_ratio,
                         points: hole.points,
                         closed: true,
+                        object_id: None,
+                        fan_percent: None,
                     });
                 }
             }
@@ -2836,6 +3498,7 @@ fn greedy_order_paths(mut pool: Vec<ExtrusionPath>, cursor: &mut (f64, f64)) -> 
 #[derive(Default)]
 struct IslandPathBucket {
     walls: Vec<ExtrusionPath>,
+    gap_fill: Vec<ExtrusionPath>,
     surfaces: Vec<ExtrusionPath>,
     internal_solid: Vec<ExtrusionPath>,
     bridges: Vec<ExtrusionPath>,
@@ -2851,6 +3514,7 @@ impl IslandPathBucket {
             && config.process.wall_order != WallOrder::OuterInner
             && !self.sparse.is_empty()
             && !self.walls.is_empty()
+            && self.gap_fill.is_empty()
             && self.surfaces.is_empty()
             && self.bridges.is_empty()
             && self.internal_solid.is_empty()
@@ -2866,6 +3530,7 @@ impl IslandPathBucket {
             self.sparse
                 .first()
                 .or_else(|| self.walls.first())
+                .or_else(|| self.gap_fill.first())
                 .or_else(|| self.surfaces.first())
                 .or_else(|| self.internal_solid.first())
                 .or_else(|| self.bridges.first())
@@ -2873,6 +3538,7 @@ impl IslandPathBucket {
         } else {
             self.walls
                 .first()
+                .or_else(|| self.gap_fill.first())
                 .or_else(|| self.surfaces.first())
                 .or_else(|| self.internal_solid.first())
                 .or_else(|| self.bridges.first())
@@ -2884,6 +3550,7 @@ impl IslandPathBucket {
 
     fn is_empty(&self) -> bool {
         self.walls.is_empty()
+            && self.gap_fill.is_empty()
             && self.surfaces.is_empty()
             && self.internal_solid.is_empty()
             && self.bridges.is_empty()
@@ -2951,6 +3618,7 @@ fn order_layer_paths_by_island(
                         ExtrusionRole::OuterWall
                         | ExtrusionRole::InnerWall
                         | ExtrusionRole::OverhangWall => bucket.walls.push(path),
+                        ExtrusionRole::GapFill => bucket.gap_fill.push(path),
                         ExtrusionRole::BottomSurface | ExtrusionRole::TopSurface => {
                             bucket.surfaces.push(path);
                         }
@@ -3014,6 +3682,9 @@ fn order_layer_paths_by_island(
             if !chosen.bridges.is_empty() {
                 out.extend(greedy_order_paths(chosen.bridges, cursor_xy));
             }
+            if !chosen.gap_fill.is_empty() {
+                out.extend(greedy_order_paths(chosen.gap_fill, cursor_xy));
+            }
             if !chosen.sparse.is_empty() {
                 out.extend(greedy_order_paths(chosen.sparse, cursor_xy));
             }
@@ -3042,6 +3713,8 @@ pub(crate) fn push_closed_poly(
             flow_ratio: 1.0,
             points: poly.points.clone(),
             closed: true,
+            object_id: None,
+            fan_percent: None,
         });
     }
 }
@@ -3108,6 +3781,8 @@ fn flush_hatch_pts(
             flow_ratio,
             points: std::mem::take(pts),
             closed: false,
+            object_id: None,
+            fan_percent: None,
         });
     } else {
         pts.clear();
@@ -3871,7 +4546,14 @@ mod tests {
             .filter(|p| p.role == ExtrusionRole::Bridge)
             .collect();
         assert!(!bridges.is_empty(), "expected Bridge paths on layer 20");
-        assert_eq!(bridge_layer.fan_percent, 100);
+        assert_eq!(bridge_layer.fan_percent, 30);
+        assert!(bridges.iter().all(|b| b.fan_percent == Some(100)));
+        assert!(
+            bridge_layer
+                .paths
+                .iter()
+                .any(|p| p.role == ExtrusionRole::OuterWall && p.fan_percent.is_none())
+        );
 
         let mut x_span_len = 0.0;
         let mut total_len = 0.0;
@@ -5509,5 +6191,196 @@ mod tests {
         assert!(!split[2].2);
         assert!(split[3].2);
         assert!(!split[4].2);
+    }
+
+    #[test]
+    fn negative_part_modifier_cuts_void_through_sliced_cube() {
+        let cube = make_box_mesh(20.0, 20.0, 10.0);
+        let cutter = make_box_mesh(6.0, 6.0, 12.0);
+        let prepared_cube = prepare_for_plate(&cube, 250.0, 250.0).unwrap();
+        let mut prepared_cutter = prepare_for_plate(&cutter, 250.0, 250.0).unwrap();
+        prepared_cutter.translate(0.0, 0.0, -1.0).unwrap();
+
+        let mods = vec![ModifierVolume {
+            id: 1,
+            name: "Center Hole".to_owned(),
+            role: layercraft_config::ModifierRole::NegativePart,
+            mesh: prepared_cutter,
+            overrides: ModifierOverrides::default(),
+        }];
+        let cfg = PrintConfig::default();
+        let plate = slice_prepared_mesh_with_modifiers(&prepared_cube, &cfg, &mods).unwrap();
+        assert!(!plate.layers.is_empty());
+        let l5 = &plate.layers[5];
+        assert!(
+            !l5.slice_regions[0].holes.is_empty(),
+            "expected hole cut out of cube"
+        );
+    }
+
+    #[test]
+    fn classic_gap_fill_fills_narrow_rib_channel() {
+        // With outer_w = 0.42, inner_w = 0.45, wall_loops = 2:
+        // Total 1.12 mm rib fits ring 0 (0.84 mm across both sides) cleanly, leaving ~0.28 mm center gap.
+        let rib = make_box_mesh(1.12, 20.0, 2.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_loops = 2;
+        cfg.process.wall_generator = WallGenerator::Classic;
+        cfg.process.gap_fill_enabled = true;
+        cfg.process.gap_fill_speed_mm_s = Some(48.0);
+        cfg.process.gap_fill_min_width_mm = 0.12;
+        cfg.filament.slow_down_layer_time_s = 0.0;
+
+        let plate = slice_single_mesh(&rib, &cfg).unwrap();
+        let gap_paths: Vec<_> = plate.layers[2]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::GapFill)
+            .collect();
+        assert!(
+            !gap_paths.is_empty(),
+            "expected classic GapFill paths in 1.12 mm rib"
+        );
+        assert!((gap_paths[0].speed_mm_s - 48.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progressive_overhang_speeds_slow_steeper_bands() {
+        // Stepped block widens cleanly by progressive overhang steps:
+        // step1 (+0.14 mm flare -> 2/4 = 40 mm/s), step2 (+0.31 mm flare from step1 -> 3/4 = 25 mm/s).
+        let base = make_box_mesh(10.0, 10.0, 2.0);
+        let step1 = make_box_mesh(10.28, 10.0, 2.0);
+        let step2 = make_box_mesh(10.90, 10.0, 2.0);
+        let p_base = prepare_for_plate(&base, 250.0, 250.0).unwrap();
+        let mut p_step1 = prepare_for_plate(&step1, 250.0, 250.0).unwrap();
+        let mut p_step2 = prepare_for_plate(&step2, 250.0, 250.0).unwrap();
+        p_step1.translate(0.0, 0.0, 2.0).unwrap();
+        p_step2.translate(0.0, 0.0, 4.0).unwrap();
+        let mut tris = Vec::new();
+        tris.extend(p_base.triangles.iter().copied());
+        tris.extend(p_step1.triangles.iter().copied());
+        tris.extend(p_step2.triangles.iter().copied());
+        let combined = TriangleMesh::new(tris).unwrap();
+
+        let mut cfg = PrintConfig::default();
+        cfg.process.outer_wall_speed_mm_s = 100.0;
+        cfg.process.overhang_1_4_speed_mm_s = Some(60.0);
+        cfg.process.overhang_2_4_speed_mm_s = Some(40.0);
+        cfg.process.overhang_speed_mm_s = 25.0;
+        cfg.process.overhang_4_4_speed_mm_s = Some(14.0);
+        cfg.filament.slow_down_layer_time_s = 0.0;
+
+        let plate = slice_prepared_mesh(&combined, &cfg).unwrap();
+        // Layer at z = 2.2 (index 10): 0.14 mm flare (~33% unsupported -> 2/4 = 40 mm/s).
+        let l10_speeds: Vec<f64> = plate.layers[10]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OverhangWall)
+            .map(|p| p.speed_mm_s)
+            .collect();
+        assert!(
+            l10_speeds.iter().any(|&s| (s - 40.0).abs() < 1e-6),
+            "expected ~40 mm/s 2/4 overhang band: {l10_speeds:?}"
+        );
+        // Layer at z = 4.2 (index 20): extra 0.31 mm flare (>50%..75% -> 3/4 = 25 mm/s).
+        let l20_min = plate.layers[20]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::OverhangWall)
+            .map(|p| p.speed_mm_s)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            l20_min <= 25.0 + 1e-6,
+            "expected <=25 mm/s on deeper flare, got {l20_min}"
+        );
+    }
+
+    #[test]
+    fn slice_plate_objects_preserves_ids_overrides_and_sequential_clearance() {
+        let mesh = make_box_mesh(16.0, 16.0, 6.0);
+        let mut p1 = prepare_for_plate(&mesh, 250.0, 250.0).unwrap();
+        let mut p2 = prepare_for_plate(&mesh, 250.0, 250.0).unwrap();
+        p1.translate(-50.0, 0.0, 0.0).unwrap();
+        p2.translate(50.0, 0.0, 0.0).unwrap();
+
+        let ov1 = ModifierOverrides {
+            wall_loops: Some(1),
+            ..ModifierOverrides::default()
+        };
+        let ov2 = ModifierOverrides {
+            wall_loops: Some(4),
+            ..ModifierOverrides::default()
+        };
+        let objs = [
+            PlateSliceObject {
+                id: 10,
+                name: "Left Part",
+                prepared_mesh: &p1,
+                overrides: &ov1,
+            },
+            PlateSliceObject {
+                id: 20,
+                name: "Right Part",
+                prepared_mesh: &p2,
+                overrides: &ov2,
+            },
+        ];
+
+        let mut cfg = PrintConfig::default();
+        cfg.process.skirt_loops = 1;
+        let by_layer = slice_plate_objects(&objs, &cfg, &[]).unwrap();
+        assert_eq!(by_layer.objects.len(), 2);
+        assert_eq!(by_layer.print_sequence, PrintSequence::ByLayer);
+        let obj1_walls = by_layer.layers[1]
+            .paths
+            .iter()
+            .filter(|p| {
+                p.object_id == Some(10)
+                    && matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall)
+            })
+            .count();
+        let obj2_walls = by_layer.layers[1]
+            .paths
+            .iter()
+            .filter(|p| {
+                p.object_id == Some(20)
+                    && matches!(p.role, ExtrusionRole::OuterWall | ExtrusionRole::InnerWall)
+            })
+            .count();
+        assert_eq!(obj1_walls, 1);
+        assert_eq!(obj2_walls, 4);
+
+        // Sequential ByObject succeeds when spaced >= 35 mm and height <= 25 mm.
+        cfg.process.print_sequence = PrintSequence::ByObject;
+        let by_obj = slice_plate_objects(&objs, &cfg, &[]).unwrap();
+        assert_eq!(by_obj.print_sequence, PrintSequence::ByObject);
+        assert_eq!(by_obj.layers.len(), 60);
+        assert!(by_obj.layers[..30].iter().all(|l| l.object_id == Some(10)));
+        assert!(by_obj.layers[30..].iter().all(|l| l.object_id == Some(20)));
+
+        // Exceeding clearance height on first object fails cleanly.
+        cfg.process.extruder_clearance_height_mm = 4.0;
+        assert!(matches!(
+            slice_plate_objects(&objs, &cfg, &[]),
+            Err(SliceError::SequentialHeightViolation { .. })
+        ));
+        cfg.process.extruder_clearance_height_mm = 25.0;
+
+        // Placing objects too close in XY fails clearance check.
+        let mut p2_close = prepare_for_plate(&mesh, 250.0, 250.0).unwrap();
+        p2_close.translate(-25.0, 0.0, 0.0).unwrap();
+        let objs_close = [
+            objs[0],
+            PlateSliceObject {
+                id: 20,
+                name: "Close Part",
+                prepared_mesh: &p2_close,
+                overrides: &ov2,
+            },
+        ];
+        assert!(matches!(
+            slice_plate_objects(&objs_close, &cfg, &[]),
+            Err(SliceError::SequentialClearanceViolation { .. })
+        ));
     }
 }

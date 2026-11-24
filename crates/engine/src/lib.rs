@@ -8,8 +8,8 @@ use base64::Engine as _;
 use layercraft_config::ProfileDirLoadReport;
 use layercraft_config::{
     ActiveProfiles, ConfigError, MachineConfig, ModifierOverrides, ModifierRole, PrintConfig,
-    ProfileApplyResult, ProfileError, ProfileKind, ProfileLibrary, ProfileSummary, ResolvedProfile,
-    profile_document_from_config,
+    ProfileApplyResult, ProfileDocument, ProfileError, ProfileKind, ProfileLibrary, ProfileSummary,
+    ResolvedProfile, profile_document_from_config,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_config::{
@@ -23,8 +23,8 @@ use layercraft_gcode::{
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{
     IoError, ThreeMfBuildItem, ThreeMfDocument, ThreeMfExportDocument, ThreeMfExportPlate,
-    ThreeMfPart, ThreeMfResourceMesh, normalize_base_url, read_3mf_document_bytes, read_stl_bytes,
-    write_3mf_document_bytes,
+    ThreeMfModifierPart, ThreeMfPart, ThreeMfPartRole, ThreeMfResourceMesh, normalize_base_url,
+    read_3mf_document_bytes, read_stl_bytes, write_3mf_document_bytes,
 };
 pub use layercraft_io::{
     PrinterAuth, PrinterError, PrinterProfile, PrinterProfileSummary, PrinterProtocol,
@@ -41,8 +41,9 @@ use layercraft_mesh::{
 };
 pub use layercraft_mesh::{MeshRepairConfig, MeshRepairReport};
 use layercraft_slice::{
-    ModifierVolume, PrintabilityReport, SliceError, SlicedPlate, analyze_printability,
-    slice_prepared_mesh_with_modifiers, slice_single_mesh_with_modifiers,
+    ModifierVolume, PlateSliceObject, PrintabilityReport, SliceError, SlicedPlate,
+    analyze_printability, slice_plate_objects, slice_prepared_mesh_with_modifiers,
+    slice_single_mesh_with_modifiers,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -102,7 +103,7 @@ pub enum EngineError {
     Io(#[from] IoError),
 }
 
-/// Stored plate object entry with raw mesh, transform, and prepared world-space mesh.
+/// Stored plate object entry with raw mesh, transform, prepared world-space mesh, and optional overrides.
 #[derive(Debug, Clone)]
 pub struct PlateObjectEntry {
     pub id: u64,
@@ -110,6 +111,7 @@ pub struct PlateObjectEntry {
     pub raw_mesh: Arc<TriangleMesh>,
     pub transform: ObjectTransform,
     pub prepared_mesh: Arc<TriangleMesh>,
+    pub overrides: ModifierOverrides,
 }
 
 impl PlateObjectEntry {
@@ -118,6 +120,7 @@ impl PlateObjectEntry {
             id: self.id,
             name: self.name.clone(),
             transform: self.transform,
+            overrides: self.overrides.clone(),
             triangle_count: self.prepared_mesh.triangles.len(),
             aabb: self.prepared_mesh.aabb(),
         }
@@ -130,6 +133,8 @@ pub struct PlateObjectInfo {
     pub id: u64,
     pub name: String,
     pub transform: ObjectTransform,
+    #[serde(default)]
+    pub overrides: ModifierOverrides,
     pub triangle_count: usize,
     pub aabb: Option<Aabb3>,
 }
@@ -975,6 +980,14 @@ pub struct RemoveModifierParams {
     pub id: u64,
 }
 
+/// Parameters for `plate.set_object_overrides`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SetObjectOverridesParams {
+    pub id: u64,
+    #[serde(default)]
+    pub overrides: ModifierOverrides,
+}
+
 /// Parameters for `plate.repair_mesh`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RepairMeshParams {
@@ -1447,6 +1460,8 @@ struct ProjectObjectRecord {
     name: String,
     resource_id: u32,
     transform: ObjectTransform,
+    #[serde(default)]
+    overrides: ModifierOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1570,6 +1585,12 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             name: "plate.transform_object",
             summary: "Update XY position, Euler rotation, or XYZ scale on a plate object by ID.",
             params_schema: schema_val::<TransformObjectParams>(),
+            result_schema: schema_val::<PlateObjectInfo>(),
+        },
+        CommandDescriptor {
+            name: "plate.set_object_overrides",
+            summary: "Set per-object process parameter overrides (walls, shells, infill, ironing) by ID.",
+            params_schema: schema_val::<SetObjectOverridesParams>(),
             result_schema: schema_val::<PlateObjectInfo>(),
         },
         CommandDescriptor {
@@ -2029,6 +2050,7 @@ fn add_plate_object(
         raw_mesh: Arc::new(mesh),
         transform,
         prepared_mesh: Arc::new(prepared),
+        overrides: ModifierOverrides::default(),
     });
     if append && session.objects.len() > 1 {
         auto_arrange_session_objects(session, 6.0)?;
@@ -2036,20 +2058,116 @@ fn add_plate_object(
     rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
 }
 
+fn map_threemf_part_role(role: ThreeMfPartRole) -> ModifierRole {
+    match role {
+        ThreeMfPartRole::NegativePart => ModifierRole::NegativePart,
+        ThreeMfPartRole::Modifier => ModifierRole::Modifier,
+        ThreeMfPartRole::SupportBlocker => ModifierRole::SupportBlocker,
+        ThreeMfPartRole::SupportEnforcer => ModifierRole::SupportEnforcer,
+    }
+}
+
+fn import_threemf_project_settings(session: &mut Session, settings_json: &str) {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(settings_json) else {
+        return;
+    };
+    let mut settings = BTreeMap::new();
+    for (k, v) in map {
+        if matches!(
+            k.as_str(),
+            "name" | "type" | "inherits" | "from" | "instantiation"
+        ) {
+            continue;
+        }
+        settings.insert(k, v);
+    }
+    let doc = ProfileDocument {
+        name: "__3mf_project_settings__".to_owned(),
+        kind: ProfileKind::Process,
+        instantiation: true,
+        from: None,
+        inherits: Vec::new(),
+        settings,
+    };
+    let mut tmp = ProfileLibrary::new();
+    tmp.add_document(doc);
+    if let Ok(applied) = tmp.build_print_config(
+        &session.config,
+        None,
+        None,
+        Some("__3mf_project_settings__"),
+    ) && applied.config.validate().is_ok()
+    {
+        session.config = applied.config;
+    }
+}
+
+fn compute_aabb_shift(raw_bb: Option<Aabb3>, prep_bb: Option<Aabb3>) -> [f64; 3] {
+    match (raw_bb, prep_bb) {
+        (Some(rb), Some(pb)) => {
+            let rc = rb.center();
+            let pc = pb.center();
+            [pc.x - rc.x, pc.y - rc.y, pb.min.z - rb.min.z]
+        }
+        _ => [0.0, 0.0, 0.0],
+    }
+}
+
+fn build_aligned_modifier_entry(
+    next_modifier_id: &mut u64,
+    m_part: ThreeMfModifierPart,
+    shift: [f64; 3],
+) -> Result<PlateModifierEntry, EngineError> {
+    let bb = m_part.mesh.aabb().ok_or(EngineError::NoMeshLoaded)?;
+    let c = bb.center();
+    let transform = ModifierTransform {
+        position_xyz_mm: [c.x + shift[0], c.y + shift[1], c.z + shift[2]],
+        rotation_deg: [0.0, 0.0, 0.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+    let prepared_mesh = Arc::new(prepare_modifier_mesh(&m_part.mesh, transform)?);
+    let id = if *next_modifier_id == 0 {
+        1
+    } else {
+        *next_modifier_id
+    };
+    *next_modifier_id = id + 1;
+    Ok(PlateModifierEntry {
+        id,
+        name: m_part.name,
+        role: map_threemf_part_role(m_part.role),
+        primitive: None,
+        raw_mesh: Arc::new(m_part.mesh),
+        transform,
+        prepared_mesh,
+        overrides: ModifierOverrides::default(),
+    })
+}
+
+type ImportedPartBoundsMap = HashMap<(u32, u32), (u64, Option<Aabb3>)>;
+
 fn build_centered_plate_objects(
     parts: Vec<ThreeMfPart>,
     next_object_id: &mut u64,
     bed_width_mm: f64,
     bed_depth_mm: f64,
-) -> Result<Vec<PlateObjectEntry>, EngineError> {
+) -> Result<(Vec<PlateObjectEntry>, ImportedPartBoundsMap), EngineError> {
     if parts.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HashMap::new()));
     }
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
-    let mut part_entries: Vec<(String, TriangleMesh, [f64; 2])> = Vec::with_capacity(parts.len());
+    struct PartPrep {
+        object_id: u32,
+        instance_id: u32,
+        name: String,
+        mesh: TriangleMesh,
+        raw_aabb: Aabb3,
+        center_xy: [f64; 2],
+    }
+    let mut part_entries: Vec<PartPrep> = Vec::with_capacity(parts.len());
 
     for part in parts {
         let Some(bb) = part.mesh.aabb() else {
@@ -2060,10 +2178,17 @@ fn build_centered_plate_objects(
         max_x = max_x.max(bb.max.x);
         max_y = max_y.max(bb.max.y);
         let c = bb.center();
-        part_entries.push((part.name, part.mesh, [c.x, c.y]));
+        part_entries.push(PartPrep {
+            object_id: part.object_id,
+            instance_id: part.instance_id,
+            name: part.name,
+            mesh: part.mesh,
+            raw_aabb: bb,
+            center_xy: [c.x, c.y],
+        });
     }
     if part_entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HashMap::new()));
     }
 
     let group_cx = 0.5 * (min_x + max_x);
@@ -2072,7 +2197,8 @@ fn build_centered_plate_objects(
     let shift_y = 0.5 * bed_depth_mm - group_cy;
 
     let mut entries = Vec::with_capacity(part_entries.len());
-    for (name, raw_mesh, [cx, cy]) in part_entries {
+    let mut tracked: ImportedPartBoundsMap = HashMap::with_capacity(part_entries.len());
+    for item in part_entries {
         let id = if *next_object_id == 0 {
             1
         } else {
@@ -2080,20 +2206,25 @@ fn build_centered_plate_objects(
         };
         *next_object_id = id + 1;
         let transform = ObjectTransform {
-            position_xy_mm: [cx + shift_x, cy + shift_y],
+            position_xy_mm: [item.center_xy[0] + shift_x, item.center_xy[1] + shift_y],
             rotation_deg: [0.0, 0.0, 0.0],
             scale: [1.0, 1.0, 1.0],
         };
-        let prepared_mesh = Arc::new(prepare_transformed_object(&raw_mesh, transform)?);
+        let prepared_mesh = Arc::new(prepare_transformed_object(&item.mesh, transform)?);
+        tracked.insert(
+            (item.object_id, item.instance_id),
+            (id, Some(item.raw_aabb)),
+        );
         entries.push(PlateObjectEntry {
             id,
-            name,
-            raw_mesh: Arc::new(raw_mesh),
+            name: item.name,
+            raw_mesh: Arc::new(item.mesh),
             transform,
             prepared_mesh,
+            overrides: ModifierOverrides::default(),
         });
     }
-    Ok(entries)
+    Ok((entries, tracked))
 }
 
 fn add_3mf_document_objects(
@@ -2103,9 +2234,14 @@ fn add_3mf_document_objects(
     append: bool,
 ) -> Result<MeshInspection, EngineError> {
     let mut parts = doc.parts;
+    let modifier_parts = doc.modifier_parts;
     let plates_meta = doc.plates;
     if parts.is_empty() {
         return Err(EngineError::NoMeshLoaded);
+    }
+
+    if !append && let Some(settings_json) = doc.project_settings_json.as_deref() {
+        import_threemf_project_settings(session, settings_json);
     }
 
     let is_single_plate_single_part = plates_meta.len() <= 1 && parts.len() == 1;
@@ -2127,13 +2263,29 @@ fn add_3mf_document_objects(
             session.modifiers.clear();
         }
         if let Some(part) = parts.pop() {
+            let parent_key = (part.object_id, part.instance_id);
+            let raw_bb = part.mesh.aabb();
             let label = name_override
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
                 .unwrap_or(part.name);
-            return add_plate_object(session, label, part.mesh, append);
+            let insp = add_plate_object(session, label, part.mesh, append)?;
+            let prep_bb = session.objects.last().and_then(|o| o.prepared_mesh.aabb());
+            let shift = compute_aabb_shift(raw_bb, prep_bb);
+            for m_part in modifier_parts {
+                if (m_part.parent_object_id, m_part.instance_id) == parent_key || !append {
+                    let entry =
+                        build_aligned_modifier_entry(&mut session.next_modifier_id, m_part, shift)?;
+                    session.modifiers.push(entry);
+                }
+            }
+            if !session.modifiers.is_empty() {
+                session.sliced = None;
+                session.last_gcode = None;
+            }
+            return Ok(insp);
         }
         return Err(EngineError::NoMeshLoaded);
     }
@@ -2142,7 +2294,7 @@ fn add_3mf_document_objects(
         let bed_w = session.config.machine.bed_width_mm;
         let bed_d = session.config.machine.bed_depth_mm;
         let mut next_id = session.next_object_id;
-        let entries = build_centered_plate_objects(parts, &mut next_id, bed_w, bed_d)?;
+        let (entries, tracked) = build_centered_plate_objects(parts, &mut next_id, bed_w, bed_d)?;
         if entries.is_empty() {
             return Err(EngineError::NoMeshLoaded);
         }
@@ -2151,7 +2303,23 @@ fn add_3mf_document_objects(
         if session.objects.len() > 1 {
             auto_arrange_session_objects(session, 6.0)?;
         }
-        return rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded);
+        let insp = rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)?;
+        for m_part in modifier_parts {
+            let shift = tracked
+                .get(&(m_part.parent_object_id, m_part.instance_id))
+                .map(|(obj_id, raw_bb)| {
+                    let prep_bb = session
+                        .objects
+                        .iter()
+                        .find(|o| o.id == *obj_id)
+                        .and_then(|o| o.prepared_mesh.aabb());
+                    compute_aabb_shift(*raw_bb, prep_bb)
+                })
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let entry = build_aligned_modifier_entry(&mut session.next_modifier_id, m_part, shift)?;
+            session.modifiers.push(entry);
+        }
+        return Ok(insp);
     }
 
     let plate_defs: Vec<(u32, String)> = if plates_meta.is_empty() {
@@ -2172,21 +2340,55 @@ fn add_3mf_document_objects(
         }
     }
 
+    let mut mod_buckets: Vec<Vec<ThreeMfModifierPart>> =
+        (0..plate_defs.len()).map(|_| Vec::new()).collect();
+    for m_part in modifier_parts {
+        let target_idx = if m_part.plate_index < mod_buckets.len() {
+            m_part.plate_index
+        } else {
+            0
+        };
+        if let Some(bucket) = mod_buckets.get_mut(target_idx) {
+            bucket.push(m_part);
+        }
+    }
+
     let bed_w = session.config.machine.bed_width_mm;
     let bed_d = session.config.machine.bed_depth_mm;
     let mut next_id = session.next_object_id;
+    let mut next_mod_id = session.next_modifier_id;
     let mut max_plate_id: u32 = 0;
     let mut new_slots: Vec<StoredPlate> = Vec::with_capacity(plate_defs.len());
 
-    for ((plate_id, plate_name), bucket) in plate_defs.into_iter().zip(buckets) {
+    for (((plate_id, plate_name), bucket), mod_bucket) in
+        plate_defs.into_iter().zip(buckets).zip(mod_buckets)
+    {
         max_plate_id = max_plate_id.max(plate_id);
-        let objs = build_centered_plate_objects(bucket, &mut next_id, bed_w, bed_d)?;
+        let (objs, tracked) = build_centered_plate_objects(bucket, &mut next_id, bed_w, bed_d)?;
+        let mut mods = Vec::with_capacity(mod_bucket.len());
+        for m_part in mod_bucket {
+            let shift = tracked
+                .get(&(m_part.parent_object_id, m_part.instance_id))
+                .map(|(obj_id, raw_bb)| {
+                    let prep_bb = objs
+                        .iter()
+                        .find(|o| o.id == *obj_id)
+                        .and_then(|o| o.prepared_mesh.aabb());
+                    compute_aabb_shift(*raw_bb, prep_bb)
+                })
+                .unwrap_or([0.0, 0.0, 0.0]);
+            mods.push(build_aligned_modifier_entry(
+                &mut next_mod_id,
+                m_part,
+                shift,
+            )?);
+        }
         let (mesh, prepared_mesh, plate_inspection) = merge_plate_meshes(&objs)?;
         new_slots.push(StoredPlate {
             id: plate_id,
             name: plate_name,
             objects: objs,
-            modifiers: Vec::new(),
+            modifiers: mods,
             mesh,
             prepared_mesh,
             plate_inspection,
@@ -2201,6 +2403,7 @@ fn add_3mf_document_objects(
         .ok_or(EngineError::NoMeshLoaded)?;
 
     session.next_object_id = next_id;
+    session.next_modifier_id = next_mod_id;
     session.objects.clear();
     session.modifiers.clear();
     session.mesh = None;
@@ -2338,6 +2541,7 @@ pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineErro
                 name: obj.name.clone(),
                 resource_id: res_id,
                 transform: obj.transform,
+                overrides: obj.overrides.clone(),
             });
         }
 
@@ -2412,6 +2616,7 @@ fn load_manifest_plate_records(
 ) -> Result<(Vec<PlateObjectEntry>, Vec<PlateModifierEntry>), EngineError> {
     let mut new_objects = Vec::with_capacity(objects.len());
     for rec in objects {
+        rec.overrides.validate()?;
         let res = resource_map.get(&rec.resource_id).ok_or_else(|| {
             EngineError::InvalidProject(format!(
                 "missing 3MF resource {} for object `{}`",
@@ -2426,6 +2631,7 @@ fn load_manifest_plate_records(
             raw_mesh: Arc::clone(res),
             transform: rec.transform,
             prepared_mesh,
+            overrides: rec.overrides,
         });
     }
 
@@ -2745,7 +2951,19 @@ pub fn slice_with_config(
         .iter()
         .map(PlateModifierEntry::to_volume)
         .collect();
-    if let Some(prepared) = session.prepared_mesh.as_ref() {
+    if !session.objects.is_empty() {
+        let slice_objs: Vec<PlateSliceObject<'_>> = session
+            .objects
+            .iter()
+            .map(|o| PlateSliceObject {
+                id: o.id,
+                name: &o.name,
+                prepared_mesh: &o.prepared_mesh,
+                overrides: &o.overrides,
+            })
+            .collect();
+        Ok(slice_plate_objects(&slice_objs, config, &mod_vols)?)
+    } else if let Some(prepared) = session.prepared_mesh.as_ref() {
         Ok(slice_prepared_mesh_with_modifiers(
             prepared, config, &mod_vols,
         )?)
@@ -2765,6 +2983,7 @@ fn undo_label_for_command(name: &str) -> Option<&'static str> {
         | "plate.add_mesh_file" => Some("Add object"),
         "plate.remove_object" => Some("Remove object"),
         "plate.transform_object" => Some("Transform object"),
+        "plate.set_object_overrides" => Some("Set object overrides"),
         "plate.auto_arrange" => Some("Auto-arrange plate"),
         "plate.repair_mesh" => Some("Repair mesh"),
         "plate.add_modifier_primitive"
@@ -3097,6 +3316,20 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             entry.prepared_mesh = Arc::new(next_prep);
             let info = entry.info();
             let _ = rebuild_plate_mesh(session)?;
+            Ok(serde_json::to_value(info)?)
+        }
+        "plate.set_object_overrides" => {
+            let p: SetObjectOverridesParams = serde_json::from_value(params)?;
+            p.overrides.validate()?;
+            let entry = session
+                .objects
+                .iter_mut()
+                .find(|o| o.id == p.id)
+                .ok_or(EngineError::ObjectNotFound(p.id))?;
+            entry.overrides = p.overrides;
+            let info = entry.info();
+            session.sliced = None;
+            session.last_gcode = None;
             Ok(serde_json::to_value(info)?)
         }
         "plate.auto_arrange" => {
@@ -5570,6 +5803,259 @@ mod tests {
             sess.profiles
                 .get(ProfileKind::Filament, "My Fast PETG")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn object_overrides_roundtrip_and_affect_slice_and_cancel_object_gcode() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "name": "LeftCube", "append": false }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "name": "RightCube", "append": true }),
+        )
+        .unwrap();
+        let id1 = sess.objects[0].id;
+        let id2 = sess.objects[1].id;
+
+        execute(
+            &mut sess,
+            "plate.set_object_overrides",
+            serde_json::json!({
+                "id": id2,
+                "overrides": { "wall_loops": 4 }
+            }),
+        )
+        .unwrap();
+        assert_eq!(sess.objects[1].overrides.wall_loops, Some(4));
+
+        // Undo & redo preserve object overrides cleanly.
+        execute(&mut sess, "session.undo", Value::Null).unwrap();
+        assert_eq!(sess.objects[1].overrides.wall_loops, None);
+        execute(&mut sess, "session.redo", Value::Null).unwrap();
+        assert_eq!(sess.objects[1].overrides.wall_loops, Some(4));
+
+        // Project .3mf export/reload roundtrips per-object overrides.
+        let exported: ProjectExportBytesResult = serde_json::from_value(
+            execute(&mut sess, "project.export_3mf_bytes", Value::Null).unwrap(),
+        )
+        .unwrap();
+        let mut reloaded = Session::default();
+        execute(
+            &mut reloaded,
+            "project.load_3mf_bytes",
+            serde_json::json!({ "bytes": exported.bytes }),
+        )
+        .unwrap();
+        assert_eq!(reloaded.objects.len(), 2);
+        assert_eq!(reloaded.objects[1].overrides.wall_loops, Some(4));
+
+        // Slicing preserves object IDs + overrides + cancel-object markers in G-code.
+        execute(&mut reloaded, "slice.run", Value::Null).unwrap();
+        let sliced = reloaded.sliced.as_ref().unwrap();
+        assert_eq!(sliced.objects.len(), 2);
+        let l1 = &sliced.layers[1];
+        let obj1_walls = l1
+            .paths
+            .iter()
+            .filter(|p| {
+                p.object_id == Some(id1)
+                    && matches!(
+                        p.role,
+                        layercraft_slice::ExtrusionRole::OuterWall
+                            | layercraft_slice::ExtrusionRole::InnerWall
+                    )
+            })
+            .count();
+        let obj2_walls = l1
+            .paths
+            .iter()
+            .filter(|p| {
+                p.object_id == Some(id2)
+                    && matches!(
+                        p.role,
+                        layercraft_slice::ExtrusionRole::OuterWall
+                            | layercraft_slice::ExtrusionRole::InnerWall
+                    )
+            })
+            .count();
+        assert_eq!(obj1_walls, reloaded.config.process.wall_loops as usize);
+        assert_eq!(obj2_walls, 4);
+
+        let gcode_out: GcodeOutput =
+            serde_json::from_value(execute(&mut reloaded, "gcode.export", Value::Null).unwrap())
+                .unwrap();
+        assert!(gcode_out.gcode.contains("EXCLUDE_OBJECT_DEFINE NAME="));
+        assert!(gcode_out.gcode.contains("EXCLUDE_OBJECT_START NAME="));
+        assert!(gcode_out.gcode.contains("EXCLUDE_OBJECT_END NAME="));
+    }
+
+    fn test_crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn make_stored_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let data = body.as_bytes();
+            let crc = test_crc32(data);
+            let len = u32::try_from(data.len()).unwrap();
+            let name_bytes = name.as_bytes();
+            let nlen = u16::try_from(name_bytes.len()).unwrap();
+            let lfh_off = u32::try_from(out.len()).unwrap();
+
+            out.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&nlen.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&len.to_le_bytes());
+            central.extend_from_slice(&len.to_le_bytes());
+            central.extend_from_slice(&nlen.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&lfh_off.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_off = u32::try_from(out.len()).unwrap();
+        let cd_sz = u32::try_from(central.len()).unwrap();
+        let count = u16::try_from(entries.len()).unwrap();
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_sz.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn third_party_3mf_imports_negative_part_and_project_settings() {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="2" type="model" name="Body">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/><vertex x="20" y="0" z="0"/>
+          <vertex x="20" y="20" z="0"/><vertex x="0" y="20" z="0"/>
+          <vertex x="0" y="0" z="10"/><vertex x="20" y="0" z="10"/>
+          <vertex x="20" y="20" z="10"/><vertex x="0" y="20" z="10"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="3" type="model" name="HoleVoid">
+      <mesh>
+        <vertices>
+          <vertex x="7" y="7" z="-1"/><vertex x="13" y="7" z="-1"/>
+          <vertex x="13" y="13" z="-1"/><vertex x="7" y="13" z="-1"/>
+          <vertex x="7" y="7" z="11"/><vertex x="13" y="7" z="11"/>
+          <vertex x="13" y="13" z="11"/><vertex x="7" y="13" z="11"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="1" type="model" name="MountedBlock">
+      <components>
+        <component objectid="2"/>
+        <component objectid="3"/>
+      </components>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1" transform="1 0 0 0 1 0 0 0 1 100 100 0"/>
+  </build>
+</model>"#;
+        let model_settings = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="1">
+    <metadata key="name" value="MountedBlock"/>
+    <part id="2" subtype="normal_part"><metadata key="name" value="Body"/></part>
+    <part id="3" subtype="negative_part"><metadata key="name" value="CenterVoid"/></part>
+  </object>
+</config>"#;
+        let project_settings = r#"{"layer_height": "0.16", "wall_loops": "4"}"#;
+
+        let bytes = make_stored_zip(&[
+            ("3D/3dmodel.model", model),
+            ("Metadata/model_settings.config", model_settings),
+            ("Metadata/project_settings.config", project_settings),
+        ]);
+
+        let mut sess = Session::default();
+        let loaded: ProjectLoadResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "project.load_3mf_bytes",
+                serde_json::json!({ "bytes": bytes }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!loaded.is_layercraft_project);
+        assert_eq!(loaded.object_count, 1);
+        assert_eq!(loaded.modifier_count, 1);
+        assert_eq!(sess.modifiers[0].role, ModifierRole::NegativePart);
+        assert!((sess.config.process.layer_height_mm - 0.16).abs() < 1e-6);
+        assert_eq!(sess.config.process.wall_loops, 4);
+
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        let sliced = sess.sliced.as_ref().unwrap();
+        let mid_layer = &sliced.layers[sliced.layers.len() / 2];
+        assert!(
+            !mid_layer.slice_regions[0].holes.is_empty(),
+            "expected NegativePart cutout from 3MF to punch hole into block"
         );
     }
 }

@@ -1367,6 +1367,31 @@ impl LayerCraftApp {
         }
     }
 
+    pub(crate) fn set_object_overrides(&mut self, id: u64, overrides: ModifierOverrides) {
+        self.cancel_pending_slice();
+        match execute(
+            &mut self.session,
+            "plate.set_object_overrides",
+            serde_json::json!({
+                "id": id,
+                "overrides": overrides,
+            }),
+        ) {
+            Ok(_) => {
+                if self.pointer_active && !self.drag_undo_active {
+                    self.drag_undo_active = true;
+                    self.session.set_undo_suppressed(true);
+                }
+                self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
+                self.view_mode = ViewMode::Prepare;
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
     /// Return `true` while a native background slice job is active.
     pub(crate) fn is_slicing(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
@@ -1669,6 +1694,7 @@ impl LayerCraftApp {
                 ModifierRole::Modifier => [0.95, 0.72, 0.18, alpha],
                 ModifierRole::SupportBlocker => [0.92, 0.26, 0.26, alpha],
                 ModifierRole::SupportEnforcer => [0.20, 0.85, 0.45, alpha],
+                ModifierRole::NegativePart => [0.85, 0.22, 0.72, alpha],
             };
             modifiers.extend(build_mesh_vertices(&m.prepared_mesh, col));
         }
@@ -3598,5 +3624,37 @@ mod tests {
             app.execute_discard_action(pending);
         }
         assert_eq!(app.session.objects.len(), 1);
+    }
+
+    #[test]
+    fn ui_object_overrides_and_negative_part_scene_work() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        let obj_id = app.session.objects[0].id;
+        app.set_object_overrides(
+            obj_id,
+            ModifierOverrides {
+                wall_loops: Some(4),
+                ..ModifierOverrides::default()
+            },
+        );
+        assert!(app.project_dirty);
+        assert_eq!(app.session.objects[0].overrides.wall_loops, Some(4));
+
+        app.undo_action();
+        assert_eq!(app.session.objects[0].overrides.wall_loops, None);
+        app.redo_action();
+        assert_eq!(app.session.objects[0].overrides.wall_loops, Some(4));
+
+        app.add_modifier_primitive(
+            ModifierPrimitive::Box {
+                width_mm: 8.0,
+                depth_mm: 8.0,
+                height_mm: 10.0,
+            },
+            ModifierRole::NegativePart,
+        );
+        assert_eq!(app.session.modifiers.len(), 1);
+        assert_eq!(app.session.modifiers[0].role, ModifierRole::NegativePart);
+        assert!(!app.scene.modifier_verts.is_empty());
     }
 }

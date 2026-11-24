@@ -1,17 +1,19 @@
 //! Volumetric stadium-bead extrusion, G-code emission (Klipper/Marlin),
 //! and physical invariant evaluation + 2D raster IoU comparison.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::{PI, TAU};
 use std::fmt::Write as _;
 
 use base64::Engine as _;
 use combing::CombingLayer;
-use layercraft_config::{GcodeFlavor, PrintConfig, SeamPosition, ThumbnailFormat};
+use layercraft_config::{
+    GcodeFlavor, PrintConfig, PrintSequence, SeamPosition, ThumbnailFormat, ZEventAction,
+};
 use layercraft_geom::{ExPolygon, Point2};
 pub use layercraft_slice::{
     DEFAULT_EXTRUSION_ACCEL_MM_S2, DEFAULT_JUNCTION_DEVIATION_MM, DEFAULT_Z_ACCEL_MM_S2,
-    ExtrusionPath, ExtrusionRole, SlicedLayer, SlicedPlate, bead_area_mm2,
+    ExtrusionPath, ExtrusionRole, SlicedLayer, SlicedObjectInfo, SlicedPlate, bead_area_mm2,
     effective_role_accel_mm_s2, effective_travel_accel_mm_s2, estimate_polyline_kinematic_time_s,
     estimate_trapezoid_move_time_s,
 };
@@ -226,7 +228,11 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         .map(|l| l.estimated_time_s.max(0.0))
         .sum();
     let total_layers = plate.layers.len();
-    let max_z = plate.layers.last().map(|l| l.z_top_mm).unwrap_or(0.0);
+    let max_z = plate
+        .layers
+        .iter()
+        .map(|l| l.z_top_mm)
+        .fold(0.0_f64, f64::max);
     let first_nozzle = config.filament.effective_first_layer_nozzle_temp_c();
     let first_bed = config.filament.effective_first_layer_bed_temp_c();
     let first_z = plate
@@ -330,6 +336,40 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         }
     }
 
+    let mut object_table: HashMap<u64, (usize, String)> = HashMap::new();
+    if config.machine.label_objects && !plate.objects.is_empty() {
+        if config.machine.flavor != GcodeFlavor::Klipper {
+            writeln!(out, "M486 T{}", plate.objects.len()).map_err(|_| GcodeError::FormatError)?;
+        }
+        for (idx, obj) in plate.objects.iter().enumerate() {
+            object_table.insert(obj.id, (idx, obj.gcode_id.clone()));
+            match config.machine.flavor {
+                GcodeFlavor::Klipper => {
+                    let mut poly_str = String::new();
+                    if !obj.polygon_xy_mm.is_empty() {
+                        poly_str.push_str(" POLYGON=[");
+                        for (pi, [px, py]) in obj.polygon_xy_mm.iter().enumerate() {
+                            if pi > 0 {
+                                poly_str.push(',');
+                            }
+                            let _ = write!(poly_str, "[{px:.2},{py:.2}]");
+                        }
+                        poly_str.push(']');
+                    }
+                    writeln!(
+                        out,
+                        "EXCLUDE_OBJECT_DEFINE NAME={} CENTER={:.2},{:.2}{poly_str}",
+                        obj.gcode_id, obj.center_xy_mm[0], obj.center_xy_mm[1]
+                    )
+                    .map_err(|_| GcodeError::FormatError)?;
+                }
+                GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => {
+                    writeln!(out, "M486 A{}", obj.gcode_id).map_err(|_| GcodeError::FormatError)?;
+                }
+            }
+        }
+    }
+
     let travel_f = config.machine.travel_speed_mm_s * 60.0;
     let retract_len = config.machine.retraction_length_mm;
     let retract_f = config.machine.retraction_speed_mm_s * 60.0;
@@ -350,20 +390,72 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let mut feature_stats: BTreeMap<String, FeatureStats> = BTreeMap::new();
     let mut current_role: Option<ExtrusionRole> = None;
     let mut prev_role: Option<ExtrusionRole> = None;
+    let mut current_object_id: Option<u64> = None;
+    let mut current_seq_object_id: Option<u64> = None;
+    let mut max_completed_object_z = 0.0_f64;
+    let mut cur_seq_object_max_z = 0.0_f64;
+    let mut transitioned_from_first_layer = false;
     let mut prev_layer_seams: Vec<(f64, f64)> = Vec::new();
     let mut last_path_trail: Vec<(f64, f64)> = Vec::new();
 
-    for layer in &plate.layers {
+    let mut sorted_z_events = config.process.z_events.clone();
+    sorted_z_events.sort_by(|a, b| a.z_mm.total_cmp(&b.z_mm));
+    let mut z_event_fired = vec![false; sorted_z_events.len()];
+
+    for (layer_seq_idx, layer) in plate.layers.iter().enumerate() {
         last_path_trail.clear();
         let mut cur_layer_seams: Vec<(f64, f64)> = Vec::new();
         let combing = config.process.avoid_crossing_perimeters.then(|| {
             CombingLayer::from_regions(&layer.slice_regions, config.process.outer_wall_width_mm)
         });
 
+        let mut seq_object_changed = false;
+        if plate.print_sequence == PrintSequence::ByObject {
+            if current_seq_object_id.is_some() && layer.object_id != current_seq_object_id {
+                if let Some(prev_id) = current_object_id.take()
+                    && let Some((_, prev_gid)) = object_table.get(&prev_id)
+                {
+                    emit_object_end(&mut out, config.machine.flavor, prev_gid)?;
+                }
+                max_completed_object_z = max_completed_object_z.max(cur_seq_object_max_z);
+                cur_seq_object_max_z = 0.0;
+                prev_layer_seams.clear();
+                current_role = None;
+                prev_role = None;
+                seq_object_changed = true;
+
+                writeln!(out, ";SEQUENTIAL_OBJECT_CHANGE").map_err(|_| GcodeError::FormatError)?;
+                if !retracted && has_extruded && retract_len > 0.0 {
+                    emit_e_move(
+                        &mut out,
+                        config.machine.relative_extrusion,
+                        &mut cur_e,
+                        -retract_len,
+                        retract_f,
+                    )?;
+                    retracted = true;
+                }
+                let safe_z = (max_completed_object_z + config.machine.z_hop_mm.max(2.0))
+                    .min(config.machine.bed_height_mm);
+                if safe_z > cur_z + 1e-4 {
+                    writeln!(out, "G0 Z{safe_z:.3} F{zhop_f:.0}")
+                        .map_err(|_| GcodeError::FormatError)?;
+                    total_time_s += estimate_trapezoid_move_time_s(
+                        safe_z - cur_z,
+                        config.machine.z_hop_speed_mm_s,
+                        DEFAULT_Z_ACCEL_MM_S2,
+                    );
+                    cur_z = safe_z;
+                }
+            }
+            current_seq_object_id = layer.object_id;
+            cur_seq_object_max_z = cur_seq_object_max_z.max(layer.z_top_mm);
+        }
+
         writeln!(out, ";LAYER_CHANGE").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";Z:{:.3}", layer.z_top_mm).map_err(|_| GcodeError::FormatError)?;
         writeln!(out, ";HEIGHT:{:.3}", layer.height_mm).map_err(|_| GcodeError::FormatError)?;
-        if config.machine.relative_extrusion && layer.index > 0 {
+        if config.machine.relative_extrusion && layer_seq_idx > 0 {
             writeln!(out, "G92 E0").map_err(|_| GcodeError::FormatError)?;
         }
         if config.machine.emit_progress_m73 {
@@ -372,7 +464,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                     .floor()
                     .clamp(0.0, 99.0) as u8
             } else {
-                ((layer.index * 99) / total_layers.max(1)).min(99) as u8
+                ((layer_seq_idx * 99) / total_layers.max(1)).min(99) as u8
             };
             let rem_min = ((total_est_time_s - elapsed_est_s).max(0.0) / 60.0).ceil() as u64;
             writeln!(out, "M73 P{pct} R{rem_min}").map_err(|_| GcodeError::FormatError)?;
@@ -394,7 +486,8 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             push_template_block(&mut out, &expanded)?;
         }
 
-        if layer.index == 1 {
+        if layer.index > 0 && !transitioned_from_first_layer {
+            transitioned_from_first_layer = true;
             if config
                 .filament
                 .first_layer_nozzle_temp_c
@@ -414,18 +507,13 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         }
 
         if current_fan_percent != Some(layer.fan_percent) {
-            if layer.fan_percent == 0 {
-                writeln!(out, "M107").map_err(|_| GcodeError::FormatError)?;
-            } else {
-                let pwm = ((layer.fan_percent as f64) * 255.0 / 100.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                writeln!(out, "M106 S{pwm}").map_err(|_| GcodeError::FormatError)?;
-            }
+            emit_fan_command(&mut out, layer.fan_percent)?;
             current_fan_percent = Some(layer.fan_percent);
         }
 
-        let mut z_hopped = if layer.index == 0 && config.machine.start_gcode.is_some() {
+        let mut z_hopped = if seq_object_changed {
+            true
+        } else if layer_seq_idx == 0 && config.machine.start_gcode.is_some() {
             let travel_z = layer.z_top_mm + config.machine.z_hop_mm.max(1.8);
             writeln!(out, "G0 Z{travel_z:.3} F{zhop_f:.0}").map_err(|_| GcodeError::FormatError)?;
             total_time_s += estimate_trapezoid_move_time_s(
@@ -446,6 +534,76 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             cur_z = layer.z_top_mm;
             false
         };
+
+        for (ev_idx, ev) in sorted_z_events.iter().enumerate() {
+            let already = z_event_fired.get(ev_idx).copied().unwrap_or(true);
+            if !already && layer.z_top_mm + 1e-4 >= ev.z_mm {
+                if let Some(slot) = z_event_fired.get_mut(ev_idx) {
+                    *slot = true;
+                }
+                if !retracted && has_extruded && retract_len > 0.0 {
+                    emit_e_move(
+                        &mut out,
+                        config.machine.relative_extrusion,
+                        &mut cur_e,
+                        -retract_len,
+                        retract_f,
+                    )?;
+                    retracted = true;
+                }
+                let action_tag = match ev.action {
+                    ZEventAction::Pause => "pause",
+                    ZEventAction::FilamentChange => "filament_change",
+                    ZEventAction::CustomGcode => "custom_gcode",
+                };
+                writeln!(out, ";Z_EVENT:{action_tag}").map_err(|_| GcodeError::FormatError)?;
+                if let Some(msg) = ev
+                    .message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let clean_msg = msg.replace(['\r', '\n'], " ");
+                    writeln!(out, "M117 {clean_msg}").map_err(|_| GcodeError::FormatError)?;
+                }
+                match ev.action {
+                    ZEventAction::Pause => {
+                        let cmd = match config.machine.flavor {
+                            GcodeFlavor::Klipper => "PAUSE",
+                            GcodeFlavor::MarlinBuddy => "M601",
+                            GcodeFlavor::Marlin => "M0",
+                        };
+                        writeln!(out, "{cmd}").map_err(|_| GcodeError::FormatError)?;
+                    }
+                    ZEventAction::FilamentChange => {
+                        writeln!(out, ";COLOR_CHANGE").map_err(|_| GcodeError::FormatError)?;
+                        writeln!(out, "M600").map_err(|_| GcodeError::FormatError)?;
+                    }
+                    ZEventAction::CustomGcode => {
+                        if let Some(tpl) = ev
+                            .custom_gcode
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let vars = make_template_vars(
+                                config,
+                                layer.index,
+                                layer.z_top_mm,
+                                layer.height_mm,
+                                total_layers,
+                                max_z,
+                                &bounds,
+                            );
+                            let expanded = expand_gcode_template(tpl, &vars);
+                            writeln!(out, ";TYPE:Custom").map_err(|_| GcodeError::FormatError)?;
+                            push_template_block(&mut out, &expanded)?;
+                            current_role = None;
+                        }
+                    }
+                }
+            }
+        }
 
         let mut layer_state = LayerEmitState {
             out: &mut out,
@@ -471,6 +629,9 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             feature_stats: &mut feature_stats,
             current_role: &mut current_role,
             prev_role: &mut prev_role,
+            current_fan_percent: &mut current_fan_percent,
+            current_object_id: &mut current_object_id,
+            object_table: &object_table,
             cur_layer_seams: &mut cur_layer_seams,
             prev_layer_seams: &prev_layer_seams,
             last_path_trail: &mut last_path_trail,
@@ -484,9 +645,13 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             };
             if is_post_seam_reorderable(first_path) {
                 let run_role = first_path.role;
+                let run_obj = first_path.object_id;
+                let run_fan = first_path.fan_percent;
                 let mut end = i + 1;
                 while let Some(next_p) = layer.paths.get(end)
                     && next_p.role == run_role
+                    && next_p.object_id == run_obj
+                    && next_p.fan_percent == run_fan
                     && is_post_seam_reorderable(next_p)
                 {
                     end += 1;
@@ -531,6 +696,12 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             cur_e = 0.0;
         }
         elapsed_est_s += layer.estimated_time_s.max(0.0);
+    }
+
+    if let Some(prev_id) = current_object_id.take()
+        && let Some((_, prev_gid)) = object_table.get(&prev_id)
+    {
+        emit_object_end(&mut out, config.machine.flavor, prev_gid)?;
     }
 
     if config.machine.emit_progress_m73 {
@@ -704,6 +875,40 @@ fn emit_e_mode(out: &mut String, relative: bool) -> Result<(), GcodeError> {
     }
 }
 
+fn emit_fan_command(out: &mut String, pct: u8) -> Result<(), GcodeError> {
+    if pct == 0 {
+        writeln!(out, "M107").map_err(|_| GcodeError::FormatError)
+    } else {
+        let pwm = ((pct as f64) * 255.0 / 100.0).round().clamp(0.0, 255.0) as u8;
+        writeln!(out, "M106 S{pwm}").map_err(|_| GcodeError::FormatError)
+    }
+}
+
+fn emit_object_start(
+    out: &mut String,
+    flavor: GcodeFlavor,
+    idx: usize,
+    gcode_id: &str,
+) -> Result<(), GcodeError> {
+    match flavor {
+        GcodeFlavor::Klipper => writeln!(out, "EXCLUDE_OBJECT_START NAME={gcode_id}"),
+        GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => writeln!(out, "M486 S{idx}"),
+    }
+    .map_err(|_| GcodeError::FormatError)
+}
+
+fn emit_object_end(
+    out: &mut String,
+    flavor: GcodeFlavor,
+    gcode_id: &str,
+) -> Result<(), GcodeError> {
+    match flavor {
+        GcodeFlavor::Klipper => writeln!(out, "EXCLUDE_OBJECT_END NAME={gcode_id}"),
+        GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => writeln!(out, "M486 S-1"),
+    }
+    .map_err(|_| GcodeError::FormatError)
+}
+
 fn is_post_seam_reorderable(path: &ExtrusionPath) -> bool {
     !path.closed
         && matches!(
@@ -741,6 +946,9 @@ struct LayerEmitState<'a> {
     feature_stats: &'a mut BTreeMap<String, FeatureStats>,
     current_role: &'a mut Option<ExtrusionRole>,
     prev_role: &'a mut Option<ExtrusionRole>,
+    current_fan_percent: &'a mut Option<u8>,
+    current_object_id: &'a mut Option<u64>,
+    object_table: &'a HashMap<u64, (usize, String)>,
     cur_layer_seams: &'a mut Vec<(f64, f64)>,
     prev_layer_seams: &'a [(f64, f64)],
     last_path_trail: &'a mut Vec<(f64, f64)>,
@@ -796,6 +1004,26 @@ fn emit_single_layer_path(
     } else {
         Vec::new()
     };
+
+    if !st.object_table.is_empty() && *st.current_object_id != path.object_id {
+        if let Some(prev_id) = *st.current_object_id
+            && let Some((_, prev_gid)) = st.object_table.get(&prev_id)
+        {
+            emit_object_end(st.out, config.machine.flavor, prev_gid)?;
+        }
+        if let Some(new_id) = path.object_id
+            && let Some(&(idx, ref gid)) = st.object_table.get(&new_id)
+        {
+            emit_object_start(st.out, config.machine.flavor, idx, gid)?;
+        }
+        *st.current_object_id = path.object_id;
+    }
+
+    let desired_fan = path.fan_percent.unwrap_or(layer.fan_percent);
+    if *st.current_fan_percent != Some(desired_fan) {
+        emit_fan_command(st.out, desired_fan)?;
+        *st.current_fan_percent = Some(desired_fan);
+    }
 
     if *st.current_role != Some(path.role) {
         writeln!(st.out, ";TYPE:{}", path.role.label()).map_err(|_| GcodeError::FormatError)?;
@@ -2008,6 +2236,10 @@ pub struct GcodeReport {
     pub combed_travel_moves_count: usize,
     #[serde(default)]
     pub thumbnail_count: usize,
+    #[serde(default)]
+    pub object_label_commands_count: usize,
+    #[serde(default)]
+    pub z_event_commands_count: usize,
 }
 
 fn default_wall_variation_ratio() -> f64 {
@@ -2200,6 +2432,7 @@ pub fn evaluate_gcode(
     let mut feature_volumes_mm3: BTreeMap<String, f64> = BTreeMap::new();
     let mut layer_z_mm: Vec<f64> = Vec::new();
     let mut max_active_z = 0.0f64;
+    let mut overall_max_z = 0.0f64;
     let mut last_extrusion_z: Option<f64> = None;
     let mut current_declared_layer_z: Option<f64> = None;
     let mut prev_layer_max_z = 0.0f64;
@@ -2217,6 +2450,9 @@ pub fn evaluate_gcode(
     let mut scarf_ramp_moves_count = 0usize;
     let mut combed_travel_moves_count = 0usize;
     let mut thumbnail_count = 0usize;
+    let mut object_label_commands_count = 0usize;
+    let mut z_event_commands_count = 0usize;
+    let mut pending_z_event_marker = false;
 
     let mut min_ex_x = f64::INFINITY;
     let mut min_ex_y = f64::INFINITY;
@@ -2270,10 +2506,24 @@ pub fn evaluate_gcode(
             in_combing = false;
             continue;
         }
+        if trimmed == ";SEQUENTIAL_OBJECT_CHANGE" {
+            overall_max_z = overall_max_z.max(max_active_z);
+            prev_layer_max_z = 0.0;
+            max_active_z = 0.0;
+            last_extrusion_z = None;
+            current_declared_layer_z = None;
+            continue;
+        }
+        if trimmed.starts_with(";Z_EVENT:") {
+            z_event_commands_count += 1;
+            pending_z_event_marker = true;
+            continue;
+        }
         if trimmed == ";LAYER_CHANGE" {
             layer_change_count += 1;
             prev_layer_max_z = prev_layer_max_z.max(max_active_z);
             current_declared_layer_z = None;
+            pending_z_event_marker = false;
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix(";Z:") {
@@ -2358,6 +2608,15 @@ pub fn evaluate_gcode(
             }
             "M572" | "M900" | "SET_PRESSURE_ADVANCE" => {
                 pressure_advance_commands_count += 1;
+            }
+            "EXCLUDE_OBJECT_DEFINE" | "EXCLUDE_OBJECT_START" | "EXCLUDE_OBJECT_END" | "M486" => {
+                object_label_commands_count += 1;
+            }
+            "PAUSE" | "M600" | "M601" | "M0" => {
+                if !pending_z_event_marker {
+                    z_event_commands_count += 1;
+                }
+                pending_z_event_marker = false;
             }
             "G92" => {
                 for tok in tokens {
@@ -2765,7 +3024,7 @@ pub fn evaluate_gcode(
     let report = GcodeReport {
         active_layer_count: layer_z_mm.len(),
         layer_z_mm,
-        max_z_mm: max_active_z,
+        max_z_mm: overall_max_z.max(max_active_z),
         total_extrusion_length_mm: total_e_mm,
         total_filament_volume_mm3: total_e_mm * fil_area,
         total_travel_mm,
@@ -2793,6 +3052,8 @@ pub fn evaluate_gcode(
         layer_height_variation_ratio,
         combed_travel_moves_count,
         thumbnail_count,
+        object_label_commands_count,
+        z_event_commands_count,
     };
 
     Ok((report, segments))
@@ -3597,10 +3858,15 @@ mod tests {
                     flow_ratio: 1.0,
                     points: pts,
                     closed: false,
+                    object_id: None,
+                    fan_percent: None,
                 }],
                 fan_percent: 0,
                 estimated_time_s: 1.0,
+                object_id: None,
             }],
+            objects: Vec::new(),
+            print_sequence: PrintSequence::ByLayer,
         };
 
         let out = emit_gcode(&plate, &cfg).unwrap();
@@ -4150,6 +4416,285 @@ mod tests {
             "expected kinematic accel to materially change print time: low={} high={}",
             out_low.stats.estimated_time_s,
             out_high.stats.estimated_time_s
+        );
+    }
+
+    #[test]
+    fn cancel_object_emits_klipper_and_marlin_buddy_markers() {
+        use layercraft_config::ModifierOverrides;
+        use layercraft_slice::{PlateSliceObject, slice_plate_objects};
+
+        let mut p1 = make_box(16.0, 16.0, 2.0);
+        let mut p2 = make_box(16.0, 16.0, 2.0);
+        p1.translate(50.0, 117.0, 0.0).unwrap();
+        p2.translate(180.0, 117.0, 0.0).unwrap();
+
+        let ov = ModifierOverrides::default();
+        let objs = [
+            PlateSliceObject {
+                id: 1,
+                name: "Part A",
+                prepared_mesh: &p1,
+                overrides: &ov,
+            },
+            PlateSliceObject {
+                id: 2,
+                name: "Part B",
+                prepared_mesh: &p2,
+                overrides: &ov,
+            },
+        ];
+
+        let mut cfg = PrintConfig::default();
+        cfg.machine.flavor = GcodeFlavor::Klipper;
+        cfg.machine.label_objects = true;
+        let plate = slice_plate_objects(&objs, &cfg, &[]).unwrap();
+
+        let out_klipper = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out_klipper.gcode.contains("EXCLUDE_OBJECT_DEFINE NAME="));
+        assert!(out_klipper.gcode.contains("EXCLUDE_OBJECT_START NAME="));
+        assert!(out_klipper.gcode.contains("EXCLUDE_OBJECT_END NAME="));
+        let (rep_k, _) = evaluate_gcode(
+            &out_klipper.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep_k.safety.is_clean(), "{:?}", rep_k.safety);
+        assert!(rep_k.object_label_commands_count >= 6);
+
+        cfg.machine.flavor = GcodeFlavor::MarlinBuddy;
+        let out_buddy = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out_buddy.gcode.contains("M486 T2"));
+        assert!(out_buddy.gcode.contains("M486 A"));
+        assert!(out_buddy.gcode.contains("M486 S0"));
+        assert!(out_buddy.gcode.contains("M486 S1"));
+        assert!(out_buddy.gcode.contains("M486 S-1"));
+        let (rep_b, _) = evaluate_gcode(
+            &out_buddy.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep_b.safety.is_clean(), "{:?}", rep_b.safety);
+        assert!(rep_b.object_label_commands_count >= 6);
+
+        cfg.machine.label_objects = false;
+        let out_off = emit_gcode(&plate, &cfg).unwrap();
+        assert!(!out_off.gcode.contains("M486"));
+        assert!(!out_off.gcode.contains("EXCLUDE_OBJECT"));
+    }
+
+    #[test]
+    fn mid_layer_fan_boosts_for_bridge_and_restores_on_next_path() {
+        use layercraft_geom::{ExPolygon, Point2, Polygon};
+        use layercraft_slice::SlicedLayer;
+
+        let cfg = PrintConfig::default();
+        let plate = SlicedPlate {
+            layers: vec![SlicedLayer {
+                index: 2,
+                z_top_mm: 0.6,
+                height_mm: 0.2,
+                slice_regions: vec![ExPolygon::new(
+                    Polygon::new(vec![
+                        Point2::from_mm(40.0, 40.0).unwrap(),
+                        Point2::from_mm(90.0, 40.0).unwrap(),
+                        Point2::from_mm(90.0, 60.0).unwrap(),
+                        Point2::from_mm(40.0, 60.0).unwrap(),
+                    ]),
+                    vec![],
+                )],
+                paths: vec![
+                    ExtrusionPath {
+                        role: ExtrusionRole::OuterWall,
+                        width_mm: 0.42,
+                        point_widths_mm: Vec::new(),
+                        height_mm: 0.2,
+                        speed_mm_s: 60.0,
+                        flow_ratio: 1.0,
+                        points: vec![
+                            Point2::from_mm(45.0, 45.0).unwrap(),
+                            Point2::from_mm(60.0, 45.0).unwrap(),
+                        ],
+                        closed: false,
+                        object_id: None,
+                        fan_percent: None,
+                    },
+                    ExtrusionPath {
+                        role: ExtrusionRole::Bridge,
+                        width_mm: 0.42,
+                        point_widths_mm: Vec::new(),
+                        height_mm: 0.2,
+                        speed_mm_s: 30.0,
+                        flow_ratio: 1.0,
+                        points: vec![
+                            Point2::from_mm(65.0, 45.0).unwrap(),
+                            Point2::from_mm(80.0, 45.0).unwrap(),
+                        ],
+                        closed: false,
+                        object_id: None,
+                        fan_percent: Some(100),
+                    },
+                    ExtrusionPath {
+                        role: ExtrusionRole::SparseInfill,
+                        width_mm: 0.45,
+                        point_widths_mm: Vec::new(),
+                        height_mm: 0.2,
+                        speed_mm_s: 80.0,
+                        flow_ratio: 1.0,
+                        points: vec![
+                            Point2::from_mm(82.0, 50.0).unwrap(),
+                            Point2::from_mm(45.0, 50.0).unwrap(),
+                        ],
+                        closed: false,
+                        object_id: None,
+                        fan_percent: None,
+                    },
+                ],
+                fan_percent: 40,
+                estimated_time_s: 2.0,
+                object_id: None,
+            }],
+            objects: Vec::new(),
+            print_sequence: PrintSequence::ByLayer,
+        };
+
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        let fan_lines: Vec<&str> = out
+            .gcode
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("M106") || *l == "M107")
+            .collect();
+        // Expect initial M107 (disable_fan_first_layers), layer start M106 S102 (40%),
+        // bridge boost M106 S255 (100%), and restore M106 S102 (40%), plus final M107.
+        let base_idx = fan_lines.iter().position(|&l| l == "M106 S102").unwrap();
+        let boost_idx = fan_lines
+            .iter()
+            .skip(base_idx + 1)
+            .position(|&l| l == "M106 S255")
+            .unwrap()
+            + base_idx
+            + 1;
+        let restore_idx = fan_lines
+            .iter()
+            .skip(boost_idx + 1)
+            .position(|&l| l == "M106 S102")
+            .unwrap()
+            + boost_idx
+            + 1;
+        assert!(
+            base_idx < boost_idx && boost_idx < restore_idx,
+            "fan sequence: {fan_lines:?}"
+        );
+    }
+
+    #[test]
+    fn z_events_emit_pause_filament_change_and_custom_gcode() {
+        use layercraft_config::LayerZEvent;
+
+        let mesh = make_box(12.0, 12.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.machine.flavor = GcodeFlavor::MarlinBuddy;
+        cfg.process.z_events = vec![
+            LayerZEvent {
+                z_mm: 1.0,
+                action: ZEventAction::Pause,
+                message: Some("Insert nut".to_owned()),
+                custom_gcode: None,
+            },
+            LayerZEvent {
+                z_mm: 2.0,
+                action: ZEventAction::FilamentChange,
+                message: None,
+                custom_gcode: None,
+            },
+            LayerZEvent {
+                z_mm: 3.0,
+                action: ZEventAction::CustomGcode,
+                message: None,
+                custom_gcode: Some("M118 Z={layer_z}".to_owned()),
+            },
+        ];
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let out_buddy = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out_buddy.gcode.contains("M117 Insert nut"));
+        assert!(out_buddy.gcode.contains("M601"));
+        assert!(out_buddy.gcode.contains("M600"));
+        assert!(out_buddy.gcode.contains("M118 Z=3"));
+        let (rep, _) = evaluate_gcode(
+            &out_buddy.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert_eq!(rep.z_event_commands_count, 3);
+
+        cfg.machine.flavor = GcodeFlavor::Klipper;
+        let out_klipper = emit_gcode(&plate, &cfg).unwrap();
+        assert!(out_klipper.gcode.contains("\nPAUSE\n"));
+    }
+
+    #[test]
+    fn sequential_by_object_gcode_clears_height_and_passes_safety() {
+        use layercraft_config::ModifierOverrides;
+        use layercraft_slice::{PlateSliceObject, slice_plate_objects};
+
+        let mut p1 = make_box(16.0, 16.0, 4.0);
+        let mut p2 = make_box(16.0, 16.0, 6.0);
+        p1.translate(50.0, 117.0, 0.0).unwrap();
+        p2.translate(180.0, 117.0, 0.0).unwrap();
+
+        let ov = ModifierOverrides::default();
+        let objs = [
+            PlateSliceObject {
+                id: 1,
+                name: "Short",
+                prepared_mesh: &p1,
+                overrides: &ov,
+            },
+            PlateSliceObject {
+                id: 2,
+                name: "Tall",
+                prepared_mesh: &p2,
+                overrides: &ov,
+            },
+        ];
+
+        let mut cfg = PrintConfig::default();
+        cfg.process.print_sequence = PrintSequence::ByObject;
+        let plate = slice_plate_objects(&objs, &cfg, &[]).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+
+        assert!(out.gcode.contains(";SEQUENTIAL_OBJECT_CHANGE"));
+        let seq_pos = out.gcode.find(";SEQUENTIAL_OBJECT_CHANGE").unwrap();
+        let after_seq = &out.gcode[seq_pos..];
+        let lift_pos = after_seq.find("G0 Z6.000").unwrap();
+        let obj2_drop_pos = after_seq.find("G0 Z0.200").unwrap();
+        assert!(
+            lift_pos < obj2_drop_pos,
+            "expected Z clearance lift before dropping to object 2"
+        );
+
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert_eq!(rep.safety.z_regressions, 0);
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert!(
+            rep.max_z_mm >= 5.9,
+            "expected tallest object max Z, got {}",
+            rep.max_z_mm
         );
     }
 }

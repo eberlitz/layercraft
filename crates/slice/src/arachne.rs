@@ -509,7 +509,8 @@ pub(crate) fn build_perimeters_arachne(
         let core_infill = offset(single, -mm_to_nm(half_infill)?, support_join)?;
         if !core_infill.is_empty() {
             let inner_edge_inset = params.nominal_inner_edge_inset();
-            let infill_overlap = 0.15 * config.process.solid_infill_width_mm;
+            let infill_overlap =
+                config.process.infill_wall_overlap_ratio * config.process.solid_infill_width_mm;
             let expand_mm = (half_infill - inner_edge_inset).max(0.0) + infill_overlap;
             let expanded = offset(&core_infill, mm_to_nm(expand_mm)?, miter2)?;
             let max_infill_inset = (inner_edge_inset - infill_overlap).max(0.0);
@@ -651,6 +652,8 @@ fn emit_polyline_with_widths(
         flow_ratio: 1.0,
         points,
         closed,
+        object_id: None,
+        fan_percent: None,
     });
 }
 
@@ -1067,4 +1070,83 @@ fn polyline_len_mm(pts: &[(f64, f64)], closed: bool) -> f64 {
         }
     }
     total
+}
+
+fn extract_range_runs(edge: &MedialEdge, min_w: f64, max_w: f64) -> Vec<WidthPiece> {
+    let mut pieces = Vec::new();
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let mut ws: Vec<f64> = Vec::new();
+
+    for pair in edge.samples.windows(2) {
+        let (Some(sa), Some(sb)) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        let wa = 2.0 * sa.radius_mm;
+        let wb = 2.0 * sb.radius_mm;
+        let mid_w = 0.5 * (wa + wb);
+        if mid_w >= min_w && mid_w <= max_w {
+            let (ax, ay) = sa.point.to_mm();
+            let (bx, by) = sb.point.to_mm();
+            let w_a = wa.clamp(min_w, max_w);
+            let w_b = wb.clamp(min_w, max_w);
+            if pts.is_empty() {
+                pts.push((ax, ay));
+                ws.push(w_a);
+            }
+            pts.push((bx, by));
+            ws.push(w_b);
+        } else if pts.len() >= 2 {
+            pieces.push((std::mem::take(&mut pts), std::mem::take(&mut ws)));
+        } else {
+            pts.clear();
+            ws.clear();
+        }
+    }
+    if pts.len() >= 2 {
+        pieces.push((pts, ws));
+    }
+    pieces
+}
+
+/// Generate medial-axis variable-width gap fill paths across narrow residual channels.
+pub(crate) fn extract_gap_fill_paths(
+    gap_regions: &[ExPolygon],
+    min_width_mm: f64,
+    max_width_mm: f64,
+    layer_height_mm: f64,
+    speed_mm_s: f64,
+) -> Result<Vec<ExtrusionPath>, SliceError> {
+    if gap_regions.is_empty() || max_width_mm <= min_width_mm {
+        return Ok(Vec::new());
+    }
+    let mut pieces = Vec::new();
+    for region in gap_regions {
+        let Ok(axis) = medial_axis(region) else {
+            continue;
+        };
+        for edge in &axis.edges {
+            pieces.extend(extract_range_runs(edge, min_width_mm, max_width_mm));
+        }
+    }
+    if pieces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let min_piece_len = (0.5 * min_width_mm).max(0.05);
+    let stitched = stitch_open_chains(pieces, CHAIN_STITCH_TOL_MM);
+    let mut out = Vec::new();
+    for (pts, widths, closed) in stitched {
+        if pts.len() < 2 || (!closed && polyline_len_mm(&pts, false) < min_piece_len) {
+            continue;
+        }
+        emit_polyline_with_widths(
+            &pts,
+            &widths,
+            closed,
+            ExtrusionRole::GapFill,
+            layer_height_mm,
+            speed_mm_s,
+            &mut out,
+        );
+    }
+    Ok(out)
 }

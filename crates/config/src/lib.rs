@@ -207,6 +207,8 @@ pub struct MachineConfig {
     pub start_gcode: Option<String>,
     pub end_gcode: Option<String>,
     pub layer_change_gcode: Option<String>,
+    /// Emit object boundary & definition markers (`EXCLUDE_OBJECT_*` / `M486`) when slicing objects.
+    pub label_objects: bool,
 }
 
 impl Default for MachineConfig {
@@ -234,6 +236,7 @@ impl Default for MachineConfig {
             start_gcode: None,
             end_gcode: None,
             layer_change_gcode: None,
+            label_objects: true,
         }
     }
 }
@@ -428,11 +431,18 @@ pub enum ModifierRole {
     SupportBlocker,
     /// Force support generation for overhangs intersecting the volume.
     SupportEnforcer,
+    /// Subtract boolean volume from positive parts before slicing.
+    NegativePart,
 }
 
 impl ModifierRole {
     /// All supported modifier volume roles.
-    pub const ALL: [Self; 3] = [Self::Modifier, Self::SupportBlocker, Self::SupportEnforcer];
+    pub const ALL: [Self; 4] = [
+        Self::Modifier,
+        Self::SupportBlocker,
+        Self::SupportEnforcer,
+        Self::NegativePart,
+    ];
 
     /// Human-readable display label.
     pub fn label(self) -> &'static str {
@@ -440,6 +450,74 @@ impl ModifierRole {
             Self::Modifier => "Modifier",
             Self::SupportBlocker => "Support blocker",
             Self::SupportEnforcer => "Support enforcer",
+            Self::NegativePart => "Negative part",
+        }
+    }
+}
+
+/// Plate print ordering strategy when multiple objects exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintSequence {
+    #[default]
+    ByLayer,
+    ByObject,
+}
+
+impl PrintSequence {
+    /// All supported build-plate print sequences.
+    pub const ALL: [Self; 2] = [Self::ByLayer, Self::ByObject];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByLayer => "By layer",
+            Self::ByObject => "By object",
+        }
+    }
+}
+
+/// Mid-print action triggered when reaching a configured Z height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ZEventAction {
+    #[default]
+    Pause,
+    FilamentChange,
+    CustomGcode,
+}
+
+impl ZEventAction {
+    /// All supported per-Z event actions.
+    pub const ALL: [Self; 3] = [Self::Pause, Self::FilamentChange, Self::CustomGcode];
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pause => "Pause",
+            Self::FilamentChange => "Filament Change (M600)",
+            Self::CustomGcode => "Custom G-code",
+        }
+    }
+}
+
+/// User-scheduled mid-print action emitted at `z_mm`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct LayerZEvent {
+    pub z_mm: f64,
+    pub action: ZEventAction,
+    pub message: Option<String>,
+    pub custom_gcode: Option<String>,
+}
+
+impl Default for LayerZEvent {
+    fn default() -> Self {
+        Self {
+            z_mm: 5.0,
+            action: ZEventAction::Pause,
+            message: None,
+            custom_gcode: None,
         }
     }
 }
@@ -651,6 +729,17 @@ pub struct ProcessConfig {
     pub support: SupportConfig,
     pub skirt_loops: u16,
     pub brim_width_mm: f64,
+    pub print_sequence: PrintSequence,
+    pub extruder_clearance_radius_mm: f64,
+    pub extruder_clearance_height_mm: f64,
+    pub infill_wall_overlap_ratio: f64,
+    pub gap_fill_enabled: bool,
+    pub gap_fill_speed_mm_s: Option<f64>,
+    pub gap_fill_min_width_mm: f64,
+    pub overhang_1_4_speed_mm_s: Option<f64>,
+    pub overhang_2_4_speed_mm_s: Option<f64>,
+    pub overhang_4_4_speed_mm_s: Option<f64>,
+    pub z_events: Vec<LayerZEvent>,
 }
 
 /// Top-surface ironing scope.
@@ -880,6 +969,17 @@ impl Default for ProcessConfig {
             support: SupportConfig::default(),
             skirt_loops: 0,
             brim_width_mm: 0.0,
+            print_sequence: PrintSequence::ByLayer,
+            extruder_clearance_radius_mm: 35.0,
+            extruder_clearance_height_mm: 25.0,
+            infill_wall_overlap_ratio: 0.15,
+            gap_fill_enabled: false,
+            gap_fill_speed_mm_s: None,
+            gap_fill_min_width_mm: 0.15,
+            overhang_1_4_speed_mm_s: None,
+            overhang_2_4_speed_mm_s: None,
+            overhang_4_4_speed_mm_s: None,
+            z_events: Vec::new(),
         }
     }
 }
@@ -1563,6 +1663,84 @@ impl PrintConfig {
             }
             hr.overrides.validate()?;
         }
+
+        if !self.process.extruder_clearance_radius_mm.is_finite()
+            || !(0.0..=200.0).contains(&self.process.extruder_clearance_radius_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.extruder_clearance_radius_mm",
+                reason: "must be within 0.0..=200.0",
+            });
+        }
+        if !self.process.extruder_clearance_height_mm.is_finite()
+            || !(0.0..=500.0).contains(&self.process.extruder_clearance_height_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.extruder_clearance_height_mm",
+                reason: "must be within 0.0..=500.0",
+            });
+        }
+        if !self.process.infill_wall_overlap_ratio.is_finite()
+            || !(0.0..=0.50).contains(&self.process.infill_wall_overlap_ratio)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.infill_wall_overlap_ratio",
+                reason: "must be within 0.0..=0.50",
+            });
+        }
+        if !self.process.gap_fill_min_width_mm.is_finite()
+            || !(0.05..=2.0).contains(&self.process.gap_fill_min_width_mm)
+        {
+            return Err(ConfigError::Invalid {
+                field: "process.gap_fill_min_width_mm",
+                reason: "must be within 0.05..=2.0",
+            });
+        }
+        for (field, opt_spd) in [
+            (
+                "process.gap_fill_speed_mm_s",
+                self.process.gap_fill_speed_mm_s,
+            ),
+            (
+                "process.overhang_1_4_speed_mm_s",
+                self.process.overhang_1_4_speed_mm_s,
+            ),
+            (
+                "process.overhang_2_4_speed_mm_s",
+                self.process.overhang_2_4_speed_mm_s,
+            ),
+            (
+                "process.overhang_4_4_speed_mm_s",
+                self.process.overhang_4_4_speed_mm_s,
+            ),
+        ] {
+            if let Some(s) = opt_spd {
+                check_pos(field, s)?;
+            }
+        }
+        for ev in &self.process.z_events {
+            check_pos("process.z_events.z_mm", ev.z_mm)?;
+            if ev.action == ZEventAction::CustomGcode
+                && ev
+                    .custom_gcode
+                    .as_deref()
+                    .is_none_or(|g| g.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid {
+                    field: "process.z_events.custom_gcode",
+                    reason: "custom_gcode action requires non-empty G-code",
+                });
+            }
+            if let Some(msg) = &ev.message
+                && (msg.contains('\n') || msg.contains('\r'))
+            {
+                return Err(ConfigError::Invalid {
+                    field: "process.z_events.message",
+                    reason: "must be a single line without newlines",
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -1885,5 +2063,53 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn phase6b_config_validation_and_defaults() {
+        let mut cfg = PrintConfig::default();
+        assert!(cfg.machine.label_objects);
+        assert_eq!(cfg.process.print_sequence, PrintSequence::ByLayer);
+        assert!(!cfg.process.gap_fill_enabled);
+        assert_eq!(ModifierRole::ALL.len(), 4);
+        assert_eq!(ModifierRole::NegativePart.label(), "Negative part");
+
+        cfg.process.infill_wall_overlap_ratio = 0.25;
+        cfg.process.gap_fill_enabled = true;
+        cfg.process.gap_fill_speed_mm_s = Some(50.0);
+        cfg.process.overhang_1_4_speed_mm_s = Some(60.0);
+        cfg.process.overhang_2_4_speed_mm_s = Some(40.0);
+        cfg.process.overhang_4_4_speed_mm_s = Some(15.0);
+        cfg.process.z_events = vec![
+            LayerZEvent {
+                z_mm: 4.2,
+                action: ZEventAction::Pause,
+                message: Some("Insert nut".to_owned()),
+                custom_gcode: None,
+            },
+            LayerZEvent {
+                z_mm: 8.0,
+                action: ZEventAction::CustomGcode,
+                message: None,
+                custom_gcode: Some("M117 Custom".to_owned()),
+            },
+        ];
+        assert!(cfg.validate().is_ok());
+
+        let mut bad = cfg.clone();
+        bad.process.infill_wall_overlap_ratio = 0.75;
+        assert!(bad.validate().is_err());
+
+        let mut bad_z = cfg.clone();
+        bad_z.process.z_events[0].z_mm = 0.0;
+        assert!(bad_z.validate().is_err());
+
+        let mut bad_msg = cfg.clone();
+        bad_msg.process.z_events[0].message = Some("line1\nline2".to_owned());
+        assert!(bad_msg.validate().is_err());
+
+        let mut bad_custom = cfg;
+        bad_custom.process.z_events[1].custom_gcode = Some("   ".to_owned());
+        assert!(bad_custom.validate().is_err());
     }
 }

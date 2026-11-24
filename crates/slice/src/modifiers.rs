@@ -112,6 +112,7 @@ pub(crate) struct SlicedModifiers {
     pub param_mods: Vec<ParamModifierSlices>,
     pub blocker_masks: Vec<Vec<ExPolygon>>,
     pub enforcer_masks: Vec<Vec<ExPolygon>>,
+    pub negative_masks: Vec<Vec<ExPolygon>>,
 }
 
 impl SlicedModifiers {
@@ -143,6 +144,7 @@ pub(crate) fn slice_modifier_volumes(
     let mut param_mods = Vec::new();
     let mut blocker_raw: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
     let mut enforcer_raw: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
+    let mut negative_raw: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
 
     for m in modifiers {
         let sliced = slice_mesh_at_z_planes(&m.mesh, &z_planes)?;
@@ -169,6 +171,13 @@ pub(crate) fn slice_modifier_volumes(
                     }
                 }
             }
+            ModifierRole::NegativePart => {
+                for (dst, src) in negative_raw.iter_mut().zip(sliced) {
+                    if !src.is_empty() {
+                        dst.extend(src);
+                    }
+                }
+            }
         }
     }
 
@@ -182,11 +191,17 @@ pub(crate) fn slice_modifier_volumes(
             *slot = union(slot)?;
         }
     }
+    for slot in &mut negative_raw {
+        if slot.len() > 1 {
+            *slot = union(slot)?;
+        }
+    }
 
     Ok(SlicedModifiers {
         param_mods,
         blocker_masks: blocker_raw,
         enforcer_masks: enforcer_raw,
+        negative_masks: negative_raw,
     })
 }
 

@@ -590,6 +590,19 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
             ModifierRole::SupportEnforcer,
         );
     }
+    if ribbon_button(ui, p, Icon::BoxShape, "+ Cutout", false)
+        .on_hover_text("Add negative part cutout box")
+        .clicked()
+    {
+        app.add_modifier_primitive(
+            ModifierPrimitive::Box {
+                width_mm: 12.0,
+                depth_mm: 12.0,
+                height_mm: 10.0,
+            },
+            ModifierRole::NegativePart,
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     {

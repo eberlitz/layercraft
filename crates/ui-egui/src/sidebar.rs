@@ -2,9 +2,9 @@
 
 use egui::{Align, CornerRadius, Margin, RichText, Stroke, StrokeKind, pos2, vec2};
 use layercraft_config::{
-    GcodeFlavor, HeightRangeModifier, InfillPattern, IroningType, ModifierOverrides, ModifierRole,
-    ProfileKind, SeamPosition, SupportStyle, SurfacePattern, ThumbnailSize, WallGenerator,
-    WallOrder,
+    GcodeFlavor, HeightRangeModifier, InfillPattern, IroningType, LayerZEvent, ModifierOverrides,
+    ModifierRole, PrintSequence, ProfileKind, SeamPosition, SupportStyle, SurfacePattern,
+    ThumbnailSize, WallGenerator, WallOrder, ZEventAction,
 };
 use layercraft_engine::{PrinterAuth, PrinterProtocol};
 use layercraft_mesh::{ModifierPrimitive, ModifierTransform};
@@ -506,11 +506,22 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         app.select_plate(idx);
     }
 
-    let entries: Vec<(u64, String, layercraft_mesh::ObjectTransform)> = app
+    struct ObjectOutlinerItem {
+        id: u64,
+        name: String,
+        transform: layercraft_mesh::ObjectTransform,
+        overrides: ModifierOverrides,
+    }
+    let entries: Vec<ObjectOutlinerItem> = app
         .session
         .objects
         .iter()
-        .map(|o| (o.id, o.name.clone(), o.transform))
+        .map(|o| ObjectOutlinerItem {
+            id: o.id,
+            name: o.name.clone(),
+            transform: o.transform,
+            overrides: o.overrides.clone(),
+        })
         .collect();
     let mods_snapshot: Vec<(
         u64,
@@ -541,6 +552,10 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
             rot: [f64; 3],
             scale: [f64; 3],
         },
+        SetObjectOverrides {
+            id: u64,
+            overrides: ModifierOverrides,
+        },
         AddModifier(ModifierPrimitive, ModifierRole),
         RemoveModifier(u64),
         UpdateModifier {
@@ -569,14 +584,15 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     .color(p.text_muted),
             );
         } else {
-            for (id, name, _) in &entries {
-                let selected = app.selected_object_id == Some(*id);
+            for item in &entries {
+                let id = item.id;
+                let selected = app.selected_object_id == Some(id);
                 let is_oob = app
                     .session
                     .plate_layout
                     .out_of_bounds_object_ids
-                    .contains(id);
-                let is_overlap = app.session.plate_layout.colliding_object_ids.contains(id);
+                    .contains(&id);
+                let is_overlap = app.session.plate_layout.colliding_object_ids.contains(&id);
                 ui.horizontal(|ui| {
                     let dot_r = ui
                         .allocate_exact_size(vec2(10.0, 16.0), egui::Sense::hover())
@@ -592,22 +608,25 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     };
                     ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
                     if ui
-                        .selectable_label(selected, format!("#{id} {name}"))
+                        .selectable_label(selected, format!("#{id} {}", item.name))
                         .clicked()
                     {
-                        app.selected_object_id = Some(*id);
+                        app.selected_object_id = Some(id);
                         app.selected_modifier_id = None;
                         app.rebuild_scene();
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if small_icon_button(ui, p, Icon::Trash, "Remove object").clicked() {
-                            action = Some(PlateAction::RemoveObject(*id));
+                            action = Some(PlateAction::RemoveObject(id));
                         }
                         if is_overlap {
                             badge(ui, p.bg_panel, p.warning, "Overlap");
                         }
                         if is_oob {
                             badge(ui, p.bg_panel, p.danger, "OOB");
+                        }
+                        if !item.overrides.is_empty() {
+                            badge(ui, p.bg_panel, p.accent, "Custom");
                         }
                     });
                 });
@@ -649,6 +668,16 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     .color(p.text_secondary),
             );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("+ Cutout").clicked() {
+                    action = Some(PlateAction::AddModifier(
+                        ModifierPrimitive::Box {
+                            width_mm: 12.0,
+                            depth_mm: 12.0,
+                            height_mm: 10.0,
+                        },
+                        ModifierRole::NegativePart,
+                    ));
+                }
                 if ui.small_button("+ Cyl").clicked() {
                     action = Some(PlateAction::AddModifier(
                         ModifierPrimitive::Cylinder {
@@ -685,6 +714,7 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     ModifierRole::Modifier => p.warning,
                     ModifierRole::SupportBlocker => p.danger,
                     ModifierRole::SupportEnforcer => p.success,
+                    ModifierRole::NegativePart => egui::Color32::from_rgb(217, 56, 184),
                 };
                 ui.horizontal(|ui| {
                     let dot_r = ui
@@ -709,21 +739,21 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         }
     });
 
-    // 2. Selected Object Transform Inspector
+    // 2. Selected Object Transform & Overrides Inspector
     if let Some(sel_id) = app.selected_object_id
-        && let Some((_, name, xf)) = entries.iter().find(|(id, _, _)| *id == sel_id)
+        && let Some(item) = entries.iter().find(|item| item.id == sel_id)
     {
         ui.add_space(6.0);
-        let title = format!("Transform — #{sel_id} {name}");
+        let title = format!("Transform — #{sel_id} {}", item.name);
         card(ui, p, Some(&title), |ui| {
-            let mut pos = xf.position_xy_mm;
-            let mut rot = xf.rotation_deg;
-            let [mut uni_scale, _, _] = xf.scale;
-            let mut changed = false;
+            let mut pos = item.transform.position_xy_mm;
+            let mut rot = item.transform.rotation_deg;
+            let [mut uni_scale, _, _] = item.transform.scale;
+            let mut xf_changed = false;
             let bw = app.session.config.machine.bed_width_mm;
             let bd = app.session.config.machine.bed_depth_mm;
 
-            changed |= xy_row(
+            xf_changed |= xy_row(
                 ui,
                 p,
                 "Position (mm)",
@@ -733,18 +763,37 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                 "",
             );
             ui.add_space(4.0);
-            changed |= xyz_row(ui, p, "Rotation (°)", &mut rot, -180.0..=180.0, 1.0, "°");
+            xf_changed |= xyz_row(ui, p, "Rotation (°)", &mut rot, -180.0..=180.0, 1.0, "°");
             ui.add_space(4.0);
             setting_row(ui, p, "Uniform scale", |ui| {
-                changed |= unit_drag(ui, &mut uni_scale, 0.1..=5.0, 0.02, "×").changed();
+                xf_changed |= unit_drag(ui, &mut uni_scale, 0.1..=5.0, 0.02, "×").changed();
             });
 
-            if changed && action.is_none() {
+            if xf_changed && action.is_none() {
                 action = Some(PlateAction::TransformObject {
                     id: sel_id,
                     pos,
                     rot,
                     scale: [uni_scale, uni_scale, uni_scale],
+                });
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("PER-OBJECT OVERRIDES")
+                    .size(10.0)
+                    .strong()
+                    .color(p.text_muted),
+            );
+            let mut ov = item.overrides.clone();
+            let mut ov_changed = false;
+            draw_overrides_editor(ui, p, &mut ov, "obj", &mut ov_changed);
+            if ov_changed && action.is_none() {
+                action = Some(PlateAction::SetObjectOverrides {
+                    id: sel_id,
+                    overrides: ov,
                 });
             }
         });
@@ -804,79 +853,7 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                         .strong()
                         .color(p.text_muted),
                 );
-
-                let mut has_dens = ov.sparse_infill_density.is_some();
-                setting_row(ui, p, "Override infill %", |ui| {
-                    if let Some(d) = &mut ov.sparse_infill_density {
-                        let mut pct = *d * 100.0;
-                        if unit_drag(ui, &mut pct, 0.0..=100.0, 1.0, "%").changed() {
-                            *d = (pct / 100.0).clamp(0.0, 1.0);
-                            changed = true;
-                        }
-                    }
-                    if toggle_switch(ui, p, &mut has_dens).changed() {
-                        ov.sparse_infill_density = if has_dens { Some(0.50) } else { None };
-                        changed = true;
-                    }
-                });
-
-                let mut has_pat = ov.sparse_infill_pattern.is_some();
-                setting_row(ui, p, "Override pattern", |ui| {
-                    if let Some(pat) = &mut ov.sparse_infill_pattern {
-                        egui::ComboBox::from_id_salt("mod_pat_combo")
-                            .width(100.0)
-                            .selected_text(pat.label())
-                            .show_ui(ui, |ui| {
-                                for candidate in InfillPattern::ALL {
-                                    changed |= ui
-                                        .selectable_value(pat, candidate, candidate.label())
-                                        .changed();
-                                }
-                            });
-                    }
-                    if toggle_switch(ui, p, &mut has_pat).changed() {
-                        ov.sparse_infill_pattern = if has_pat {
-                            Some(InfillPattern::Gyroid)
-                        } else {
-                            None
-                        };
-                        changed = true;
-                    }
-                });
-
-                let mut has_walls = ov.wall_loops.is_some();
-                setting_row(ui, p, "Override walls", |ui| {
-                    if let Some(w) = &mut ov.wall_loops {
-                        changed |= unit_drag(ui, w, 0..=20, 0.25, "").changed();
-                    }
-                    if toggle_switch(ui, p, &mut has_walls).changed() {
-                        ov.wall_loops = if has_walls { Some(4) } else { None };
-                        changed = true;
-                    }
-                });
-
-                let mut has_iron = ov.ironing_mode.is_some();
-                setting_row(ui, p, "Override ironing", |ui| {
-                    if let Some(im) = &mut ov.ironing_mode {
-                        egui::ComboBox::from_id_salt("mod_iron_combo")
-                            .width(110.0)
-                            .selected_text(im.label())
-                            .show_ui(ui, |ui| {
-                                for mode in IroningType::ALL {
-                                    changed |=
-                                        ui.selectable_value(im, mode, mode.label()).changed();
-                                }
-                            });
-                    }
-                    if toggle_switch(ui, p, &mut has_iron).changed() {
-                        ov.ironing_mode = if has_iron {
-                            Some(IroningType::TopmostSurface)
-                        } else {
-                            None
-                        };
-                        changed = true;
-                    }
-                });
+                draw_overrides_editor(ui, p, &mut ov, "mod", &mut changed);
             }
 
             if changed && action.is_none() {
@@ -900,6 +877,9 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
             rot,
             scale,
         }) => app.transform_object(id, pos, rot, scale),
+        Some(PlateAction::SetObjectOverrides { id, overrides }) => {
+            app.set_object_overrides(id, overrides);
+        }
         Some(PlateAction::AddModifier(prim, role)) => app.add_modifier_primitive(prim, role),
         Some(PlateAction::RemoveModifier(id)) => app.remove_modifier(id),
         Some(PlateAction::UpdateModifier {
@@ -913,7 +893,42 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         None => {}
     }
 
-    // 4. Height Ranges Card
+    // 4. Print Sequence Card
+    ui.add_space(6.0);
+    card(ui, p, Some("Print Sequence"), |ui| {
+        let proc_cfg = &mut app.session.config.process;
+        setting_row(ui, p, "Print sequence", |ui| {
+            egui::ComboBox::from_id_salt("print_sequence_combo")
+                .selected_text(proc_cfg.print_sequence.label())
+                .show_ui(ui, |ui| {
+                    for seq in PrintSequence::ALL {
+                        ui.selectable_value(&mut proc_cfg.print_sequence, seq, seq.label());
+                    }
+                });
+        });
+        if proc_cfg.print_sequence == PrintSequence::ByObject {
+            setting_row(ui, p, "Clearance radius", |ui| {
+                unit_drag(
+                    ui,
+                    &mut proc_cfg.extruder_clearance_radius_mm,
+                    5.0..=150.0,
+                    0.5,
+                    "mm",
+                );
+            });
+            setting_row(ui, p, "Clearance height", |ui| {
+                unit_drag(
+                    ui,
+                    &mut proc_cfg.extruder_clearance_height_mm,
+                    1.0..=250.0,
+                    0.5,
+                    "mm",
+                );
+            });
+        }
+    });
+
+    // 5. Height Ranges Card
     ui.add_space(6.0);
     card(ui, p, Some("Height Range Bands"), |ui| {
         let max_nozzle_h = (app.session.config.machine.nozzle_diameter_mm * 1.25).max(0.04);
@@ -992,6 +1007,99 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
             && ri < proc_cfg.height_ranges.len()
         {
             proc_cfg.height_ranges.remove(ri);
+        }
+    });
+
+    // 6. Pause / Color Change / Custom Z Events Card
+    ui.add_space(6.0);
+    card(ui, p, Some("Pause / Color Change (Z Events)"), |ui| {
+        let max_bed_z = app.session.config.machine.bed_height_mm;
+        let proc_cfg = &mut app.session.config.process;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Insert M601/PAUSE, M600, or custom G-code at Z")
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("+ Add Z Event").clicked() {
+                    let next_z = proc_cfg
+                        .z_events
+                        .last()
+                        .map(|e| e.z_mm + 5.0)
+                        .unwrap_or(5.0)
+                        .min(max_bed_z);
+                    proc_cfg.z_events.push(LayerZEvent {
+                        z_mm: next_z,
+                        action: ZEventAction::Pause,
+                        message: None,
+                        custom_gcode: None,
+                    });
+                }
+            });
+        });
+
+        let mut rm_ev_idx: Option<usize> = None;
+        for (ei, ev) in proc_cfg.z_events.iter_mut().enumerate() {
+            ui.push_id(("z_ev", ei), |ui| {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label("Z:");
+                    ui.add(
+                        egui::DragValue::new(&mut ev.z_mm)
+                            .speed(0.2)
+                            .range(0.05..=max_bed_z)
+                            .suffix(" mm"),
+                    );
+                    egui::ComboBox::from_id_salt(("z_ev_action", ei))
+                        .width(120.0)
+                        .selected_text(ev.action.label())
+                        .show_ui(ui, |ui| {
+                            for act in ZEventAction::ALL {
+                                ui.selectable_value(&mut ev.action, act, act.label());
+                            }
+                        });
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if small_icon_button(ui, p, Icon::Trash, "Remove Z event").clicked() {
+                            rm_ev_idx = Some(ei);
+                        }
+                    });
+                });
+                if ev.action == ZEventAction::CustomGcode {
+                    let mut buf = ev.custom_gcode.clone().unwrap_or_default();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut buf)
+                            .hint_text("e.g. M118 Z={layer_z}")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        ev.custom_gcode = if buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(buf)
+                        };
+                    }
+                } else {
+                    let mut msg_buf = ev.message.clone().unwrap_or_default();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut msg_buf)
+                            .hint_text("Optional M117 display message")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        ev.message = if msg_buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(msg_buf)
+                        };
+                    }
+                }
+            });
+        }
+        if let Some(ei) = rm_ev_idx
+            && ei < proc_cfg.z_events.len()
+        {
+            proc_cfg.z_events.remove(ei);
         }
     });
 
@@ -1437,6 +1545,108 @@ fn draw_quality_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
     });
 }
 
+fn draw_overrides_editor(
+    ui: &mut egui::Ui,
+    p: &ThemePalette,
+    ov: &mut ModifierOverrides,
+    id_prefix: &str,
+    changed: &mut bool,
+) {
+    let mut has_dens = ov.sparse_infill_density.is_some();
+    setting_row(ui, p, "Override infill %", |ui| {
+        if let Some(d) = &mut ov.sparse_infill_density {
+            let mut pct = *d * 100.0;
+            if unit_drag(ui, &mut pct, 0.0..=100.0, 1.0, "%").changed() {
+                *d = (pct / 100.0).clamp(0.0, 1.0);
+                *changed = true;
+            }
+        }
+        if toggle_switch(ui, p, &mut has_dens).changed() {
+            ov.sparse_infill_density = if has_dens { Some(0.50) } else { None };
+            *changed = true;
+        }
+    });
+
+    let mut has_pat = ov.sparse_infill_pattern.is_some();
+    setting_row(ui, p, "Override pattern", |ui| {
+        if let Some(pat) = &mut ov.sparse_infill_pattern {
+            egui::ComboBox::from_id_salt((id_prefix, "pat_combo"))
+                .width(100.0)
+                .selected_text(pat.label())
+                .show_ui(ui, |ui| {
+                    for candidate in InfillPattern::ALL {
+                        *changed |= ui
+                            .selectable_value(pat, candidate, candidate.label())
+                            .changed();
+                    }
+                });
+        }
+        if toggle_switch(ui, p, &mut has_pat).changed() {
+            ov.sparse_infill_pattern = if has_pat {
+                Some(InfillPattern::Gyroid)
+            } else {
+                None
+            };
+            *changed = true;
+        }
+    });
+
+    let mut has_walls = ov.wall_loops.is_some();
+    setting_row(ui, p, "Override walls", |ui| {
+        if let Some(w) = &mut ov.wall_loops {
+            *changed |= unit_drag(ui, w, 0..=20, 0.25, "").changed();
+        }
+        if toggle_switch(ui, p, &mut has_walls).changed() {
+            ov.wall_loops = if has_walls { Some(4) } else { None };
+            *changed = true;
+        }
+    });
+
+    let mut has_top = ov.top_shell_layers.is_some();
+    setting_row(ui, p, "Override top shells", |ui| {
+        if let Some(t) = &mut ov.top_shell_layers {
+            *changed |= unit_drag(ui, t, 0..=20, 0.25, "").changed();
+        }
+        if toggle_switch(ui, p, &mut has_top).changed() {
+            ov.top_shell_layers = if has_top { Some(5) } else { None };
+            *changed = true;
+        }
+    });
+
+    let mut has_bot = ov.bottom_shell_layers.is_some();
+    setting_row(ui, p, "Override bottom shells", |ui| {
+        if let Some(b) = &mut ov.bottom_shell_layers {
+            *changed |= unit_drag(ui, b, 0..=20, 0.25, "").changed();
+        }
+        if toggle_switch(ui, p, &mut has_bot).changed() {
+            ov.bottom_shell_layers = if has_bot { Some(4) } else { None };
+            *changed = true;
+        }
+    });
+
+    let mut has_iron = ov.ironing_mode.is_some();
+    setting_row(ui, p, "Override ironing", |ui| {
+        if let Some(im) = &mut ov.ironing_mode {
+            egui::ComboBox::from_id_salt((id_prefix, "iron_combo"))
+                .width(110.0)
+                .selected_text(im.label())
+                .show_ui(ui, |ui| {
+                    for mode in IroningType::ALL {
+                        *changed |= ui.selectable_value(im, mode, mode.label()).changed();
+                    }
+                });
+        }
+        if toggle_switch(ui, p, &mut has_iron).changed() {
+            ov.ironing_mode = if has_iron {
+                Some(IroningType::TopmostSurface)
+            } else {
+                None
+            };
+            *changed = true;
+        }
+    });
+}
+
 fn draw_strength_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
     let proc_cfg = &mut app.session.config.process;
 
@@ -1450,6 +1660,30 @@ fn draw_strength_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalett
         setting_row(ui, p, "Bottom shell layers", |ui| {
             unit_drag(ui, &mut proc_cfg.bottom_shell_layers, 0..=20, 0.25, "");
         });
+        setting_row(ui, p, "Gap fill (Classic)", |ui| {
+            toggle_switch(ui, p, &mut proc_cfg.gap_fill_enabled);
+        });
+        if proc_cfg.gap_fill_enabled {
+            let mut gf_speed = proc_cfg.gap_fill_speed_mm_s.unwrap_or(0.0);
+            setting_row(ui, p, "Gap fill speed (0=auto)", |ui| {
+                if unit_drag(ui, &mut gf_speed, 0.0..=300.0, 2.0, "mm/s").changed() {
+                    proc_cfg.gap_fill_speed_mm_s = if gf_speed <= 0.0 {
+                        None
+                    } else {
+                        Some(gf_speed.max(5.0))
+                    };
+                }
+            });
+            setting_row(ui, p, "Min gap width", |ui| {
+                unit_drag(
+                    ui,
+                    &mut proc_cfg.gap_fill_min_width_mm,
+                    0.05..=0.80,
+                    0.01,
+                    "mm",
+                );
+            });
+        }
         setting_row(ui, p, "Monotonic top/bottom", |ui| {
             toggle_switch(ui, p, &mut proc_cfg.monotonic_solid_infill);
         });
@@ -1507,6 +1741,12 @@ fn draw_strength_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalett
                         ui.selectable_value(&mut proc_cfg.sparse_infill_pattern, pat, pat.label());
                     }
                 });
+        });
+        let mut overlap_pct = proc_cfg.infill_wall_overlap_ratio * 100.0;
+        setting_row(ui, p, "Infill–wall overlap", |ui| {
+            if unit_drag(ui, &mut overlap_pct, 0.0..=50.0, 1.0, "%").changed() {
+                proc_cfg.infill_wall_overlap_ratio = (overlap_pct / 100.0).clamp(0.0, 0.5);
+            }
         });
     });
 
@@ -1605,6 +1845,27 @@ fn draw_speed_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                 "mm/s",
             );
         });
+        for (label, slot) in [
+            (
+                "Overhang 10–25% (0=off)",
+                &mut proc_cfg.overhang_1_4_speed_mm_s,
+            ),
+            (
+                "Overhang 25–50% (0=off)",
+                &mut proc_cfg.overhang_2_4_speed_mm_s,
+            ),
+            (
+                "Overhang 75–100% (0=off)",
+                &mut proc_cfg.overhang_4_4_speed_mm_s,
+            ),
+        ] {
+            let mut spd = slot.unwrap_or(0.0);
+            setting_row(ui, p, label, |ui| {
+                if unit_drag(ui, &mut spd, 0.0..=300.0, 2.0, "mm/s").changed() {
+                    *slot = if spd <= 0.0 { None } else { Some(spd.max(5.0)) };
+                }
+            });
+        }
     });
 
     ui.add_space(6.0);
@@ -1862,6 +2123,9 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         });
         setting_row(ui, p, "Binary G-code (.bgcode)", |ui| {
             toggle_switch(ui, p, &mut m.binary_gcode);
+        });
+        setting_row(ui, p, "Label objects (Cancel-Object)", |ui| {
+            toggle_switch(ui, p, &mut m.label_objects);
         });
         let mut thumb_enabled = !m.thumbnails.is_empty();
         setting_row(ui, p, "Embed G-code thumbnails", |ui| {
