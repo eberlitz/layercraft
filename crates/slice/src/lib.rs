@@ -1400,27 +1400,127 @@ fn apply_flow_and_cooling(
     (fan_u8, final_ext_time_s + travel_time_s)
 }
 
+fn is_midair_bridge_segment(bridge_wall_mask: &[ExPolygon], a: Point2, b: Point2) -> bool {
+    let ax = a.x as f64;
+    let ay = a.y as f64;
+    let dx = (b.x as f64) - ax;
+    let dy = (b.y as f64) - ay;
+    for t in [0.25, 0.5, 0.75] {
+        let pt = Point2::new((ax + t * dx).round() as i64, (ay + t * dy).round() as i64);
+        if point_in_region(bridge_wall_mask, pt) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_split_wall_segment(
+    active_role: Option<(ExtrusionRole, f64, f64)>,
+    active_pts: &mut Vec<Point2>,
+    active_widths: &mut Vec<f64>,
+    has_var_w: bool,
+    base_width_mm: f64,
+    height_mm: f64,
+    out: &mut Vec<ExtrusionPath>,
+) {
+    if let Some((prev_role, prev_speed, prev_flow)) = active_role
+        && active_pts.len() >= 2
+    {
+        let pts = std::mem::take(active_pts);
+        let ws = std::mem::take(active_widths);
+        let mean_w = if has_var_w && !ws.is_empty() {
+            ws.iter().sum::<f64>() / (ws.len() as f64)
+        } else {
+            base_width_mm
+        };
+        let pw = if has_var_w && ws.len() == pts.len() {
+            ws
+        } else {
+            Vec::new()
+        };
+        out.push(ExtrusionPath {
+            role: prev_role,
+            width_mm: mean_w,
+            point_widths_mm: pw,
+            height_mm,
+            speed_mm_s: prev_speed,
+            flow_ratio: prev_flow,
+            points: pts,
+            closed: false,
+        });
+    } else {
+        active_pts.clear();
+        active_widths.clear();
+    }
+}
+
+struct SplitWallPiece {
+    t: f64,
+    role: ExtrusionRole,
+    speed: f64,
+    flow: f64,
+    p0: Point2,
+    w0: f64,
+    p1: Point2,
+    w1: f64,
+}
+
 fn split_overhang_wall_paths(
     walls: &[ExtrusionPath],
     below: &[ExPolygon],
     layer_height_mm: f64,
     config: &PrintConfig,
 ) -> Result<Vec<ExtrusionPath>, SliceError> {
-    let margin_mm = layer_height_mm * config.process.overhang_threshold_deg.to_radians().tan()
+    let outer_margin_mm = layer_height_mm
+        * config.process.overhang_threshold_deg.to_radians().tan()
         - 0.5 * config.process.outer_wall_width_mm
         + 0.015;
-    let support_mask = if margin_mm.abs() <= 1e-4 {
+    let outer_support_mask = if outer_margin_mm.abs() <= 1e-4 {
         below.to_vec()
     } else {
-        offset(below, mm_to_nm(margin_mm)?, JoinType::Miter { limit: 2.0 })?
+        offset(
+            below,
+            mm_to_nm(outer_margin_mm)?,
+            JoinType::Miter { limit: 2.0 },
+        )?
     };
+    let inner_support_mask = offset(below, mm_to_nm(0.015)?, JoinType::Miter { limit: 2.0 })?;
+    let bridge_margin_mm = 0.5 * config.process.outer_wall_width_mm - 0.015;
+    let bridge_wall_mask = if bridge_margin_mm.abs() <= 1e-4 {
+        below.to_vec()
+    } else {
+        offset(
+            below,
+            mm_to_nm(bridge_margin_mm)?,
+            JoinType::Miter { limit: 2.0 },
+        )?
+    };
+    let bridge_wall_speed = config
+        .process
+        .overhang_speed_mm_s
+        .min(config.process.bridge_speed_mm_s);
+    let bridge_flow = config.process.bridge_flow_ratio;
 
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
-        if path.role != ExtrusionRole::OuterWall || !path.closed || path.points.len() < 3 {
+        if !matches!(
+            path.role,
+            ExtrusionRole::OuterWall | ExtrusionRole::InnerWall
+        ) || !path.closed
+            || path.points.len() < 3
+        {
             out.push(path.clone());
             continue;
         }
+
+        let is_inner = path.role == ExtrusionRole::InnerWall;
+        let support_mask: &[ExPolygon] = if is_inner {
+            &inner_support_mask
+        } else {
+            &outer_support_mask
+        };
+        let supported_role = path.role;
 
         let mut closed_pts = Vec::with_capacity(path.points.len() + 1);
         closed_pts.extend_from_slice(&path.points);
@@ -1428,7 +1528,7 @@ fn split_overhang_wall_paths(
             closed_pts.push(first);
         }
 
-        let unsupported = clip_polylines_difference(&[closed_pts], &support_mask)?;
+        let unsupported = clip_polylines_difference(&[closed_pts], support_mask)?;
         if unsupported.is_empty() {
             out.push(path.clone());
             continue;
@@ -1436,7 +1536,7 @@ fn split_overhang_wall_paths(
 
         let n = path.points.len();
         let has_var_w = path.has_variable_width();
-        let mut active_role: Option<(ExtrusionRole, f64)> = None;
+        let mut active_role: Option<(ExtrusionRole, f64, f64)> = None;
         let mut active_pts: Vec<Point2> = Vec::new();
         let mut active_widths: Vec<f64> = Vec::new();
 
@@ -1459,19 +1559,11 @@ fn split_overhang_wall_paths(
                 continue;
             }
 
-            let supported_segs = clip_polylines(std::slice::from_ref(&edge), &support_mask)?;
-            let overhang_segs = clip_polylines_difference(&[edge], &support_mask)?;
+            let supported_segs = clip_polylines(std::slice::from_ref(&edge), support_mask)?;
+            let overhang_segs = clip_polylines_difference(&[edge], support_mask)?;
 
-            let mut edge_pieces: Vec<(f64, ExtrusionRole, f64, Point2, f64, Point2, f64)> =
-                Vec::new();
-            for (segs, role, speed) in [
-                (supported_segs, ExtrusionRole::OuterWall, path.speed_mm_s),
-                (
-                    overhang_segs,
-                    ExtrusionRole::OverhangWall,
-                    config.process.overhang_speed_mm_s,
-                ),
-            ] {
+            let mut edge_pieces: Vec<SplitWallPiece> = Vec::new();
+            for (segs, is_overhang) in [(supported_segs, false), (overhang_segs, true)] {
                 for seg in segs {
                     let (Some(&sp0), Some(&sp1)) = (seg.first(), seg.last()) else {
                         continue;
@@ -1479,6 +1571,17 @@ fn split_overhang_wall_paths(
                     if sp0.distance_mm(sp1) <= 1e-6 {
                         continue;
                     }
+                    let (role, speed, flow) = if !is_overhang {
+                        (supported_role, path.speed_mm_s, path.flow_ratio)
+                    } else if is_inner || is_midair_bridge_segment(&bridge_wall_mask, sp0, sp1) {
+                        (ExtrusionRole::OverhangWall, bridge_wall_speed, bridge_flow)
+                    } else {
+                        (
+                            ExtrusionRole::OverhangWall,
+                            config.process.overhang_speed_mm_s,
+                            path.flow_ratio,
+                        )
+                    };
                     let (p0x, p0y) = sp0.to_mm();
                     let (p1x, p1y) = sp1.to_mm();
                     let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
@@ -1490,86 +1593,64 @@ fn split_overhang_wall_paths(
                     } else {
                         (t0, sp0, w0, sp1, w1)
                     };
-                    edge_pieces.push((ta, role, speed, pa, w_pa, pb, w_pb));
+                    edge_pieces.push(SplitWallPiece {
+                        t: ta,
+                        role,
+                        speed,
+                        flow,
+                        p0: pa,
+                        w0: w_pa,
+                        p1: pb,
+                        w1: w_pb,
+                    });
                 }
             }
-            edge_pieces.sort_by(|x, y| x.0.total_cmp(&y.0));
+            edge_pieces.sort_by(|x, y| x.t.total_cmp(&y.t));
 
-            for (_, role, speed, p0, w0, p1, w1) in edge_pieces {
-                let can_extend = active_role.is_some_and(|(r, _)| r == role)
-                    && active_pts
-                        .last()
-                        .is_some_and(|&lp| lp.distance_mm(p0) <= 1e-3);
+            for piece in edge_pieces {
+                let can_extend = active_role.is_some_and(|(r, s, f)| {
+                    r == piece.role
+                        && (s - piece.speed).abs() <= 1e-6
+                        && (f - piece.flow).abs() <= 1e-6
+                }) && active_pts
+                    .last()
+                    .is_some_and(|&lp| lp.distance_mm(piece.p0) <= 1e-3);
                 if can_extend {
                     if active_pts
                         .last()
-                        .is_none_or(|&lp| lp.distance_mm(p0) > 1e-6)
+                        .is_none_or(|&lp| lp.distance_mm(piece.p0) > 1e-6)
                     {
-                        active_pts.push(p0);
-                        active_widths.push(w0);
+                        active_pts.push(piece.p0);
+                        active_widths.push(piece.w0);
                     }
-                    active_pts.push(p1);
-                    active_widths.push(w1);
+                    active_pts.push(piece.p1);
+                    active_widths.push(piece.w1);
                 } else {
-                    if let Some((prev_role, prev_speed)) = active_role
-                        && active_pts.len() >= 2
-                    {
-                        let pts = std::mem::take(&mut active_pts);
-                        let ws = std::mem::take(&mut active_widths);
-                        let mean_w = if has_var_w && !ws.is_empty() {
-                            ws.iter().sum::<f64>() / (ws.len() as f64)
-                        } else {
-                            path.width_mm
-                        };
-                        let pw = if has_var_w && ws.len() == pts.len() {
-                            ws
-                        } else {
-                            Vec::new()
-                        };
-                        out.push(ExtrusionPath {
-                            role: prev_role,
-                            width_mm: mean_w,
-                            point_widths_mm: pw,
-                            height_mm: path.height_mm,
-                            speed_mm_s: prev_speed,
-                            flow_ratio: 1.0,
-                            points: pts,
-                            closed: false,
-                        });
-                    } else {
-                        active_widths.clear();
-                    }
-                    active_role = Some((role, speed));
-                    active_pts = vec![p0, p1];
-                    active_widths = vec![w0, w1];
+                    flush_split_wall_segment(
+                        active_role,
+                        &mut active_pts,
+                        &mut active_widths,
+                        has_var_w,
+                        path.width_mm,
+                        path.height_mm,
+                        &mut out,
+                    );
+                    active_role = Some((piece.role, piece.speed, piece.flow));
+                    active_pts = vec![piece.p0, piece.p1];
+                    active_widths = vec![piece.w0, piece.w1];
                 }
             }
         }
 
-        if let Some((prev_role, prev_speed)) = active_role
-            && active_pts.len() >= 2
-        {
-            let mean_w = if has_var_w && !active_widths.is_empty() {
-                active_widths.iter().sum::<f64>() / (active_widths.len() as f64)
-            } else {
-                path.width_mm
-            };
-            let pw = if has_var_w && active_widths.len() == active_pts.len() {
-                active_widths
-            } else {
-                Vec::new()
-            };
-            out.push(ExtrusionPath {
-                role: prev_role,
-                width_mm: mean_w,
-                point_widths_mm: pw,
-                height_mm: path.height_mm,
-                speed_mm_s: prev_speed,
-                flow_ratio: 1.0,
-                points: active_pts,
-                closed: false,
-            });
-        }
+        flush_split_wall_segment(
+            active_role,
+            &mut active_pts,
+            &mut active_widths,
+            has_var_w,
+            path.width_mm,
+            path.height_mm,
+            &mut out,
+        );
     }
 
     Ok(out)
@@ -3624,6 +3705,82 @@ mod tests {
             }
         }
         assert!(x_span_len > 0.90 * total_len);
+    }
+
+    #[test]
+    fn bridge_walls_slow_down_both_outer_and_inner_walls_over_air_gap() {
+        let mesh = make_bridge_arch_mesh(6.0, 18.0, 10.0, 6.0, 3.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_loops = 2;
+        cfg.process.outer_wall_speed_mm_s = 120.0;
+        cfg.process.inner_wall_speed_mm_s = 180.0;
+        cfg.process.overhang_speed_mm_s = 30.0;
+        cfg.process.bridge_speed_mm_s = 35.0;
+        cfg.process.bridge_flow_ratio = 0.95;
+        cfg.filament.slow_down_layer_time_s = 0.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let bridge_layer = &plate.layers[30];
+        assert!((bridge_layer.z_top_mm - 6.2).abs() < 1e-4);
+
+        let mut bridge_overhang_paths = 0usize;
+        let mut has_fast_inner_pillar = false;
+        let mut has_fast_outer_pillar = false;
+        for p in &bridge_layer.paths {
+            match p.role {
+                ExtrusionRole::InnerWall | ExtrusionRole::OuterWall => {
+                    if p.role == ExtrusionRole::InnerWall
+                        && (p.speed_mm_s - 180.0).abs() < 1e-6
+                        && (p.flow_ratio - 1.0).abs() < 1e-6
+                    {
+                        has_fast_inner_pillar = true;
+                    }
+                    if p.role == ExtrusionRole::OuterWall
+                        && (p.speed_mm_s - 120.0).abs() < 1e-6
+                        && (p.flow_ratio - 1.0).abs() < 1e-6
+                    {
+                        has_fast_outer_pillar = true;
+                    }
+                    for w in p.points.windows(2) {
+                        let mx = 0.5 * (w[0].to_mm().0 + w[1].to_mm().0);
+                        assert!(
+                            !(120.0..=130.0).contains(&mx) || p.speed_mm_s <= 35.0,
+                            "fast {:?} crossed air gap at x={mx:.2} speed={}",
+                            p.role,
+                            p.speed_mm_s
+                        );
+                    }
+                }
+                ExtrusionRole::OverhangWall => {
+                    let crosses_gap = p.points.windows(2).any(|w| {
+                        let mx = 0.5 * (w[0].to_mm().0 + w[1].to_mm().0);
+                        (120.0..=130.0).contains(&mx)
+                    });
+                    if crosses_gap {
+                        bridge_overhang_paths += 1;
+                        assert!(
+                            p.speed_mm_s <= 30.0 + 1e-6,
+                            "expected slow bridge wall <=30 mm/s, got {}",
+                            p.speed_mm_s
+                        );
+                        assert!(
+                            (p.flow_ratio - 0.95).abs() < 1e-6,
+                            "expected bridge_flow_ratio 0.95, got {}",
+                            p.flow_ratio
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            bridge_overhang_paths >= 4,
+            "expected >=4 slowed OverhangWall spans (2 outer + 2 inner), got {bridge_overhang_paths}"
+        );
+        assert!(
+            has_fast_inner_pillar && has_fast_outer_pillar,
+            "expected supported inner and outer pillar walls to keep full speed"
+        );
     }
 
     #[test]
