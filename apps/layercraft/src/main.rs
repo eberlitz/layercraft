@@ -36,6 +36,12 @@ struct Args {
     /// Optional PNG output path: render headlessly offscreen via wgpu and exit.
     #[arg(long)]
     screenshot: Option<PathBuf>,
+    /// Screenshot viewport width in logical points.
+    #[arg(long, default_value_t = 1360)]
+    width: u32,
+    /// Screenshot viewport height in logical points.
+    #[arg(long, default_value_t = 840)]
+    height: u32,
     /// Custom IPC socket path for Live MCP Studio bridge (overrides LAYERCRAFT_SOCKET).
     #[arg(long)]
     bridge_socket: Option<PathBuf>,
@@ -300,7 +306,9 @@ fn main() -> ExitCode {
 
     if let Some(screenshot_path) = args.screenshot {
         let mut app = build_app(initial_bytes, sample, theme, preview, home);
-        if let Err(e) = render_headless_screenshot(&mut app, &screenshot_path, 1360, 840) {
+        let w = args.width.clamp(320, 3840);
+        let h = args.height.clamp(240, 2160);
+        if let Err(e) = render_headless_screenshot(&mut app, &screenshot_path, w, h) {
             eprintln!("headless screenshot failed: {e}");
             return ExitCode::FAILURE;
         }

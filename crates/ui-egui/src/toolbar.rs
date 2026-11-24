@@ -11,11 +11,12 @@ use crate::{LayerCraftApp, PendingDiscardAction, ViewMode};
 
 /// Top 44px application header bar.
 pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    let h_margin: i8 = if ui.available_width() < 540.0 { 8 } else { 14 };
     let resp = egui::Panel::top("layercraft_header")
         .frame(
             egui::Frame::NONE
                 .fill(p.bg_chrome)
-                .inner_margin(Margin::symmetric(14, 7)),
+                .inner_margin(Margin::symmetric(h_margin, 7)),
         )
         .show(ui, |ui| {
             let avail_w = ui.available_width().max(120.0);
@@ -26,37 +27,45 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                     .max_rect(row_rect)
                     .layout(egui::Layout::left_to_right(Align::Center)),
                 |ui| {
-                    ui.spacing_mut().item_spacing.x = if avail_w < 680.0 { 6.0 } else { 8.0 };
+                    ui.spacing_mut().item_spacing.x = if avail_w < 540.0 {
+                        4.0
+                    } else if avail_w < 680.0 {
+                        6.0
+                    } else {
+                        8.0
+                    };
 
-                    // Clickable brand mark -> returns to Home hub
-                    let (mark_rect, mark_resp) =
-                        ui.allocate_exact_size(vec2(24.0, 24.0), egui::Sense::click());
-                    if ui.is_rect_visible(mark_rect) {
-                        if mark_resp.hovered() {
-                            ui.painter().rect(
-                                mark_rect,
-                                CornerRadius::same(6),
-                                p.bg_hover,
-                                Stroke::new(1.0, p.border_subtle),
-                                StrokeKind::Inside,
+                    // Clickable brand mark -> returns to Home hub (hidden in narrow Prepare/Preview where Home pill suffices)
+                    if avail_w >= 480.0 || app.view_mode == ViewMode::Home {
+                        let (mark_rect, mark_resp) =
+                            ui.allocate_exact_size(vec2(24.0, 24.0), egui::Sense::click());
+                        if ui.is_rect_visible(mark_rect) {
+                            if mark_resp.hovered() {
+                                ui.painter().rect(
+                                    mark_rect,
+                                    CornerRadius::same(6),
+                                    p.bg_hover,
+                                    Stroke::new(1.0, p.border_subtle),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            paint_icon(
+                                ui.painter(),
+                                mark_rect.shrink(3.0),
+                                Icon::BrandMark,
+                                p.accent,
                             );
                         }
-                        paint_icon(
-                            ui.painter(),
-                            mark_rect.shrink(3.0),
-                            Icon::BrandMark,
-                            p.accent,
-                        );
-                    }
-                    if mark_resp
-                        .on_hover_text("Return to LayerCraft Home")
-                        .clicked()
-                    {
-                        app.view_mode = ViewMode::Home;
+                        if mark_resp
+                            .on_hover_text("Return to LayerCraft Home")
+                            .clicked()
+                        {
+                            app.view_mode = ViewMode::Home;
+                        }
                     }
 
                     // Home | Prepare | Preview segmented pill switcher
-                    draw_view_mode_switcher(app, ui, p);
+                    draw_view_mode_switcher(app, ui, p, avail_w);
 
                     // File menu popover
                     draw_file_menu(app, ui, p);
@@ -68,7 +77,7 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                     .max_rect(row_rect)
                     .layout(egui::Layout::right_to_left(Align::Center)),
                 |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = if avail_w < 540.0 { 4.0 } else { 6.0 };
                     draw_right_actions(app, ui, p, avail_w);
                 },
             );
@@ -106,8 +115,14 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
     );
 }
 
-fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+fn draw_view_mode_switcher(
+    app: &mut LayerCraftApp,
+    ui: &mut egui::Ui,
+    p: &ThemePalette,
+    avail_w: f32,
+) {
     let mut target_mode: Option<ViewMode> = None;
+    let compact = avail_w < 500.0;
 
     egui::Frame::NONE
         .fill(p.bg_input)
@@ -124,16 +139,21 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                 ] {
                     let active = app.view_mode == mode;
                     let text_col = if active { p.text_primary } else { p.text_muted };
+                    let icon_only = compact && mode == ViewMode::Home;
                     let galley = ui.painter().layout_no_wrap(
                         label.to_owned(),
                         egui::FontId::new(12.0, egui::FontFamily::Proportional),
                         text_col,
                     );
-                    let icon_extra = if mode == ViewMode::Home { 16.0 } else { 0.0 };
-                    let (seg_rect, seg_resp) = ui.allocate_exact_size(
-                        vec2(galley.size().x + 18.0 + icon_extra, 22.0),
-                        egui::Sense::click(),
-                    );
+                    let seg_w = if icon_only {
+                        28.0
+                    } else {
+                        let pad_x = if compact { 12.0 } else { 18.0 };
+                        let icon_extra = if mode == ViewMode::Home { 16.0 } else { 0.0 };
+                        galley.size().x + pad_x + icon_extra
+                    };
+                    let (seg_rect, seg_resp) =
+                        ui.allocate_exact_size(vec2(seg_w, 22.0), egui::Sense::click());
                     if ui.is_rect_visible(seg_rect) {
                         if active {
                             ui.painter().rect(
@@ -144,8 +164,8 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                                 StrokeKind::Inside,
                             );
                             let pip = egui::Rect::from_min_max(
-                                pos2(seg_rect.left() + 8.0, seg_rect.bottom() - 2.0),
-                                pos2(seg_rect.right() - 8.0, seg_rect.bottom()),
+                                pos2(seg_rect.left() + 6.0, seg_rect.bottom() - 2.0),
+                                pos2(seg_rect.right() - 6.0, seg_rect.bottom()),
                             );
                             ui.painter()
                                 .rect_filled(pip, CornerRadius::same(1), p.accent);
@@ -153,7 +173,16 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                             ui.painter()
                                 .rect_filled(seg_rect, CornerRadius::same(5), p.bg_hover);
                         }
-                        if mode == ViewMode::Home {
+                        if icon_only {
+                            let ir =
+                                egui::Rect::from_center_size(seg_rect.center(), vec2(13.0, 13.0));
+                            paint_icon(
+                                ui.painter(),
+                                ir,
+                                Icon::Home,
+                                if active { p.accent } else { p.text_muted },
+                            );
+                        } else if mode == ViewMode::Home {
                             let ir = egui::Rect::from_center_size(
                                 pos2(seg_rect.left() + 14.0, seg_rect.center().y),
                                 vec2(12.0, 12.0),
@@ -177,6 +206,11 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                             ui.painter().galley(pos, galley, text_col);
                         }
                     }
+                    let seg_resp = if icon_only {
+                        seg_resp.on_hover_text("Home")
+                    } else {
+                        seg_resp
+                    };
                     if seg_resp.clicked() && !active {
                         target_mode = Some(mode);
                     }
@@ -241,6 +275,8 @@ fn draw_file_menu(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
     }
 
     let menu_resp = resp.on_hover_text("Project files, exports, profiles, and recent items");
+    let mut switch_plate: Option<usize> = None;
+    let plates_snapshot = app.session.list_plates();
     Popup::menu(&menu_resp).show(|ui| {
         ui.set_min_width(230.0);
 
@@ -255,6 +291,57 @@ fn draw_file_menu(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         if ui.button("New Empty Plate").clicked() {
             app.request_discard_or_run(PendingDiscardAction::NewEmptyProject);
             ui.close();
+        }
+
+        if app.view_mode != ViewMode::Home {
+            ui.separator();
+            let hist = app.session.history_status();
+            let undo_lbl = match &hist.undo_label {
+                Some(lbl) => format!("Undo `{lbl}`   Ctrl+Z"),
+                None => "Undo   Ctrl+Z".to_owned(),
+            };
+            ui.add_enabled_ui(hist.can_undo, |ui| {
+                if ui.button(undo_lbl).clicked() {
+                    app.undo_action();
+                    ui.close();
+                }
+            });
+            let redo_lbl = match &hist.redo_label {
+                Some(lbl) => format!("Redo `{lbl}`   Ctrl+Shift+Z"),
+                None => "Redo   Ctrl+Shift+Z".to_owned(),
+            };
+            ui.add_enabled_ui(hist.can_redo, |ui| {
+                if ui.button(redo_lbl).clicked() {
+                    app.redo_action();
+                    ui.close();
+                }
+            });
+            if app.view_mode == ViewMode::Preview {
+                let slicing = app.is_slicing();
+                ui.add_enabled_ui(!slicing, |ui| {
+                    if ui.button("Re-slice Plate").clicked() {
+                        app.start_slice_action(ui.ctx());
+                        ui.close();
+                    }
+                });
+            }
+            if plates_snapshot.len() > 1 {
+                ui.menu_button("Switch Plate", |ui| {
+                    for plate in &plates_snapshot {
+                        let dot = if plate.sliced { "● " } else { "○ " };
+                        let row_lbl = format!(
+                            "{dot}{}. {} ({} obj)",
+                            plate.index + 1,
+                            plate.name,
+                            plate.object_count
+                        );
+                        if ui.selectable_label(plate.active, row_lbl).clicked() && !plate.active {
+                            switch_plate = Some(plate.index);
+                            ui.close();
+                        }
+                    }
+                });
+            }
         }
 
         ui.separator();
@@ -277,6 +364,11 @@ fn draw_file_menu(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
             }
             if ui.button("Export Binary G-code (.bgcode)").clicked() {
                 app.export_gcode_with_format(true);
+                ui.close();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui.button("Send to Printer...").clicked() {
+                app.open_upload_dialog();
                 ui.close();
             }
         });
@@ -338,6 +430,9 @@ fn draw_file_menu(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
             ui.close();
         }
     });
+    if let Some(idx) = switch_plate {
+        app.select_plate(idx);
+    }
 }
 
 fn draw_project_plate_pill(
@@ -492,7 +587,8 @@ fn draw_right_actions(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalet
     // Primary CTA rendered first in right_to_left so it sits at far right
     match app.view_mode {
         ViewMode::Home => {
-            if primary_button(ui, p, Icon::OpenFile, "Open File").clicked() {
+            let open_label = if avail_w < 420.0 { "Open" } else { "Open File" };
+            if primary_button(ui, p, Icon::OpenFile, open_label).clicked() {
                 app.request_discard_or_run(PendingDiscardAction::OpenFileDialog);
             }
         }
@@ -533,7 +629,7 @@ fn draw_right_actions(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalet
                 app.export_gcode_action();
             }
             #[cfg(not(target_arch = "wasm32"))]
-            if has_gcode {
+            if has_gcode && avail_w >= 560.0 {
                 let send_lbl = if avail_w < 840.0 {
                     "Send"
                 } else {
@@ -548,18 +644,20 @@ fn draw_right_actions(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalet
                     }
                 });
             }
-            let reslice_label = if slicing {
-                slicing_label.as_str()
-            } else {
-                "Re-slice"
-            };
-            ui.add_enabled_ui(!slicing, |ui| {
-                if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label).clicked() {
-                    app.start_slice_action(ui.ctx());
+            if avail_w >= 560.0 {
+                let reslice_label = if slicing {
+                    slicing_label.as_str()
+                } else {
+                    "Re-slice"
+                };
+                ui.add_enabled_ui(!slicing, |ui| {
+                    if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label).clicked() {
+                        app.start_slice_action(ui.ctx());
+                    }
+                });
+                if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
+                    app.cancel_slice_action();
                 }
-            });
-            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
-                app.cancel_slice_action();
             }
         }
     }
@@ -602,26 +700,28 @@ fn draw_right_actions(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalet
             app.sidebar_open = !app.sidebar_open;
         }
 
-        let hist = app.session.history_status();
-        let redo_tip = match &hist.redo_label {
-            Some(lbl) => format!("Redo `{lbl}` (Ctrl+Shift+Z)"),
-            None => "Nothing to redo (Ctrl+Shift+Z)".to_owned(),
-        };
-        ui.add_enabled_ui(hist.can_redo, |ui| {
-            if icon_button(ui, p, Icon::Redo, &redo_tip, false).clicked() {
-                app.redo_action();
-            }
-        });
+        if avail_w >= 580.0 {
+            let hist = app.session.history_status();
+            let redo_tip = match &hist.redo_label {
+                Some(lbl) => format!("Redo `{lbl}` (Ctrl+Shift+Z)"),
+                None => "Nothing to redo (Ctrl+Shift+Z)".to_owned(),
+            };
+            ui.add_enabled_ui(hist.can_redo, |ui| {
+                if icon_button(ui, p, Icon::Redo, &redo_tip, false).clicked() {
+                    app.redo_action();
+                }
+            });
 
-        let undo_tip = match &hist.undo_label {
-            Some(lbl) => format!("Undo `{lbl}` (Ctrl+Z)"),
-            None => "Nothing to undo (Ctrl+Z)".to_owned(),
-        };
-        ui.add_enabled_ui(hist.can_undo, |ui| {
-            if icon_button(ui, p, Icon::Undo, &undo_tip, false).clicked() {
-                app.undo_action();
-            }
-        });
+            let undo_tip = match &hist.undo_label {
+                Some(lbl) => format!("Undo `{lbl}` (Ctrl+Z)"),
+                None => "Nothing to undo (Ctrl+Z)".to_owned(),
+            };
+            ui.add_enabled_ui(hist.can_undo, |ui| {
+                if icon_button(ui, p, Icon::Undo, &undo_tip, false).clicked() {
+                    app.undo_action();
+                }
+            });
+        }
 
         // Subtle color-mode quick indicator when in Preview on wide screens
         if app.view_mode == ViewMode::Preview

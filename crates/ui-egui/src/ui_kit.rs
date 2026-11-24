@@ -427,13 +427,21 @@ fn axis_drag(
 
 /// Compact rounded pill badge.
 pub fn badge(ui: &mut Ui, bg: Color32, fg: Color32, text: &str) {
-    egui::Frame::NONE
-        .fill(bg)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(7, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(10.5).strong().color(fg));
-        });
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::new(10.5, egui::FontFamily::Proportional),
+        fg,
+    );
+    let size = galley.size() + vec2(14.0, 4.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, CornerRadius::same(10), bg);
+        ui.painter().galley(
+            pos2(rect.left() + 7.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            fg,
+        );
+    }
 }
 
 /// Thin vertical divider inside toolbars and ribbons.

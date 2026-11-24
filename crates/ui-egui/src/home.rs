@@ -37,10 +37,10 @@ pub fn draw_home_page(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalet
                     draw_recent_section(app, ui, p, content_w);
 
                     ui.add_space(20.0);
-                    draw_quick_start_section(app, ui, p);
+                    draw_quick_start_section(app, ui, p, content_w);
 
                     ui.add_space(18.0);
-                    draw_active_setup_bar(app, ui, p);
+                    draw_active_setup_bar(app, ui, p, content_w);
 
                     ui.add_space(24.0);
                 });
@@ -144,36 +144,19 @@ fn draw_recent_section(
 ) {
     let total_count = app.recent_projects.entries.len();
 
-    // Header bar with title badge, live search box, and Clear All button
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(
-            RichText::new("Recent Projects")
-                .size(15.0)
-                .strong()
-                .color(p.text_primary),
-        );
-        badge(ui, p.bg_card, p.text_secondary, &total_count.to_string());
-
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if total_count > 0
-                && secondary_button(ui, p, None, "Clear All")
-                    .on_hover_text("Clear recent projects history")
-                    .clicked()
-            {
-                app.clear_recent_projects();
-            }
-
-            // Live search pill
+    let draw_search_pill =
+        |app: &mut LayerCraftApp, ui: &mut egui::Ui, input_w: f32, max_w: Option<f32>| {
             egui::Frame::NONE
                 .fill(p.bg_input)
                 .stroke(Stroke::new(1.0, p.border_subtle))
                 .corner_radius(CornerRadius::same(7))
                 .inner_margin(Margin::symmetric(8, 4))
                 .show(ui, |ui| {
-                    let w = (content_w * 0.22).clamp(140.0, 210.0);
-                    ui.set_max_width(w + 46.0);
+                    if let Some(mw) = max_w {
+                        ui.set_max_width(mw);
+                    } else {
+                        ui.set_min_width(ui.available_width());
+                    }
                     ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
                         let (s_rect, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
@@ -181,7 +164,7 @@ fn draw_recent_section(
 
                         ui.add(
                             egui::TextEdit::singleline(&mut app.home_search)
-                                .desired_width(w)
+                                .desired_width(input_w)
                                 .frame(egui::Frame::NONE)
                                 .hint_text("Search recent..."),
                         );
@@ -190,8 +173,59 @@ fn draw_recent_section(
                         }
                     });
                 });
+        };
+
+    // Header bar with title badge, live search box, and Clear All button
+    if content_w >= 540.0 {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new("Recent Projects")
+                    .size(15.0)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            badge(ui, p.bg_card, p.text_secondary, &total_count.to_string());
+
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if total_count > 0
+                    && secondary_button(ui, p, None, "Clear All")
+                        .on_hover_text("Clear recent projects history")
+                        .clicked()
+                {
+                    app.clear_recent_projects();
+                }
+
+                let w = (content_w * 0.22).clamp(140.0, 210.0);
+                draw_search_pill(app, ui, w, Some(w + 46.0));
+            });
         });
-    });
+    } else {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new("Recent Projects")
+                    .size(15.0)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            badge(ui, p.bg_card, p.text_secondary, &total_count.to_string());
+
+            if total_count > 0 {
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if secondary_button(ui, p, None, "Clear All")
+                        .on_hover_text("Clear recent projects history")
+                        .clicked()
+                    {
+                        app.clear_recent_projects();
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+        draw_search_pill(app, ui, (content_w - 52.0).max(120.0), None);
+    }
 
     ui.add_space(10.0);
 
@@ -569,21 +603,44 @@ fn draw_recent_empty_state(
         });
 }
 
-fn draw_quick_start_section(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+fn draw_quick_start_section(
+    app: &mut LayerCraftApp,
+    ui: &mut egui::Ui,
+    p: &ThemePalette,
+    content_w: f32,
+) {
+    if content_w >= 620.0 {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new("Quick Start Calibration Shapes")
+                    .size(14.5)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            ui.label(
+                RichText::new("Open a built-in parametric benchmark on a fresh plate")
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
+        });
+    } else {
         ui.label(
             RichText::new("Quick Start Calibration Shapes")
                 .size(14.5)
                 .strong()
                 .color(p.text_primary),
         );
-        ui.label(
-            RichText::new("Open a built-in parametric benchmark on a fresh plate")
-                .size(11.5)
-                .color(p.text_muted),
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new("Open a built-in parametric benchmark on a fresh plate")
+                    .size(11.5)
+                    .color(p.text_muted),
+            )
+            .wrap(),
         );
-    });
+    }
     ui.add_space(8.0);
 
     ui.horizontal_wrapped(|ui| {
@@ -599,19 +656,28 @@ fn draw_quick_start_section(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Them
     });
 }
 
-fn draw_active_setup_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+fn draw_active_setup_bar(
+    app: &mut LayerCraftApp,
+    ui: &mut egui::Ui,
+    p: &ThemePalette,
+    content_w: f32,
+) {
     let machine = app
         .selected_machine_profile
-        .as_deref()
-        .unwrap_or("Default Printer");
+        .clone()
+        .unwrap_or_else(|| "Default Printer".to_owned());
     let filament = app
         .selected_filament_profile
-        .as_deref()
-        .unwrap_or("Default Filament");
+        .clone()
+        .unwrap_or_else(|| "Default Filament".to_owned());
     let process = app
         .selected_process_profile
-        .as_deref()
-        .unwrap_or("Default Process");
+        .clone()
+        .unwrap_or_else(|| "Default Process".to_owned());
+    let spec = format!(
+        "{:.2} mm layer · {:.2} mm nozzle",
+        app.session.config.process.layer_height_mm, app.session.config.machine.nozzle_diameter_mm
+    );
 
     egui::Frame::NONE
         .fill(p.bg_card)
@@ -620,38 +686,57 @@ fn draw_active_setup_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePa
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                ui.label(
-                    RichText::new("ACTIVE SETUP")
-                        .size(10.5)
-                        .strong()
-                        .color(p.text_muted),
-                );
-                badge(ui, p.bg_input, p.text_primary, machine);
-                badge(ui, p.bg_input, p.text_secondary, filament);
-                badge(ui, p.bg_input, p.text_secondary, process);
-                badge(
-                    ui,
-                    p.bg_input,
-                    p.text_muted,
-                    &format!(
-                        "{:.2} mm layer · {:.2} mm nozzle",
-                        app.session.config.process.layer_height_mm,
-                        app.session.config.machine.nozzle_diameter_mm
-                    ),
-                );
+            let draw_setup_badges = |ui: &mut egui::Ui| {
+                badge(ui, p.bg_input, p.text_primary, &machine);
+                badge(ui, p.bg_input, p.text_secondary, &filament);
+                badge(ui, p.bg_input, p.text_secondary, &process);
+                badge(ui, p.bg_input, p.text_muted, &spec);
+            };
+            let draw_edit_btn = |app: &mut LayerCraftApp, ui: &mut egui::Ui| {
+                if secondary_button(ui, p, Some(Icon::TabMachine), "Edit Setup")
+                    .on_hover_text("Open workspace with Printer & Preset inspector")
+                    .clicked()
+                {
+                    app.sidebar_open = true;
+                    app.sidebar_tab = SidebarTab::Machine;
+                    app.view_mode = ViewMode::Prepare;
+                }
+            };
 
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if secondary_button(ui, p, Some(Icon::TabMachine), "Edit Setup")
-                        .on_hover_text("Open workspace with Printer & Preset inspector")
-                        .clicked()
-                    {
-                        app.sidebar_open = true;
-                        app.sidebar_tab = SidebarTab::Machine;
-                        app.view_mode = ViewMode::Prepare;
-                    }
+            if content_w >= 960.0 {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("ACTIVE SETUP")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    draw_setup_badges(ui);
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        draw_edit_btn(app, ui);
+                    });
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("ACTIVE SETUP")
+                            .size(10.5)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        draw_edit_btn(app, ui);
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width((content_w - 32.0).max(200.0));
+                    ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                    draw_setup_badges(ui);
+                });
+            }
         });
 }

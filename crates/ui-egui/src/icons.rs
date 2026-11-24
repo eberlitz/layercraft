@@ -39,6 +39,7 @@ pub enum Icon {
     Search,
     MoreDots,
     Code,
+    Close,
 }
 
 /// Paint `icon` centered cleanly inside `rect` with `color`.
@@ -332,6 +333,10 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([pt(0.64, 0.26), pt(0.86, 0.50)], stroke);
             painter.line_segment([pt(0.86, 0.50), pt(0.64, 0.74)], stroke);
             painter.line_segment([pt(0.54, 0.22), pt(0.46, 0.78)], stroke);
+        }
+        Icon::Close => {
+            painter.line_segment([pt(0.22, 0.22), pt(0.78, 0.78)], stroke);
+            painter.line_segment([pt(0.78, 0.22), pt(0.22, 0.78)], stroke);
         }
     }
 }

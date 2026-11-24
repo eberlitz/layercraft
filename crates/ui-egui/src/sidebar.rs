@@ -62,6 +62,53 @@ impl SidebarTab {
     }
 }
 
+fn draw_inspector_body(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    draw_preset_card(app, ui, p);
+    ui.add_space(8.0);
+
+    let mut group = app.sidebar_tab.group();
+    if segmented_control(
+        ui,
+        p,
+        "inspector_group_switch",
+        &mut group,
+        &[
+            (InspectorGroup::Objects, "Objects"),
+            (InspectorGroup::Settings, "Settings"),
+            (InspectorGroup::Printer, "Printer"),
+        ],
+    ) {
+        app.sidebar_tab = match group {
+            InspectorGroup::Objects => SidebarTab::Plate,
+            InspectorGroup::Settings => {
+                if app.last_settings_tab.is_settings_tab() {
+                    app.last_settings_tab
+                } else {
+                    SidebarTab::Quality
+                }
+            }
+            InspectorGroup::Printer => SidebarTab::Machine,
+        };
+    }
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("layercraft_inspector_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            match app.sidebar_tab {
+                SidebarTab::Plate => draw_plate_tab(app, ui, p),
+                SidebarTab::Quality
+                | SidebarTab::Strength
+                | SidebarTab::Speed
+                | SidebarTab::Support
+                | SidebarTab::Finish => draw_settings_area(app, ui, p),
+                SidebarTab::Machine => draw_machine_tab(app, ui, p),
+            }
+            ui.add_space(10.0);
+        });
+}
+
 /// Draw the collapsible right inspector dock containing presets, group switcher, and active view.
 pub fn draw_sidebar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
     if !app.sidebar_open {
@@ -81,50 +128,7 @@ pub fn draw_sidebar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
                 .inner_margin(Margin::symmetric(12, 10)),
         )
         .show(ui, |ui| {
-            draw_preset_card(app, ui, p);
-            ui.add_space(8.0);
-
-            let mut group = app.sidebar_tab.group();
-            if segmented_control(
-                ui,
-                p,
-                "inspector_group_switch",
-                &mut group,
-                &[
-                    (InspectorGroup::Objects, "Objects"),
-                    (InspectorGroup::Settings, "Settings"),
-                    (InspectorGroup::Printer, "Printer"),
-                ],
-            ) {
-                app.sidebar_tab = match group {
-                    InspectorGroup::Objects => SidebarTab::Plate,
-                    InspectorGroup::Settings => {
-                        if app.last_settings_tab.is_settings_tab() {
-                            app.last_settings_tab
-                        } else {
-                            SidebarTab::Quality
-                        }
-                    }
-                    InspectorGroup::Printer => SidebarTab::Machine,
-                };
-            }
-            ui.add_space(8.0);
-
-            egui::ScrollArea::vertical()
-                .id_salt("layercraft_inspector_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match app.sidebar_tab {
-                        SidebarTab::Plate => draw_plate_tab(app, ui, p),
-                        SidebarTab::Quality
-                        | SidebarTab::Strength
-                        | SidebarTab::Speed
-                        | SidebarTab::Support
-                        | SidebarTab::Finish => draw_settings_area(app, ui, p),
-                        SidebarTab::Machine => draw_machine_tab(app, ui, p),
-                    }
-                    ui.add_space(10.0);
-                });
+            draw_inspector_body(app, ui, p);
         })
         .response;
 
@@ -133,6 +137,93 @@ pub fn draw_sidebar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         [pos2(r.left(), r.top()), pos2(r.left(), r.bottom())],
         Stroke::new(1.0, p.border_subtle),
     );
+}
+
+/// Draw the inspector as a right-aligned modal overlay drawer on narrow viewports.
+pub fn draw_sidebar_overlay(
+    app: &mut LayerCraftApp,
+    ctx: &egui::Context,
+    bounds_rect: egui::Rect,
+    p: &ThemePalette,
+) {
+    if !app.sidebar_open {
+        return;
+    }
+
+    if app.sidebar_tab.is_settings_tab() {
+        app.last_settings_tab = app.sidebar_tab;
+    }
+
+    let mut close_drawer = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+    egui::Area::new(egui::Id::unique("layercraft_inspector_scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(bounds_rect.min)
+        .show(ctx, |ui| {
+            let (scrim_rect, scrim_resp) =
+                ui.allocate_exact_size(bounds_rect.size(), egui::Sense::click());
+            let scrim_col = if p.dark {
+                egui::Color32::from_black_alpha(135)
+            } else {
+                egui::Color32::from_black_alpha(85)
+            };
+            ui.painter().rect_filled(scrim_rect, 0.0, scrim_col);
+            if scrim_resp.clicked() {
+                close_drawer = true;
+            }
+        });
+
+    let drawer_w = (bounds_rect.width() - 36.0)
+        .clamp(240.0, 352.0)
+        .min(bounds_rect.width().max(240.0));
+    let drawer_h = bounds_rect.height().max(200.0);
+
+    let drawer_resp = egui::Area::new(egui::Id::unique("layercraft_inspector_drawer"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos2(bounds_rect.right() - drawer_w, bounds_rect.top()))
+        .show(ctx, |ui| {
+            ui.set_min_size(vec2(drawer_w, drawer_h));
+            ui.set_max_size(vec2(drawer_w, drawer_h));
+            egui::Frame::NONE
+                .fill(p.bg_panel)
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width((drawer_w - 24.0).max(200.0));
+                    ui.set_height((drawer_h - 20.0).max(160.0));
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Inspector")
+                                .size(13.0)
+                                .strong()
+                                .color(p.text_primary),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, p, Icon::Close, "Close inspector", false).clicked() {
+                                close_drawer = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+
+                    draw_inspector_body(app, ui, p);
+                });
+        })
+        .response;
+
+    let r = drawer_resp.rect;
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("layercraft_inspector_drawer_edge"),
+    ));
+    painter.line_segment(
+        [pos2(r.left(), r.top()), pos2(r.left(), r.bottom())],
+        Stroke::new(1.0, p.border_subtle),
+    );
+
+    if close_drawer {
+        app.sidebar_open = false;
+    }
 }
 
 fn draw_preset_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {

@@ -62,6 +62,9 @@ fn draw_prepare_tool_rail(
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
+    if viewport_rect.width() < 180.0 {
+        return;
+    }
     Area::new(Id::unique("layercraft_hud_prepare_rail"))
         .order(Order::Foreground)
         .pivot(Align2::LEFT_TOP)
@@ -258,6 +261,13 @@ fn draw_orientation_gizmo(
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
+    if viewport_rect.width() < 250.0
+        || (app.view_mode == ViewMode::Preview
+            && app.show_legend_hud
+            && viewport_rect.width() < 380.0)
+    {
+        return;
+    }
     Area::new(Id::unique("layercraft_hud_gizmo"))
         .order(Order::Foreground)
         .pivot(Align2::RIGHT_TOP)
@@ -402,6 +412,12 @@ fn draw_preview_summary_hud(
         return;
     };
 
+    let max_w = if viewport_rect.width() < 520.0 {
+        208.0
+    } else {
+        248.0
+    };
+    let combo_w = if max_w < 220.0 { 114.0 } else { 142.0 };
     Area::new(Id::unique("layercraft_hud_preview_summary"))
         .order(Order::Foreground)
         .pivot(Align2::LEFT_TOP)
@@ -409,7 +425,7 @@ fn draw_preview_summary_hud(
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
             hud_frame(p).show(ui, |ui| {
-                ui.set_max_width(248.0);
+                ui.set_max_width(max_w);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("PRINT ESTIMATE")
@@ -458,7 +474,7 @@ fn draw_preview_summary_hud(
                     ui.label(RichText::new("Color by").size(10.5).color(p.text_secondary));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         egui::ComboBox::from_id_salt("hud_color_mode")
-                            .width(142.0)
+                            .width(combo_w)
                             .selected_text(app.color_mode.label())
                             .show_ui(ui, |ui| {
                                 for mode in ColorMode::ALL {
@@ -749,6 +765,7 @@ fn draw_vertical_layer_scrubber(
         viewport_rect.center().y + 38.0,
     );
 
+    let mut scrubber_active = false;
     let area_resp = Area::new(Id::unique("layercraft_hud_scrubber"))
         .order(Order::Foreground)
         .pivot(Align2::RIGHT_CENTER)
@@ -760,15 +777,20 @@ fn draw_vertical_layer_scrubber(
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
-                        if scrubber_step_button(ui, p, "+", "Next layer (Up Arrow)").clicked()
-                            && app.max_layer + 1 < total
-                        {
+                        let up_resp = scrubber_step_button(ui, p, "+", "Next layer (Up Arrow)");
+                        if up_resp.hovered() || up_resp.clicked() {
+                            scrubber_active = true;
+                        }
+                        if up_resp.clicked() && app.max_layer + 1 < total {
                             let next = app.max_layer + 1;
                             app.set_active_layer(next);
                         }
 
                         let (track_rect, track_resp) =
                             ui.allocate_exact_size(vec2(24.0, track_h), Sense::click_and_drag());
+                        if track_resp.hovered() || track_resp.dragged() {
+                            scrubber_active = true;
+                        }
 
                         if track_resp.hovered() {
                             let wheel = ui.input(|i| i.smooth_scroll_delta.y);
@@ -817,9 +839,12 @@ fn draw_vertical_layer_scrubber(
                         ui.painter()
                             .circle(knob, 7.0, p.text_primary, Stroke::new(2.0, p.accent));
 
-                        if scrubber_step_button(ui, p, "–", "Previous layer (Down Arrow)").clicked()
-                            && app.max_layer > 0
-                        {
+                        let dn_resp =
+                            scrubber_step_button(ui, p, "–", "Previous layer (Down Arrow)");
+                        if dn_resp.hovered() || dn_resp.clicked() {
+                            scrubber_active = true;
+                        }
+                        if dn_resp.clicked() && app.max_layer > 0 {
                             let prev = app.max_layer - 1;
                             app.set_active_layer(prev);
                         }
@@ -828,7 +853,9 @@ fn draw_vertical_layer_scrubber(
         })
         .response;
 
-    if let Some(sliced) = &app.session.sliced
+    let show_callout = viewport_rect.width() >= 520.0 || !app.show_legend_hud || scrubber_active;
+    if show_callout
+        && let Some(sliced) = &app.session.sliced
         && let Some(layer) = sliced.layers.get(app.max_layer)
     {
         let scrubber_rect = area_resp.rect;
@@ -918,7 +945,13 @@ fn draw_preview_bottom_dock(
         None
     };
 
-    let track_w = (viewport_rect.width() * 0.28).clamp(120.0, 290.0);
+    let compact = viewport_rect.width() < 540.0;
+    let track_w = if compact {
+        (viewport_rect.width() - 230.0).clamp(56.0, 175.0)
+    } else {
+        (viewport_rect.width() * 0.28).clamp(120.0, 290.0)
+    };
+    let dock_margin = Margin::symmetric(if compact { 8 } else { 12 }, 7);
     Area::new(Id::unique("layercraft_hud_preview_dock"))
         .order(Order::Foreground)
         .pivot(Align2::CENTER_BOTTOM)
@@ -929,7 +962,7 @@ fn draw_preview_bottom_dock(
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
             floating_rail_frame(p)
-                .inner_margin(Margin::symmetric(12, 7))
+                .inner_margin(dock_margin)
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
@@ -1089,7 +1122,7 @@ fn draw_preview_bottom_dock(
                                         ui.allocate_exact_size(vec2(8.0, 12.0), Sense::hover());
                                     ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
 
-                                    let desc = if cur_step == 0 {
+                                    let full_desc = if cur_step == 0 {
                                         format!("0/{step_count} · Start")
                                     } else if matches!(step.kind, MoveKind::Extrusion(_)) {
                                         format!(
@@ -1105,15 +1138,31 @@ fn draw_preview_bottom_dock(
                                             step.fan_percent
                                         )
                                     };
-                                    ui.label(RichText::new(desc).size(11.0).color(p.text_primary));
+                                    let desc = if compact {
+                                        format!("{cur_step}/{step_count}")
+                                    } else {
+                                        full_desc.clone()
+                                    };
+                                    ui.label(RichText::new(desc).size(11.0).color(p.text_primary))
+                                        .on_hover_text(full_desc);
                                 }
                             });
                             ui.separator();
                         }
 
                         // Canonical Preview view toggles row
+                        #[derive(Clone, Copy)]
+                        enum DockToggle {
+                            SingleLayer,
+                            Travels,
+                            GhostMesh,
+                            BedGrid,
+                            LegendHud,
+                            GcodeViewer,
+                        }
+                        let mut toggled: Option<DockToggle> = None;
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.x = if compact { 4.0 } else { 6.0 };
                             if icon_button(
                                 ui,
                                 p,
@@ -1125,44 +1174,86 @@ fn draw_preview_bottom_dock(
                             {
                                 app.frame_camera(CameraPreset::Isometric);
                             }
-                            if ribbon_button(ui, p, Icon::Layers, "Single", app.single_layer_only)
-                                .on_hover_text("Show only the currently selected layer")
-                                .clicked()
-                            {
-                                app.single_layer_only = !app.single_layer_only;
-                            }
-                            if ribbon_button(ui, p, Icon::Travel, "Travels", app.show_travels)
-                                .on_hover_text("Toggle travel move lines (T)")
-                                .clicked()
-                            {
-                                app.show_travels = !app.show_travels;
-                            }
-                            if ribbon_button(ui, p, Icon::Ghost, "Ghost", app.show_ghost_mesh)
-                                .on_hover_text("Show translucent source mesh overlay")
-                                .clicked()
-                            {
-                                app.show_ghost_mesh = !app.show_ghost_mesh;
-                            }
-                            if ribbon_button(ui, p, Icon::ArrangeGrid, "Grid", app.show_bed_grid)
-                                .on_hover_text("Toggle build plate grid")
-                                .clicked()
-                            {
-                                app.show_bed_grid = !app.show_bed_grid;
-                                app.rebuild_scene();
-                            }
-                            if ribbon_button(ui, p, Icon::Legend, "Legend", app.show_legend_hud)
-                                .on_hover_text("Show summary & feature legend card")
-                                .clicked()
-                            {
-                                app.show_legend_hud = !app.show_legend_hud;
-                            }
-                            if ribbon_button(ui, p, Icon::Code, "G-code", app.show_gcode_viewer)
-                                .on_hover_text("Toggle live synchronized G-code viewer")
-                                .clicked()
-                            {
-                                app.show_gcode_viewer = !app.show_gcode_viewer;
+                            let items = [
+                                (
+                                    DockToggle::SingleLayer,
+                                    Icon::Layers,
+                                    "Single",
+                                    "Show only the currently selected layer",
+                                    app.single_layer_only,
+                                ),
+                                (
+                                    DockToggle::Travels,
+                                    Icon::Travel,
+                                    "Travels",
+                                    "Toggle travel move lines (T)",
+                                    app.show_travels,
+                                ),
+                                (
+                                    DockToggle::GhostMesh,
+                                    Icon::Ghost,
+                                    "Ghost",
+                                    "Show translucent source mesh overlay",
+                                    app.show_ghost_mesh,
+                                ),
+                                (
+                                    DockToggle::BedGrid,
+                                    Icon::ArrangeGrid,
+                                    "Grid",
+                                    "Toggle build plate grid",
+                                    app.show_bed_grid,
+                                ),
+                                (
+                                    DockToggle::LegendHud,
+                                    Icon::Legend,
+                                    "Legend",
+                                    "Show summary & feature legend card",
+                                    app.show_legend_hud,
+                                ),
+                                (
+                                    DockToggle::GcodeViewer,
+                                    Icon::Code,
+                                    "G-code",
+                                    "Toggle live synchronized G-code viewer",
+                                    app.show_gcode_viewer,
+                                ),
+                            ];
+                            for (kind, icon, label, tip, active) in items {
+                                let clicked = if compact {
+                                    icon_button(ui, p, icon, tip, active).clicked()
+                                } else {
+                                    ribbon_button(ui, p, icon, label, active)
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                };
+                                if clicked {
+                                    toggled = Some(kind);
+                                }
                             }
                         });
+                        if let Some(kind) = toggled {
+                            match kind {
+                                DockToggle::SingleLayer => {
+                                    app.single_layer_only = !app.single_layer_only;
+                                }
+                                DockToggle::Travels => {
+                                    app.show_travels = !app.show_travels;
+                                }
+                                DockToggle::GhostMesh => {
+                                    app.show_ghost_mesh = !app.show_ghost_mesh;
+                                }
+                                DockToggle::BedGrid => {
+                                    app.show_bed_grid = !app.show_bed_grid;
+                                    app.rebuild_scene();
+                                }
+                                DockToggle::LegendHud => {
+                                    app.show_legend_hud = !app.show_legend_hud;
+                                }
+                                DockToggle::GcodeViewer => {
+                                    app.show_gcode_viewer = !app.show_gcode_viewer;
+                                }
+                            }
+                        }
                     });
                 });
         });
@@ -1364,15 +1455,17 @@ fn draw_bottom_view_pill(
                             app.show_bed_grid = !app.show_bed_grid;
                             app.rebuild_scene();
                         }
-                        ui.label(
-                            RichText::new(format!(
-                                "{} obj · {} mod",
-                                app.session.objects.len(),
-                                app.session.modifiers.len()
-                            ))
-                            .size(11.0)
-                            .color(p.text_secondary),
-                        );
+                        if viewport_rect.width() >= 260.0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} obj · {} mod",
+                                    app.session.objects.len(),
+                                    app.session.modifiers.len()
+                                ))
+                                .size(11.0)
+                                .color(p.text_secondary),
+                            );
+                        }
                     });
                 });
         });

@@ -317,6 +317,7 @@ pub struct LayerCraftApp {
     pub(crate) theme_mode: ThemeMode,
     pub(crate) styles_installed: bool,
     pub(crate) sidebar_open: bool,
+    pub(crate) narrow_layout_applied: bool,
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) last_settings_tab: SidebarTab,
     pub(crate) settings_search: String,
@@ -515,6 +516,7 @@ impl LayerCraftApp {
             theme_mode: initial_theme,
             styles_installed: false,
             sidebar_open: true,
+            narrow_layout_applied: false,
             sidebar_tab: SidebarTab::Plate,
             last_settings_tab: SidebarTab::Quality,
             settings_search: String::new(),
@@ -3596,7 +3598,7 @@ impl LayerCraftApp {
         );
     }
 
-    fn viewport_panel(&mut self, ui: &mut egui::Ui, p: &ThemePalette) {
+    fn viewport_panel(&mut self, ui: &mut egui::Ui, p: &ThemePalette) -> egui::Rect {
         let rect = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -3775,6 +3777,7 @@ impl LayerCraftApp {
             .inner;
 
         viewport_hud::draw_viewport_hud(self, ui.ctx(), rect, p);
+        rect
     }
 
     /// Run one frame of the LayerCraft UI inside `ui` (shared between live `eframe` and headless captures).
@@ -3884,6 +3887,14 @@ impl LayerCraftApp {
             }
         }
 
+        let screen_w = ui.available_width();
+        if screen_w < 760.0 && !self.narrow_layout_applied {
+            self.sidebar_open = false;
+            self.narrow_layout_applied = true;
+        } else if screen_w >= 820.0 && self.narrow_layout_applied {
+            self.narrow_layout_applied = false;
+        }
+
         toolbar::draw_header_bar(self, ui, &palette);
         self.draw_status_bar(ui, &palette);
 
@@ -3895,7 +3906,13 @@ impl LayerCraftApp {
                 });
         } else {
             let cfg_before_sidebar = self.session.config.clone();
-            sidebar::draw_sidebar(self, ui, &palette);
+            if screen_w < 760.0 {
+                let vp_rect = self.viewport_panel(ui, &palette);
+                sidebar::draw_sidebar_overlay(self, ui.ctx(), vp_rect, &palette);
+            } else {
+                sidebar::draw_sidebar(self, ui, &palette);
+                let _ = self.viewport_panel(ui, &palette);
+            }
             if self.session.config != cfg_before_sidebar {
                 self.printability_report = None;
                 self.project_dirty = true;
@@ -3911,8 +3928,6 @@ impl LayerCraftApp {
                 self.session
                     .push_config_undo_snapshot("Edit settings", prev_cfg);
             }
-
-            self.viewport_panel(ui, &palette);
         }
 
         if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
@@ -4886,7 +4901,40 @@ mod tests {
 
         app.run_slice();
         assert_eq!(app.view_mode, ViewMode::Preview);
+        let mut out = ctx.run_ui(raw_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
+        // Phone-width (412x840) responsive pass: Home, Prepare (collapsed + overlay drawer), Preview
+        let phone_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(412.0, 840.0),
+            )),
+            ..Default::default()
+        };
+        app.view_mode = ViewMode::Home;
+        let mut out = ctx.run_ui(phone_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        assert!(app.narrow_layout_applied);
+        assert!(!app.sidebar_open);
+
+        app.view_mode = ViewMode::Prepare;
+        let mut out = ctx.run_ui(phone_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        assert!(!app.sidebar_open);
+
+        app.sidebar_open = true;
+        let mut out = ctx.run_ui(phone_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        assert!(app.sidebar_open);
+
+        app.sidebar_open = false;
+        app.view_mode = ViewMode::Preview;
+        let mut out = ctx.run_ui(phone_input, |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
         let mut out = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
         out.textures_delta.clear();
+        assert!(!app.narrow_layout_applied);
     }
 }
