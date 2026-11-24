@@ -3,16 +3,17 @@
 mod arachne;
 pub mod dfm;
 mod modifiers;
+mod spatial;
 mod tree_support;
 
 pub use dfm::*;
 pub use modifiers::ModifierVolume;
+use spatial::MaskClipIndex;
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};
 
 use layercraft_clip::{
-    ClipError, JoinType, clip_lines, clip_polylines, clip_polylines_difference, difference,
-    intersection, offset, union,
+    ClipError, JoinType, clip_polylines, difference, intersection, offset, union,
 };
 use layercraft_config::{
     InfillPattern, IroningType, PrintConfig, SupportStyle, SurfacePattern, WallGenerator, WallOrder,
@@ -299,6 +300,70 @@ pub fn slice_meshes_with_modifiers(
     slice_prepared_mesh_with_modifiers(&combined, config, modifiers)
 }
 
+fn parallel_try_map<T, R, E, F>(items: Vec<T>, f: &F) -> Result<Vec<R>, E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    F: Fn(T) -> Result<R, E> + Sync,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = items.len();
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .min(n);
+        if workers > 1 && n >= 4 {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<T>>> = items
+                .into_iter()
+                .map(|v| std::sync::Mutex::new(Some(v)))
+                .collect();
+            let results: Vec<std::sync::Mutex<Option<Result<R, E>>>> =
+                (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let next_ref = &next_idx;
+                    let slots_ref = &slots;
+                    let results_ref = &results;
+                    scope.spawn(move || {
+                        loop {
+                            let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= n {
+                                break;
+                            }
+                            let item = slots_ref
+                                .get(idx)
+                                .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+                            let Some(val) = item else {
+                                continue;
+                            };
+                            let res = f(val);
+                            if let Some(rm) = results_ref.get(idx)
+                                && let Ok(mut g) = rm.lock()
+                            {
+                                *g = Some(res);
+                            }
+                        }
+                    });
+                }
+            });
+            let mut out = Vec::with_capacity(n);
+            for rm in results {
+                if let Ok(mut g) = rm.into_inner()
+                    && let Some(r) = g.take()
+                {
+                    out.push(r?);
+                }
+            }
+            return Ok(out);
+        }
+    }
+    items.into_iter().map(f).collect()
+}
+
 /// Execute perimeters, skin detection, infill, supports, and adhesion from pre-sliced Z layers.
 pub fn slice_from_raw_layers(
     raw_layers: &[RawSliceLayer],
@@ -482,13 +547,16 @@ pub fn slice_from_raw_layers_with_modifiers(
     let elephant_comp = config.process.elephant_foot_compensation_mm;
     let has_uniform_xy = contour_comp.abs() > 1e-6 || hole_comp.abs() > 1e-6;
     let comp_raw_holder: Option<Vec<RawSliceLayer>> = if has_uniform_xy {
-        let mut layers_vec = Vec::with_capacity(n);
-        for raw in raw_layers {
-            layers_vec.push(RawSliceLayer {
+        let indices: Vec<usize> = (0..n).collect();
+        let layers_vec = parallel_try_map(indices, &|idx| -> Result<RawSliceLayer, SliceError> {
+            let Some(raw) = raw_layers.get(idx) else {
+                return Err(SliceError::Geom(GeomError::EmptyMesh));
+            };
+            Ok(RawSliceLayer {
                 plane: raw.plane,
                 regions: apply_xy_compensations(&raw.regions, contour_comp, hole_comp, 0.0)?,
-            });
-        }
+            })
+        })?;
         Some(layers_vec)
     } else {
         None
@@ -520,22 +588,31 @@ pub fn slice_from_raw_layers_with_modifiers(
         per_layer_base_params.push(base_p);
     }
 
-    let mut per_layer_walls: Vec<Vec<ExtrusionPath>> = Vec::with_capacity(n);
-    let mut per_layer_infill_areas: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
-
-    // Stage 2: Perimeters & infill boundary extraction.
-    for (idx, raw) in comp_layers.iter().enumerate() {
-        let effective_regions: &[ExPolygon] = if idx == 0 {
+    let layer_indices: Vec<usize> = (0..n).collect();
+    let effective_for = |idx: usize| -> &[ExPolygon] {
+        if idx == 0 {
             layer0_effective
                 .as_deref()
-                .unwrap_or(raw.regions.as_slice())
+                .or_else(|| comp_layers.first().map(|r| r.regions.as_slice()))
+                .unwrap_or(&[])
         } else {
-            raw.regions.as_slice()
+            comp_layers
+                .get(idx)
+                .map(|r| r.regions.as_slice())
+                .unwrap_or(&[])
+        }
+    };
+
+    // Stage 2: Perimeters & infill boundary extraction (per-layer independent).
+    let stage2_results = parallel_try_map(layer_indices.clone(), &|idx| {
+        let Some(raw) = comp_layers.get(idx) else {
+            return Ok((Vec::new(), Vec::new()));
         };
-        let h = raw.plane.height_mm;
         let Some(base_p) = per_layer_base_params.get(idx) else {
-            continue;
+            return Ok((Vec::new(), Vec::new()));
         };
+        let effective_regions = effective_for(idx);
+        let h = raw.plane.height_mm;
         let active_perim = sliced_mods.active_param_mods(idx, |ov| ov.affects_perimeters());
         if active_perim.is_empty() {
             let layer_cfg = if base_p.wall_loops != config.process.wall_loops
@@ -549,10 +626,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                 None
             };
             let cfg_ref = layer_cfg.as_ref().unwrap_or(config);
-            let (walls, infill_area) =
-                build_perimeters(effective_regions, raw.plane.index, h, cfg_ref)?;
-            per_layer_walls.push(walls);
-            per_layer_infill_areas.push(infill_area);
+            build_perimeters(effective_regions, raw.plane.index, h, cfg_ref)
         } else {
             let buckets = partition_regions(effective_regions, base_p, &active_perim)?;
             let mut layer_walls = Vec::new();
@@ -564,17 +638,23 @@ pub fn slice_from_raw_layers_with_modifiers(
                 layer_walls.extend(walls);
                 combined_infill.extend(sub_infill);
             }
-            per_layer_walls.push(layer_walls);
-            per_layer_infill_areas.push(union_if_multi(combined_infill)?);
+            Ok((layer_walls, union_if_multi(combined_infill)?))
         }
+    })?;
+    let mut per_layer_walls: Vec<Vec<ExtrusionPath>> = Vec::with_capacity(n);
+    let mut per_layer_infill_areas: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
+    for (walls, infill_area) in stage2_results {
+        per_layer_walls.push(walls);
+        per_layer_infill_areas.push(infill_area);
     }
 
-    // Stage 3: Top / bottom exposed surface detection & shell propagation.
-    let mut bottom_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
-    let mut top_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
-    for idx in 0..n {
+    // Stage 3: Top / bottom exposed surface detection & shell propagation (per-layer independent).
+    let stage3_results = parallel_try_map(layer_indices.clone(), &|idx| -> Result<
+        (Vec<ExPolygon>, Vec<ExPolygon>),
+        SliceError,
+    > {
         let Some(infill_here) = per_layer_infill_areas.get(idx) else {
-            continue;
+            return Ok((Vec::new(), Vec::new()));
         };
         let below = idx
             .checked_sub(1)
@@ -585,60 +665,43 @@ pub fn slice_from_raw_layers_with_modifiers(
             .get(idx + 1)
             .map(|l| l.regions.as_slice())
             .unwrap_or(&[]);
-
-        bottom_exposed.push(difference(infill_here, below)?);
-        top_exposed.push(difference(infill_here, above)?);
+        Ok((
+            difference(infill_here, below)?,
+            difference(infill_here, above)?,
+        ))
+    })?;
+    let mut bottom_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
+    let mut top_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
+    for (b, t) in stage3_results {
+        bottom_exposed.push(b);
+        top_exposed.push(t);
     }
 
-    let mut cursor_xy = (0.0_f64, 0.0_f64);
-    let mut prev_sparse_region: Vec<ExPolygon> = Vec::new();
-    let mut layers = Vec::with_capacity(n);
-    for idx in 0..n {
+    // Stage 4A: Shell classification, bridge anchoring, and sparse region prep per layer.
+    struct LayerShellPrep {
+        top_here: Vec<ExPolygon>,
+        bottom_here: Vec<ExPolygon>,
+        internal_solid: Vec<ExPolygon>,
+        sparse_region: Vec<ExPolygon>,
+        bridge_paths: Vec<ExtrusionPath>,
+        sparse_buckets: Vec<(Vec<ExPolygon>, EffectiveLayerParams)>,
+        next_prev_sparse: Vec<ExPolygon>,
+    }
+
+    let stage4a = parallel_try_map(layer_indices.clone(), &|idx| -> Result<
+        LayerShellPrep,
+        SliceError,
+    > {
         let Some(raw) = comp_layers.get(idx) else {
-            continue;
-        };
-        let effective_regions: &[ExPolygon] = if idx == 0 {
-            layer0_effective
-                .as_deref()
-                .unwrap_or(raw.regions.as_slice())
-        } else {
-            raw.regions.as_slice()
+            return Err(SliceError::Geom(GeomError::EmptyMesh));
         };
         let Some(infill_here) = per_layer_infill_areas.get(idx) else {
-            continue;
+            return Err(SliceError::Geom(GeomError::EmptyMesh));
         };
         let Some(base_p) = per_layer_base_params.get(idx) else {
-            continue;
+            return Err(SliceError::Geom(GeomError::EmptyMesh));
         };
         let h = raw.plane.height_mm;
-        let is_first = idx == 0;
-
-        let mut paths = Vec::new();
-
-        // Optional Stage 5 adhesion on layer 0 before part walls.
-        if is_first {
-            append_adhesion_paths(effective_regions, h, config, &mut paths)?;
-        }
-
-        // Emit support structures (base & dense interface) before part walls.
-        if let Some(spaths) = support_paths_per_layer.get(idx) {
-            paths.extend(spaths.iter().cloned());
-        }
-
-        // Emit walls in configured WallOrder, splitting unsupported outer walls into overhangs.
-        if let Some(wpaths) = per_layer_walls.get(idx) {
-            if idx > 0 && config.process.detect_overhangs {
-                let below = comp_layers
-                    .get(idx - 1)
-                    .map(|l| l.regions.as_slice())
-                    .unwrap_or(&[]);
-                let split_walls = split_overhang_wall_paths(wpaths, below, h, config)?;
-                paths.extend(split_walls);
-            } else {
-                paths.extend(wpaths.iter().cloned());
-            }
-        }
-
         let active_shells = sliced_mods.active_param_mods(idx, |ov| ov.affects_shells());
         let (top_here, mut bottom_here, mut internal_solid, mut sparse_region) =
             if active_shells.is_empty() {
@@ -769,21 +832,9 @@ pub fn slice_from_raw_layers_with_modifiers(
                 )
             };
 
-        let solid_speed = if is_first {
-            config.process.effective_first_layer_infill_speed_mm_s()
-        } else {
-            config.process.effective_solid_infill_speed_mm_s()
-        };
-        let top_speed = if is_first {
-            config.process.effective_first_layer_infill_speed_mm_s()
-        } else {
-            config.process.effective_top_surface_speed_mm_s()
-        };
         let solid_w = config.process.solid_infill_width_mm;
         let solid_spacing = stadium_spacing_mm(solid_w, h);
-        let solid_angle = if idx % 2 == 0 { FRAC_PI_4 } else { -FRAC_PI_4 };
 
-        // Detect unsupported bottom areas above layer 0 and anchor them into supporting material below.
         let mut bridge_paths = Vec::new();
         if idx > 0 && config.process.detect_bridges && !bottom_here.is_empty() {
             let below = comp_layers
@@ -822,13 +873,106 @@ pub fn slice_from_raw_layers_with_modifiers(
             }
         }
 
-        // Detect internal bridges: the first solid layer directly bridging over sparse/hollow infill.
+        let mut next_prev_sparse_src = Vec::new();
+        let sparse_buckets = if !sparse_region.is_empty() {
+            let active_infill = sliced_mods.active_param_mods(idx, |ov| {
+                ov.sparse_infill_density.is_some()
+                    || ov.sparse_infill_pattern.is_some()
+                    || ov.infill_speed_mm_s.is_some()
+            });
+            let buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
+            for (sub_sparse, b_params) in &buckets {
+                if !sub_sparse.is_empty() && b_params.sparse_infill_density < 0.99 {
+                    next_prev_sparse_src.extend(sub_sparse.iter().cloned());
+                }
+            }
+            buckets
+        } else {
+            Vec::new()
+        };
+        let next_prev_sparse = if next_prev_sparse_src.is_empty() {
+            Vec::new()
+        } else {
+            union_if_multi(next_prev_sparse_src)?
+        };
+
+        Ok(LayerShellPrep {
+            top_here,
+            bottom_here,
+            internal_solid,
+            sparse_region,
+            bridge_paths,
+            sparse_buckets,
+            next_prev_sparse,
+        })
+    })?;
+
+    // Stage 4B: Overhang splitting, internal bridges, solid/sparse hatching, and ironing (per-layer parallel).
+    let stage4b_paths = parallel_try_map(layer_indices, &|idx| -> Result<
+        Vec<ExtrusionPath>,
+        SliceError,
+    > {
+        let Some(raw) = comp_layers.get(idx) else {
+            return Ok(Vec::new());
+        };
+        let Some(prep) = stage4a.get(idx) else {
+            return Ok(Vec::new());
+        };
+        let Some(base_p) = per_layer_base_params.get(idx) else {
+            return Ok(Vec::new());
+        };
+        let effective_regions = effective_for(idx);
+        let h = raw.plane.height_mm;
+        let is_first = idx == 0;
+        let mut paths = Vec::new();
+
+        if is_first {
+            append_adhesion_paths(effective_regions, h, config, &mut paths)?;
+        }
+        if let Some(spaths) = support_paths_per_layer.get(idx) {
+            paths.extend(spaths.iter().cloned());
+        }
+
+        if let Some(wpaths) = per_layer_walls.get(idx) {
+            if idx > 0 && config.process.detect_overhangs {
+                let below = comp_layers
+                    .get(idx - 1)
+                    .map(|l| l.regions.as_slice())
+                    .unwrap_or(&[]);
+                let split_walls = split_overhang_wall_paths(wpaths, below, h, config)?;
+                paths.extend(split_walls);
+            } else {
+                paths.extend(wpaths.iter().cloned());
+            }
+        }
+
+        let solid_speed = if is_first {
+            config.process.effective_first_layer_infill_speed_mm_s()
+        } else {
+            config.process.effective_solid_infill_speed_mm_s()
+        };
+        let top_speed = if is_first {
+            config.process.effective_first_layer_infill_speed_mm_s()
+        } else {
+            config.process.effective_top_surface_speed_mm_s()
+        };
+        let solid_w = config.process.solid_infill_width_mm;
+        let solid_spacing = stadium_spacing_mm(solid_w, h);
+        let solid_angle = if idx % 2 == 0 { FRAC_PI_4 } else { -FRAC_PI_4 };
+
+        let mut internal_solid_rem: Option<Vec<ExPolygon>> = None;
+        let mut internal_bridge_paths = Vec::new();
+        let prev_sparse_region: &[ExPolygon] = idx
+            .checked_sub(1)
+            .and_then(|j| stage4a.get(j))
+            .map(|p| p.next_prev_sparse.as_slice())
+            .unwrap_or(&[]);
         if idx > 0
             && config.process.detect_bridges
-            && !internal_solid.is_empty()
+            && !prep.internal_solid.is_empty()
             && !prev_sparse_region.is_empty()
         {
-            let raw_ib = intersection(&internal_solid, &prev_sparse_region)?;
+            let raw_ib = intersection(&prep.internal_solid, prev_sparse_region)?;
             if !raw_ib.is_empty() {
                 let anchor_mm = 2.0 * solid_w;
                 let expanded_ib = offset(
@@ -836,9 +980,9 @@ pub fn slice_from_raw_layers_with_modifiers(
                     mm_to_nm(anchor_mm)?,
                     JoinType::Miter { limit: 2.0 },
                 )?;
-                let anchored_ib = intersection(&internal_solid, &expanded_ib)?;
+                let anchored_ib = intersection(&prep.internal_solid, &expanded_ib)?;
                 if !anchored_ib.is_empty() {
-                    internal_solid = difference(&internal_solid, &anchored_ib)?;
+                    internal_solid_rem = Some(difference(&prep.internal_solid, &anchored_ib)?);
                     for ib_poly in &anchored_ib {
                         let ib_angle = ib_poly
                             .aabb()
@@ -864,25 +1008,32 @@ pub fn slice_from_raw_layers_with_modifiers(
                             config.process.bridge_speed_mm_s,
                             config.process.bridge_flow_ratio,
                         )?;
-                        bridge_paths.extend(hatched);
+                        internal_bridge_paths.extend(hatched);
                     }
                 }
             }
         }
+        let effective_internal_solid = internal_solid_rem
+            .as_deref()
+            .unwrap_or(prep.internal_solid.as_slice());
 
-        // Emit solid infill, exposed top/bottom surfaces (concentric, monotonic, or rectilinear), & bridges.
         let bottom_pat = config.process.effective_bottom_surface_pattern();
         let top_pat = config.process.effective_top_surface_pattern();
         for (region, role, speed, pat) in [
             (
-                &bottom_here,
+                prep.bottom_here.as_slice(),
                 ExtrusionRole::BottomSurface,
                 solid_speed,
                 bottom_pat,
             ),
-            (&top_here, ExtrusionRole::TopSurface, top_speed, top_pat),
             (
-                &internal_solid,
+                prep.top_here.as_slice(),
+                ExtrusionRole::TopSurface,
+                top_speed,
+                top_pat,
+            ),
+            (
+                effective_internal_solid,
                 ExtrusionRole::InternalSolidInfill,
                 solid_speed,
                 SurfacePattern::Rectilinear,
@@ -921,26 +1072,13 @@ pub fn slice_from_raw_layers_with_modifiers(
                 paths.extend(fill_paths);
             }
         }
-        paths.extend(bridge_paths);
+        paths.extend(prep.bridge_paths.iter().cloned());
+        paths.extend(internal_bridge_paths);
 
-        // Stage 4: Sparse infill (partitioned across active modifier volumes when present).
-        let mut next_prev_sparse: Vec<ExPolygon> = Vec::new();
-        if !sparse_region.is_empty() {
+        if !prep.sparse_region.is_empty() {
             let sparse_w = config.process.sparse_infill_width_mm;
-            let active_infill = sliced_mods.active_param_mods(idx, |ov| {
-                ov.sparse_infill_density.is_some()
-                    || ov.sparse_infill_pattern.is_some()
-                    || ov.infill_speed_mm_s.is_some()
-            });
-            let infill_buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
-            for (sub_sparse, b_params) in infill_buckets {
-                if sub_sparse.is_empty() {
-                    continue;
-                }
-                if b_params.sparse_infill_density < 0.99 {
-                    next_prev_sparse.extend(sub_sparse.iter().cloned());
-                }
-                if b_params.sparse_infill_density <= 1e-6 {
+            for (sub_sparse, b_params) in &prep.sparse_buckets {
+                if sub_sparse.is_empty() || b_params.sparse_infill_density <= 1e-6 {
                     continue;
                 }
                 let speed = if is_first
@@ -951,7 +1089,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                     b_params.infill_speed_mm_s
                 };
                 let hatched = generate_sparse_infill_for_region(
-                    &sub_sparse,
+                    sub_sparse,
                     idx,
                     raw.plane.z_top_mm,
                     h,
@@ -963,13 +1101,7 @@ pub fn slice_from_raw_layers_with_modifiers(
                 paths.extend(hatched);
             }
         }
-        prev_sparse_region = if next_prev_sparse.is_empty() {
-            Vec::new()
-        } else {
-            union_if_multi(next_prev_sparse)?
-        };
 
-        // Stage 6 (Optional): Top-surface ironing pass (global, height-range, or modifier-local).
         let iron = &config.process.ironing;
         let active_iron = sliced_mods.active_param_mods(idx, |ov| ov.ironing_mode.is_some());
         let any_iron = base_p.ironing_mode != IroningType::Off
@@ -1022,9 +1154,21 @@ pub fn slice_from_raw_layers_with_modifiers(
             }
         }
 
-        // Order islands & infill paths to minimize cross-island & cross-layer non-extrusion travel.
-        paths = order_layer_paths_by_island(idx, paths, effective_regions, &mut cursor_xy, config);
+        Ok(paths)
+    })?;
 
+    // Stage 4C: Deterministic sequential island travel ordering & cooling flow/speed calculation.
+    let mut cursor_xy = (0.0_f64, 0.0_f64);
+    let mut layers = Vec::with_capacity(n);
+    for (idx, raw_paths) in stage4b_paths.into_iter().enumerate() {
+        let Some(raw) = comp_layers.get(idx) else {
+            continue;
+        };
+        let effective_regions = effective_for(idx);
+        let h = raw.plane.height_mm;
+        let ordered =
+            order_layer_paths_by_island(idx, raw_paths, effective_regions, &mut cursor_xy, config);
+        let mut paths = ordered;
         let (fan_percent, estimated_time_s) = apply_flow_and_cooling(idx, &mut paths, config);
 
         layers.push(SlicedLayer {
@@ -1400,14 +1544,14 @@ fn apply_flow_and_cooling(
     (fan_u8, final_ext_time_s + travel_time_s)
 }
 
-fn is_midair_bridge_segment(bridge_wall_mask: &[ExPolygon], a: Point2, b: Point2) -> bool {
+fn is_midair_bridge_segment(bridge_wall_mask: &MaskClipIndex, a: Point2, b: Point2) -> bool {
     let ax = a.x as f64;
     let ay = a.y as f64;
     let dx = (b.x as f64) - ax;
     let dy = (b.y as f64) - ay;
     for t in [0.25, 0.5, 0.75] {
         let pt = Point2::new((ax + t * dx).round() as i64, (ay + t * dy).round() as i64);
-        if point_in_region(bridge_wall_mask, pt) {
+        if bridge_wall_mask.contains_point(pt) {
             return false;
         }
     }
@@ -1502,6 +1646,10 @@ fn split_overhang_wall_paths(
         .min(config.process.bridge_speed_mm_s);
     let bridge_flow = config.process.bridge_flow_ratio;
 
+    let outer_mask_idx = MaskClipIndex::from_regions(&outer_support_mask);
+    let inner_mask_idx = MaskClipIndex::from_regions(&inner_support_mask);
+    let bridge_mask_idx = MaskClipIndex::from_regions(&bridge_wall_mask);
+
     let mut out = Vec::with_capacity(walls.len());
     for path in walls {
         if !matches!(
@@ -1515,30 +1663,20 @@ fn split_overhang_wall_paths(
         }
 
         let is_inner = path.role == ExtrusionRole::InnerWall;
-        let support_mask: &[ExPolygon] = if is_inner {
-            &inner_support_mask
+        let support_mask: &MaskClipIndex = if is_inner {
+            &inner_mask_idx
         } else {
-            &outer_support_mask
+            &outer_mask_idx
         };
         let supported_role = path.role;
-
-        let mut closed_pts = Vec::with_capacity(path.points.len() + 1);
-        closed_pts.extend_from_slice(&path.points);
-        if let Some(&first) = path.points.first() {
-            closed_pts.push(first);
-        }
-
-        let unsupported = clip_polylines_difference(&[closed_pts], support_mask)?;
-        if unsupported.is_empty() {
-            out.push(path.clone());
-            continue;
-        }
 
         let n = path.points.len();
         let has_var_w = path.has_variable_width();
         let mut active_role: Option<(ExtrusionRole, f64, f64)> = None;
         let mut active_pts: Vec<Point2> = Vec::new();
         let mut active_widths: Vec<f64> = Vec::new();
+        let mut split_out: Vec<ExtrusionPath> = Vec::new();
+        let mut any_overhang = false;
 
         for i in 0..n {
             let (Some(&a), Some(&b)) = (path.points.get(i), path.points.get((i + 1) % n)) else {
@@ -1549,7 +1687,6 @@ fn split_overhang_wall_paths(
             }
             let wa = path.vertex_width_mm(i);
             let wb = path.vertex_width_mm((i + 1) % n);
-            let edge = vec![a, b];
             let (ax, ay) = a.to_mm();
             let (bx, by) = b.to_mm();
             let edx = bx - ax;
@@ -1559,21 +1696,17 @@ fn split_overhang_wall_paths(
                 continue;
             }
 
-            let supported_segs = clip_polylines(std::slice::from_ref(&edge), support_mask)?;
-            let overhang_segs = clip_polylines_difference(&[edge], support_mask)?;
-
-            let mut edge_pieces: Vec<SplitWallPiece> = Vec::new();
-            for (segs, is_overhang) in [(supported_segs, false), (overhang_segs, true)] {
-                for seg in segs {
-                    let (Some(&sp0), Some(&sp1)) = (seg.first(), seg.last()) else {
-                        continue;
-                    };
-                    if sp0.distance_mm(sp1) <= 1e-6 {
-                        continue;
-                    }
-                    let (role, speed, flow) = if !is_overhang {
-                        (supported_role, path.speed_mm_s, path.flow_ratio)
-                    } else if is_inner || is_midair_bridge_segment(&bridge_wall_mask, sp0, sp1) {
+            let split_pieces = support_mask.split_segment(a, b);
+            let mut edge_pieces: Vec<SplitWallPiece> = Vec::with_capacity(split_pieces.len());
+            for (sp0, sp1, is_supported) in split_pieces {
+                if sp0.distance_mm(sp1) <= 1e-6 {
+                    continue;
+                }
+                let (role, speed, flow) = if is_supported {
+                    (supported_role, path.speed_mm_s, path.flow_ratio)
+                } else {
+                    any_overhang = true;
+                    if is_inner || is_midair_bridge_segment(&bridge_mask_idx, sp0, sp1) {
                         (ExtrusionRole::OverhangWall, bridge_wall_speed, bridge_flow)
                     } else {
                         (
@@ -1581,29 +1714,29 @@ fn split_overhang_wall_paths(
                             config.process.overhang_speed_mm_s,
                             path.flow_ratio,
                         )
-                    };
-                    let (p0x, p0y) = sp0.to_mm();
-                    let (p1x, p1y) = sp1.to_mm();
-                    let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
-                    let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
-                    let w0 = wa + t0 * (wb - wa);
-                    let w1 = wa + t1 * (wb - wa);
-                    let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
-                        (t1, sp1, w1, sp0, w0)
-                    } else {
-                        (t0, sp0, w0, sp1, w1)
-                    };
-                    edge_pieces.push(SplitWallPiece {
-                        t: ta,
-                        role,
-                        speed,
-                        flow,
-                        p0: pa,
-                        w0: w_pa,
-                        p1: pb,
-                        w1: w_pb,
-                    });
-                }
+                    }
+                };
+                let (p0x, p0y) = sp0.to_mm();
+                let (p1x, p1y) = sp1.to_mm();
+                let t0 = (((p0x - ax) * edx + (p0y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                let t1 = (((p1x - ax) * edx + (p1y - ay) * edy) / elen2).clamp(0.0, 1.0);
+                let w0 = wa + t0 * (wb - wa);
+                let w1 = wa + t1 * (wb - wa);
+                let (ta, pa, w_pa, pb, w_pb) = if t1 < t0 {
+                    (t1, sp1, w1, sp0, w0)
+                } else {
+                    (t0, sp0, w0, sp1, w1)
+                };
+                edge_pieces.push(SplitWallPiece {
+                    t: ta,
+                    role,
+                    speed,
+                    flow,
+                    p0: pa,
+                    w0: w_pa,
+                    p1: pb,
+                    w1: w_pb,
+                });
             }
             edge_pieces.sort_by(|x, y| x.t.total_cmp(&y.t));
 
@@ -1633,7 +1766,7 @@ fn split_overhang_wall_paths(
                         has_var_w,
                         path.width_mm,
                         path.height_mm,
-                        &mut out,
+                        &mut split_out,
                     );
                     active_role = Some((piece.role, piece.speed, piece.flow));
                     active_pts = vec![piece.p0, piece.p1];
@@ -1642,6 +1775,10 @@ fn split_overhang_wall_paths(
             }
         }
 
+        if !any_overhang {
+            out.push(path.clone());
+            continue;
+        }
         flush_split_wall_segment(
             active_role,
             &mut active_pts,
@@ -1649,8 +1786,9 @@ fn split_overhang_wall_paths(
             has_var_w,
             path.width_mm,
             path.height_mm,
-            &mut out,
+            &mut split_out,
         );
+        out.extend(split_out);
     }
 
     Ok(out)
@@ -2976,6 +3114,7 @@ fn flush_hatch_pts(
     }
 }
 
+#[cfg(test)]
 fn point_in_region(region: &[ExPolygon], p: Point2) -> bool {
     region.iter().any(|ex| ex.contains_point(p))
 }
@@ -3017,7 +3156,7 @@ fn build_monotonic_hatch_deps(
     spacing_mm: f64,
     cos_a: f64,
     sin_a: f64,
-    chain_region: &[ExPolygon],
+    chain_mask: &MaskClipIndex,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = segs.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -3050,13 +3189,13 @@ fn build_monotonic_hatch_deps(
                         .any(|u_t| {
                             let x = u_t * cos_a - v_test * sin_a;
                             let y = u_t * sin_a + v_test * cos_a;
-                            Point2::from_mm(x, y).is_ok_and(|pt| point_in_region(chain_region, pt))
+                            Point2::from_mm(x, y).is_ok_and(|pt| chain_mask.contains_point(pt))
                         })
                 } else {
                     let u_t = 0.5 * (u_lo + u_hi);
                     let x = u_t * cos_a - v_test * sin_a;
                     let y = u_t * sin_a + v_test * cos_a;
-                    Point2::from_mm(x, y).is_ok_and(|pt| point_in_region(chain_region, pt))
+                    Point2::from_mm(x, y).is_ok_and(|pt| chain_mask.contains_point(pt))
                 };
                 if connected {
                     if let Some(list) = deps.get_mut(i) {
@@ -3080,7 +3219,7 @@ fn chain_hatch_monotonic(
     cos_a: f64,
     sin_a: f64,
     max_link_mm: f64,
-    chain_region: &[ExPolygon],
+    chain_mask: &MaskClipIndex,
     check_endpoints: bool,
     role: ExtrusionRole,
     width_mm: f64,
@@ -3090,7 +3229,7 @@ fn chain_hatch_monotonic(
 ) -> Vec<ExtrusionPath> {
     let n = segs.len();
     let (deps, mut in_deg) =
-        build_monotonic_hatch_deps(segs, row_runs, spacing_mm, cos_a, sin_a, chain_region);
+        build_monotonic_hatch_deps(segs, row_runs, spacing_mm, cos_a, sin_a, chain_mask);
     let mut ready: Vec<usize> = (0..n)
         .filter(|&i| in_deg.get(i).copied() == Some(0))
         .collect();
@@ -3115,12 +3254,7 @@ fn chain_hatch_monotonic(
                     }
                     if d <= max_link_mm
                         && best_chain.is_none_or(|(_, _, _, bd)| d < bd)
-                        && segment_inside_same_region(
-                            chain_region,
-                            last_pt,
-                            entry_pt,
-                            check_endpoints,
-                        )
+                        && chain_mask.segment_inside_same_region(last_pt, entry_pt, check_endpoints)
                     {
                         best_chain = Some((pos, entry_pt, exit_pt, d));
                     }
@@ -3179,7 +3313,7 @@ fn chain_hatch_strip(
     row_runs: &[(i64, usize, usize)],
     seg_run_idx: &[usize],
     max_link_mm: f64,
-    chain_region: &[ExPolygon],
+    chain_mask: &MaskClipIndex,
     check_endpoints: bool,
     role: ExtrusionRole,
     width_mm: f64,
@@ -3223,12 +3357,7 @@ fn chain_hatch_strip(
                     let d = last_pt.distance_mm(entry_pt);
                     if d <= max_link_mm
                         && best_chain.is_none_or(|(_, _, _, bd)| d < bd)
-                        && segment_inside_same_region(
-                            chain_region,
-                            last_pt,
-                            entry_pt,
-                            check_endpoints,
-                        )
+                        && chain_mask.segment_inside_same_region(last_pt, entry_pt, check_endpoints)
                     {
                         best_chain = Some((cand_idx, entry_pt, exit_pt, d));
                     }
@@ -3298,6 +3427,52 @@ fn chain_hatch_strip(
     paths
 }
 
+fn scanline_intersect_ring(
+    pts: &[Point2],
+    cos_a: f64,
+    sin_a: f64,
+    spacing_mm: f64,
+    phase_offset_mm: f64,
+    k_min: i64,
+    row_hits: &mut [Vec<f64>],
+) {
+    let n = pts.len();
+    if n < 3 || row_hits.is_empty() {
+        return;
+    }
+    let k_max = k_min + (row_hits.len() as i64) - 1;
+    let rot_pts: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| {
+            let (x, y) = p.to_mm();
+            (x * cos_a + y * sin_a, -x * sin_a + y * cos_a)
+        })
+        .collect();
+
+    for i in 0..n {
+        let (Some(&(u0, v0)), Some(&(u1, v1))) = (rot_pts.get(i), rot_pts.get((i + 1) % n)) else {
+            continue;
+        };
+        let (lo_v, hi_v) = if v0 <= v1 { (v0, v1) } else { (v1, v0) };
+        if hi_v - lo_v <= 1e-12 {
+            continue;
+        }
+        let k0 = (((lo_v - phase_offset_mm) / spacing_mm).floor() as i64 - 1).max(k_min);
+        let k1 = (((hi_v - phase_offset_mm) / spacing_mm).ceil() as i64 + 1).min(k_max);
+        let inv_dv = 1.0 / (v1 - v0);
+        for k in k0..=k1 {
+            let vk = (k as f64) * spacing_mm + phase_offset_mm;
+            if vk >= lo_v && vk < hi_v {
+                let t = ((vk - v0) * inv_dv).clamp(0.0, 1.0);
+                let u_hit = u0 + t * (u1 - u0);
+                if let Some(bucket) = row_hits.get_mut((k - k_min) as usize) {
+                    bucket.push(u_hit);
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_rectilinear_hatch(
     region: &[ExPolygon],
@@ -3314,6 +3489,25 @@ pub(crate) fn generate_rectilinear_hatch(
     if region.is_empty() || spacing_mm <= 0.0 {
         return Ok(Vec::new());
     }
+    if region.len() > 1 {
+        let mut combined = Vec::new();
+        for ex in region {
+            combined.extend(generate_rectilinear_hatch(
+                std::slice::from_ref(ex),
+                angle_rad,
+                spacing_mm,
+                phase_offset_mm,
+                monotonic,
+                role,
+                width_mm,
+                height_mm,
+                speed_mm_s,
+                flow_ratio,
+            )?);
+        }
+        return Ok(combined);
+    }
+
     let Some(aabb) = region_aabb(region) else {
         return Ok(Vec::new());
     };
@@ -3326,8 +3520,6 @@ pub(crate) fn generate_rectilinear_hatch(
     // Project AABB corners into rotated hatch space:
     // u =  x * cos + y * sin
     // v = -x * sin + y * cos
-    let mut u_min = f64::INFINITY;
-    let mut u_max = f64::NEG_INFINITY;
     let mut v_min = f64::INFINITY;
     let mut v_max = f64::NEG_INFINITY;
     for (cx, cy) in [
@@ -3336,71 +3528,68 @@ pub(crate) fn generate_rectilinear_hatch(
         (max_x, max_y),
         (min_x, max_y),
     ] {
-        let u = cx * cos_a + cy * sin_a;
         let v = -cx * sin_a + cy * cos_a;
-        u_min = u_min.min(u);
-        u_max = u_max.max(u);
         v_min = v_min.min(v);
         v_max = v_max.max(v);
     }
 
-    let u0 = u_min - 1.0;
-    let u1 = u_max + 1.0;
+    let k_start = ((v_min - phase_offset_mm) / spacing_mm).floor() as i64 - 1;
+    let k_end = ((v_max - phase_offset_mm) / spacing_mm).ceil() as i64 + 1;
+    let count = k_end.saturating_sub(k_start).clamp(0, 100_000) as usize;
+    let mut row_hits: Vec<Vec<f64>> = (0..=count).map(|_| Vec::new()).collect();
 
-    let k_start = ((v_min - phase_offset_mm) / spacing_mm).floor() as i64;
-    let k_end = ((v_max - phase_offset_mm) / spacing_mm).ceil() as i64;
-    let mut raw_lines: Vec<(Point2, Point2)> = Vec::new();
-
-    let count = k_end.saturating_sub(k_start).clamp(0, 100_000);
-    for step in 0..=count {
-        let v = ((k_start + step) as f64) * spacing_mm + phase_offset_mm;
-        if v < v_min - 1e-4 || v > v_max + 1e-4 {
-            continue;
+    for ex in region {
+        scanline_intersect_ring(
+            &ex.outer.points,
+            cos_a,
+            sin_a,
+            spacing_mm,
+            phase_offset_mm,
+            k_start,
+            &mut row_hits,
+        );
+        for hole in &ex.holes {
+            scanline_intersect_ring(
+                &hole.points,
+                cos_a,
+                sin_a,
+                spacing_mm,
+                phase_offset_mm,
+                k_start,
+                &mut row_hits,
+            );
         }
-        let (ua, ub) = if step % 2 == 0 { (u0, u1) } else { (u1, u0) };
-        let ax = ua * cos_a - v * sin_a;
-        let ay = ua * sin_a + v * cos_a;
-        let bx = ub * cos_a - v * sin_a;
-        let by = ub * sin_a + v * cos_a;
-        raw_lines.push((Point2::from_mm(ax, ay)?, Point2::from_mm(bx, by)?));
-    }
-
-    let clipped = clip_lines(&raw_lines, region)?;
-    if clipped.is_empty() {
-        return Ok(Vec::new());
     }
 
     let min_seg_mm = (0.2 * width_mm).min(0.08);
-    let mut segs: Vec<HatchSeg> = Vec::with_capacity(clipped.len());
-    for seg in clipped {
-        let (Some(&p0), Some(&p1)) = (seg.first(), seg.last()) else {
-            continue;
-        };
-        if p0.distance_mm(p1) < min_seg_mm {
+    let mut segs: Vec<HatchSeg> = Vec::new();
+    for (row_off, mut hits) in row_hits.into_iter().enumerate() {
+        let k = k_start + (row_off as i64);
+        let vk = (k as f64) * spacing_mm + phase_offset_mm;
+        if vk < v_min - 1e-4 || vk > v_max + 1e-4 || hits.len() < 2 {
             continue;
         }
-        let (x0, y0) = p0.to_mm();
-        let (x1, y1) = p1.to_mm();
-        let v_mid = -0.5 * (x0 + x1) * sin_a + 0.5 * (y0 + y1) * cos_a;
-        let u_mid = 0.5 * (x0 + x1) * cos_a + 0.5 * (y0 + y1) * sin_a;
-        let row = ((v_mid - phase_offset_mm) / spacing_mm).round() as i64;
-
-        let u0_p = x0 * cos_a + y0 * sin_a;
-        let u1_p = x1 * cos_a + y1 * sin_a;
-        let (pa, pb, u0_s, u1_s) = if u1_p < u0_p {
-            (p1, p0, u1_p, u0_p)
-        } else {
-            (p0, p1, u0_p, u1_p)
-        };
-        segs.push(HatchSeg {
-            row,
-            u0: u0_s,
-            u1: u1_s,
-            u_mid,
-            v_mid,
-            pa,
-            pb,
-        });
+        hits.sort_by(f64::total_cmp);
+        for &[u0_s, u1_s] in hits.as_chunks::<2>().0 {
+            if u1_s - u0_s < min_seg_mm {
+                continue;
+            }
+            let ax = u0_s * cos_a - vk * sin_a;
+            let ay = u0_s * sin_a + vk * cos_a;
+            let bx = u1_s * cos_a - vk * sin_a;
+            let by = u1_s * sin_a + vk * cos_a;
+            let pa = Point2::from_mm(ax, ay)?;
+            let pb = Point2::from_mm(bx, by)?;
+            segs.push(HatchSeg {
+                row: k,
+                u0: u0_s,
+                u1: u1_s,
+                u_mid: 0.5 * (u0_s + u1_s),
+                v_mid: vk,
+                pa,
+                pb,
+            });
+        }
     }
     if segs.is_empty() {
         return Ok(Vec::new());
@@ -3413,6 +3602,7 @@ pub(crate) fn generate_rectilinear_hatch(
     };
     let chain_region: &[ExPolygon] = chain_region_owned.as_deref().unwrap_or(region);
     let check_endpoints = chain_region_owned.is_some();
+    let chain_mask = MaskClipIndex::from_regions(chain_region);
 
     let max_link_mm = if spacing_mm <= 2.0 * width_mm {
         (3.0 * spacing_mm).max(2.5 * width_mm)
@@ -3447,7 +3637,7 @@ pub(crate) fn generate_rectilinear_hatch(
             cos_a,
             sin_a,
             max_link_mm,
-            chain_region,
+            &chain_mask,
             check_endpoints,
             role,
             width_mm,
@@ -3461,7 +3651,7 @@ pub(crate) fn generate_rectilinear_hatch(
             &row_runs,
             &seg_run_idx,
             max_link_mm,
-            chain_region,
+            &chain_mask,
             check_endpoints,
             role,
             width_mm,
@@ -5286,5 +5476,38 @@ mod tests {
             0.05,
         );
         assert!(corner_slow_accel > corner);
+    }
+
+    #[test]
+    fn mask_clip_index_matches_hole_queries_and_segment_splits() {
+        let outer = Polygon::new(vec![
+            Point2::from_mm(0.0, 0.0).unwrap(),
+            Point2::from_mm(20.0, 0.0).unwrap(),
+            Point2::from_mm(20.0, 20.0).unwrap(),
+            Point2::from_mm(0.0, 20.0).unwrap(),
+        ]);
+        let hole = Polygon::new(vec![
+            Point2::from_mm(6.0, 6.0).unwrap(),
+            Point2::from_mm(6.0, 14.0).unwrap(),
+            Point2::from_mm(14.0, 14.0).unwrap(),
+            Point2::from_mm(14.0, 6.0).unwrap(),
+        ]);
+        let region = vec![ExPolygon::new(outer, vec![hole])];
+        let mask = MaskClipIndex::from_regions(&region);
+        assert!(mask.contains_point(Point2::from_mm(3.0, 3.0).unwrap()));
+        assert!(!mask.contains_point(Point2::from_mm(10.0, 10.0).unwrap()));
+        assert!(mask.contains_point(Point2::from_mm(0.0, 10.0).unwrap()));
+
+        let split = mask.split_segment(
+            Point2::from_mm(-2.0, 10.0).unwrap(),
+            Point2::from_mm(22.0, 10.0).unwrap(),
+        );
+        // Should split into: [-2..0 out], [0..6 in], [6..14 out (hole)], [14..20 in], [20..22 out].
+        assert_eq!(split.len(), 5);
+        assert!(!split[0].2);
+        assert!(split[1].2);
+        assert!(!split[2].2);
+        assert!(split[3].2);
+        assert!(!split[4].2);
     }
 }

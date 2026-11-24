@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
-use layercraft_clip::{ClipError, union_polygons};
+use layercraft_clip::{ClipError, simplify, union_polygons};
 use layercraft_geom::{
     Aabb3, ExPolygon, GeomError, Point2, Point3, Polygon, Triangle, TriangleMesh, mm_to_nm,
 };
@@ -745,6 +745,101 @@ pub fn slice_mesh_with_schedule(
         .collect())
 }
 
+const CONTOUR_SIMPLIFY_EPS_NM: i64 = 5_000;
+const CONTOUR_SIMPLIFY_MIN_VERTICES: usize = 64;
+
+fn simplify_ring(poly: Polygon, eps_nm: i64) -> Polygon {
+    if poly.points.len() <= CONTOUR_SIMPLIFY_MIN_VERTICES {
+        return poly;
+    }
+    let simplified = simplify(&poly, eps_nm);
+    if simplified.points.len() >= 3 && simplified.area_mm2() > 0.0 {
+        simplified
+    } else {
+        poly
+    }
+}
+
+fn simplify_regions(regions: Vec<ExPolygon>, eps_nm: i64) -> Vec<ExPolygon> {
+    regions
+        .into_iter()
+        .filter_map(|ex| {
+            let outer = simplify_ring(ex.outer, eps_nm);
+            let holes: Vec<Polygon> = ex
+                .holes
+                .into_iter()
+                .map(|h| simplify_ring(h, eps_nm))
+                .collect();
+            let merged = ExPolygon::new(outer, holes);
+            (merged.outer.points.len() >= 3 && merged.area_mm2() > 0.0).then_some(merged)
+        })
+        .collect()
+}
+
+fn parallel_try_map<T, R, E, F>(items: Vec<T>, f: &F) -> Result<Vec<R>, E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    F: Fn(T) -> Result<R, E> + Sync,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = items.len();
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .min(n);
+        if workers > 1 && n >= 4 {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<T>>> = items
+                .into_iter()
+                .map(|v| std::sync::Mutex::new(Some(v)))
+                .collect();
+            let results: Vec<std::sync::Mutex<Option<Result<R, E>>>> =
+                (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let next_ref = &next_idx;
+                    let slots_ref = &slots;
+                    let results_ref = &results;
+                    scope.spawn(move || {
+                        loop {
+                            let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= n {
+                                break;
+                            }
+                            let item = slots_ref
+                                .get(idx)
+                                .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+                            let Some(val) = item else {
+                                continue;
+                            };
+                            let res = f(val);
+                            if let Some(rm) = results_ref.get(idx)
+                                && let Ok(mut g) = rm.lock()
+                            {
+                                *g = Some(res);
+                            }
+                        }
+                    });
+                }
+            });
+            let mut out = Vec::with_capacity(n);
+            for rm in results {
+                if let Ok(mut g) = rm.into_inner()
+                    && let Some(r) = g.take()
+                {
+                    out.push(r?);
+                }
+            }
+            return Ok(out);
+        }
+    }
+    items.into_iter().map(f).collect()
+}
+
 /// Intersect a mesh with an arbitrary list of Z planes, returning `Vec<ExPolygon>` per plane.
 pub fn slice_mesh_at_z_planes(
     mesh: &TriangleMesh,
@@ -755,7 +850,45 @@ pub fn slice_mesh_at_z_planes(
         return Ok(Vec::new());
     }
 
-    // Precompute per-triangle Z bounds for fast per-layer filtering.
+    let is_monotonic = z_planes_mm.iter().all(|z| z.is_finite())
+        && z_planes_mm
+            .windows(2)
+            .all(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| a <= b));
+
+    if is_monotonic {
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); z_planes_mm.len()];
+        for (tri_idx, tri) in mesh.triangles.iter().enumerate() {
+            let zmin = tri.a.z.min(tri.b.z).min(tri.c.z);
+            let zmax = tri.a.z.max(tri.b.z).max(tri.c.z);
+            let lo = z_planes_mm.partition_point(|&z| z < zmin);
+            let hi = z_planes_mm.partition_point(|&z| z < zmax);
+            for slot in buckets.get_mut(lo..hi).into_iter().flatten() {
+                slot.push(tri_idx);
+            }
+        }
+        let tasks: Vec<(f64, Vec<usize>)> = z_planes_mm.iter().copied().zip(buckets).collect();
+        return parallel_try_map(tasks, &|(z, tri_indices)| {
+            if z < aabb.min.z || z > aabb.max.z || tri_indices.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut segments: Vec<(Point2, Point2)> = Vec::with_capacity(tri_indices.len());
+            for tri_idx in tri_indices {
+                let Some(tri) = mesh.triangles.get(tri_idx) else {
+                    continue;
+                };
+                if let Some(seg) = intersect_triangle_at_z(tri, z)?
+                    && seg.0 != seg.1
+                {
+                    segments.push(seg);
+                }
+            }
+            let loops = stitch_segments_into_loops(&segments);
+            let regions = union_polygons(&loops)?;
+            Ok(simplify_regions(regions, CONTOUR_SIMPLIFY_EPS_NM))
+        });
+    }
+
+    // Fallback when caller provides non-sorted Z planes.
     let tri_z: Vec<(f64, f64, &Triangle)> = mesh
         .triangles
         .iter()
@@ -766,11 +899,10 @@ pub fn slice_mesh_at_z_planes(
         })
         .collect();
 
-    let mut out = Vec::with_capacity(z_planes_mm.len());
-    for &z in z_planes_mm {
+    let tasks: Vec<f64> = z_planes_mm.to_vec();
+    parallel_try_map(tasks, &|z| {
         if !z.is_finite() || z < aabb.min.z || z > aabb.max.z {
-            out.push(Vec::new());
-            continue;
+            return Ok(Vec::new());
         }
         let mut segments: Vec<(Point2, Point2)> = Vec::new();
         for &(zmin, zmax, tri) in &tri_z {
@@ -785,10 +917,8 @@ pub fn slice_mesh_at_z_planes(
         }
         let loops = stitch_segments_into_loops(&segments);
         let regions = union_polygons(&loops)?;
-        out.push(regions);
-    }
-
-    Ok(out)
+        Ok(simplify_regions(regions, CONTOUR_SIMPLIFY_EPS_NM))
+    })
 }
 
 fn lerp_edge_xy(p0: Point3, p1: Point3, z: f64) -> Result<Point2, GeomError> {
