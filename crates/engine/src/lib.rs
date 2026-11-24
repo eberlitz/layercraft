@@ -313,6 +313,134 @@ fn push_unique_id(list: &mut Vec<u64>, id: u64) {
     }
 }
 
+type TriXy = [[f64; 2]; 3];
+
+fn tri_xy(t: &layercraft_geom::Triangle) -> TriXy {
+    [[t.a.x, t.a.y], [t.b.x, t.b.y], [t.c.x, t.c.y]]
+}
+
+fn tri_xy_bounds(t: &TriXy) -> (f64, f64, f64, f64) {
+    let [p0, p1, p2] = *t;
+    (
+        p0[0].min(p1[0]).min(p2[0]),
+        p0[1].min(p1[1]).min(p2[1]),
+        p0[0].max(p1[0]).max(p2[0]),
+        p0[1].max(p1[1]).max(p2[1]),
+    )
+}
+
+fn tri_xy_area2(t: &TriXy) -> f64 {
+    let [p0, p1, p2] = *t;
+    ((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1])).abs()
+}
+
+fn project_tri(t: &TriXy, nx: f64, ny: f64) -> (f64, f64) {
+    let [p0, p1, p2] = *t;
+    let d0 = p0[0] * nx + p0[1] * ny;
+    let d1 = p1[0] * nx + p1[1] * ny;
+    let d2 = p2[0] * nx + p2[1] * ny;
+    (d0.min(d1).min(d2), d0.max(d1).max(d2))
+}
+
+/// Separating-axis test: do two 2D triangles overlap by more than `eps` mm?
+fn tris_xy_overlap(a: &TriXy, b: &TriXy, eps: f64) -> bool {
+    for tri in [a, b] {
+        let [p0, p1, p2] = *tri;
+        for (s, e) in [(p0, p1), (p1, p2), (p2, p0)] {
+            let ex = e[0] - s[0];
+            let ey = e[1] - s[1];
+            let len = (ex * ex + ey * ey).sqrt();
+            if len < 1e-12 {
+                continue;
+            }
+            let (nx, ny) = (-ey / len, ex / len);
+            let (a_min, a_max) = project_tri(a, nx, ny);
+            let (b_min, b_max) = project_tri(b, nx, ny);
+            if a_max <= b_min + eps || b_max <= a_min + eps {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// True when the XY projections of two meshes share more than sliver-contact area.
+fn footprints_overlap(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    a_bb: &Aabb3,
+    b_bb: &Aabb3,
+    eps: f64,
+) -> bool {
+    let (rx0, ry0) = (a_bb.min.x.max(b_bb.min.x), a_bb.min.y.max(b_bb.min.y));
+    let (rx1, ry1) = (a_bb.max.x.min(b_bb.max.x), a_bb.max.y.min(b_bb.max.y));
+    let in_region = |t: &TriXy| {
+        let (x0, y0, x1, y1) = tri_xy_bounds(t);
+        tri_xy_area2(t) > 1e-9 && x1 >= rx0 && x0 <= rx1 && y1 >= ry0 && y0 <= ry1
+    };
+    let a_tris: Vec<TriXy> = a
+        .triangles
+        .iter()
+        .map(tri_xy)
+        .filter(|t| in_region(t))
+        .collect();
+    let b_tris: Vec<TriXy> = b
+        .triangles
+        .iter()
+        .map(tri_xy)
+        .filter(|t| in_region(t))
+        .collect();
+    if a_tris.is_empty() || b_tris.is_empty() {
+        return false;
+    }
+
+    const N: usize = 24;
+    let cw = ((rx1 - rx0) / N as f64).max(1e-6);
+    let ch = ((ry1 - ry0) / N as f64).max(1e-6);
+    let cell_range = |t: &TriXy| {
+        let (x0, y0, x1, y1) = tri_xy_bounds(t);
+        let to_cell = |v: f64, origin: f64, size: f64| -> usize {
+            (((v - origin) / size).floor().max(0.0) as usize).min(N - 1)
+        };
+        (
+            to_cell(x0, rx0, cw),
+            to_cell(y0, ry0, ch),
+            to_cell(x1, rx0, cw),
+            to_cell(y1, ry0, ch),
+        )
+    };
+
+    let mut grid: Vec<Vec<usize>> = vec![Vec::new(); N * N];
+    for (bi, bt) in b_tris.iter().enumerate() {
+        let (cx0, cy0, cx1, cy1) = cell_range(bt);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                if let Some(cell) = grid.get_mut(cy * N + cx) {
+                    cell.push(bi);
+                }
+            }
+        }
+    }
+    for at in &a_tris {
+        let (cx0, cy0, cx1, cy1) = cell_range(at);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                let Some(cell) = grid.get(cy * N + cx) else {
+                    continue;
+                };
+                for &bi in cell {
+                    if let Some(bt) = b_tris.get(bi)
+                        && tris_xy_overlap(at, bt, eps)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Compute bed-bounds violations and pairwise XY footprint overlaps for `objects`.
 pub fn check_plate_layout(
     objects: &[PlateObjectEntry],
@@ -347,6 +475,23 @@ pub fn check_plate_layout(
             let y_overlap =
                 a_bb.min.y < b_bb.max.y - overlap_eps && a_bb.max.y > b_bb.min.y + overlap_eps;
             if x_overlap && y_overlap {
+                // Bounding boxes of curved/diagonal parts overlap far more often than the
+                // parts themselves, so confirm with the real XY footprints.
+                let (Some(a_obj), Some(b_obj)) = (
+                    objects.iter().find(|o| o.id == *a_id),
+                    objects.iter().find(|o| o.id == *b_id),
+                ) else {
+                    continue;
+                };
+                if !footprints_overlap(
+                    &a_obj.prepared_mesh,
+                    &b_obj.prepared_mesh,
+                    a_bb,
+                    b_bb,
+                    overlap_eps,
+                ) {
+                    continue;
+                }
                 colliding_pairs.push(ObjectCollisionPair {
                     a_id: *a_id,
                     b_id: *b_id,
@@ -5625,6 +5770,38 @@ mod tests {
         assert!(sess.redo().applied);
         assert!(!sess.plate_inspection.as_ref().unwrap().needs_repair);
         execute(&mut sess, "slice.run", Value::Null).unwrap();
+    }
+
+    #[test]
+    fn diagonal_parts_with_overlapping_bboxes_are_not_flagged_as_colliding() {
+        use layercraft_geom::{Point3, Triangle};
+        let p = |x: f64, y: f64, z: f64| Point3 { x, y, z };
+        let tri = |a: Point3, b: Point3, c: Point3| Triangle { a, b, c };
+        // Two right triangles sharing a bounding box but lying on opposite sides of a diagonal.
+        let lower = TriangleMesh::new(vec![tri(
+            p(0.0, 0.0, 0.0),
+            p(10.0, 0.0, 0.0),
+            p(10.0, 10.0, 0.0),
+        )])
+        .unwrap();
+        let upper = TriangleMesh::new(vec![tri(
+            p(0.0, 0.5, 0.0),
+            p(0.0, 10.5, 0.0),
+            p(9.5, 10.5, 0.0),
+        )])
+        .unwrap();
+        let lb = lower.aabb().unwrap();
+        let ub = upper.aabb().unwrap();
+        assert!(!footprints_overlap(&lower, &upper, &lb, &ub, 1e-3));
+
+        let crossing = TriangleMesh::new(vec![tri(
+            p(5.0, 0.0, 0.0),
+            p(5.0, 10.0, 0.0),
+            p(0.0, 5.0, 0.0),
+        )])
+        .unwrap();
+        let cb = crossing.aabb().unwrap();
+        assert!(footprints_overlap(&lower, &crossing, &lb, &cb, 1e-3));
     }
 
     #[test]
