@@ -161,7 +161,7 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                     )
                     .clicked()
                     {
-                        app.theme_mode = app.theme_mode.cycle();
+                        app.cycle_theme_mode();
                     }
 
                     let ribbon_icon = if app.ribbon_collapsed {
@@ -408,7 +408,7 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
             .on_hover_text("Open STL or 3MF model/project (replaces current plate)")
             .clicked()
         {
-            app.open_file_dialog(false);
+            app.request_discard_or_run(crate::PendingDiscardAction::OpenFileDialog);
         }
         if ribbon_button(ui, p, Icon::AddPlus, "Add File", false)
             .on_hover_text("Add STL or 3MF model to plate")
@@ -416,9 +416,43 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
         {
             app.open_file_dialog(true);
         }
+        let has_recent = !app.prefs.recent_files.is_empty();
+        ui.add_enabled_ui(has_recent, |ui| {
+            let recent_resp = ribbon_dropdown_button(ui, p, Icon::OpenFile, "Recent")
+                .on_hover_text("Re-open a recent STL or 3MF file");
+            Popup::menu(&recent_resp).show(|ui| {
+                ui.set_min_width(240.0);
+                let recent_snapshot = app.prefs.recent_files.clone();
+                for path_str in &recent_snapshot {
+                    let display = std::path::Path::new(path_str)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(path_str.as_str());
+                    if ui.button(display).on_hover_text(path_str).clicked() {
+                        app.request_discard_or_run(crate::PendingDiscardAction::OpenRecentPath(
+                            path_str.clone(),
+                        ));
+                        ui.close();
+                    }
+                }
+                if !recent_snapshot.is_empty() {
+                    ui.separator();
+                    if ui.small_button("Clear Recent").clicked() {
+                        app.prefs.recent_files.clear();
+                        app.sync_and_save_prefs();
+                        ui.close();
+                    }
+                }
+            });
+        });
     }
 
-    if ribbon_button(ui, p, Icon::SaveProject, "Save .3mf", false)
+    let save_label = if app.project_dirty {
+        "Save .3mf*"
+    } else {
+        "Save .3mf"
+    };
+    if ribbon_button(ui, p, Icon::SaveProject, save_label, app.project_dirty)
         .on_hover_text(
             "Save full LayerCraft project (.3mf with objects, modifiers & settings) (Ctrl+S)",
         )
@@ -465,7 +499,7 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                     .selectable_label(app.selected_sample == shape, shape.label())
                     .clicked()
                 {
-                    app.load_sample_with_mode(shape, false);
+                    app.request_discard_or_run(crate::PendingDiscardAction::LoadSample(shape));
                     ui.close();
                 }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -489,6 +523,15 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
             .clicked()
         {
             app.auto_arrange_plate();
+        }
+    });
+
+    ui.add_enabled_ui(!app.session.objects.is_empty(), |ui| {
+        if ribbon_button(ui, p, Icon::Trash, "Clear", false)
+            .on_hover_text("Clear objects and modifiers from active build plate")
+            .clicked()
+        {
+            app.request_discard_or_run(crate::PendingDiscardAction::ClearPlate);
         }
     });
 

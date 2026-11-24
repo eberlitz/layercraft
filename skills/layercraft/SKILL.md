@@ -29,7 +29,7 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
 
 1. **Check status & discover commands:** Call `version` and, if needed, `list_commands` + `describe_command` for any unfamiliar operation.
 2. **Load geometry & presets (`batch`):**
-   - Load STL/3MF files with `plate.add_mesh_file` (or multi-plate `.3mf` projects with `project.load_file`), arrange multiple objects with `plate.auto_arrange`, and apply printer/filament/process presets via `profile.apply`.
+   - Load STL/3MF files with `plate.add_mesh_file` (or multi-plate `.3mf` projects with `project.load_file`), verify bounds and collisions with `plate.check_layout`, arrange multiple objects with `plate.auto_arrange`, and apply printer/filament/process presets via `profile.apply` (or snapshot/manage custom user presets with `profile.save_user`, `profile.delete_user`, and `profile.export_json`).
    - If `plate.inspect` or `analyze_printability` reports `needs_repair: true` (non-manifold/open/flipped/inverted shells), call `plate.repair_mesh` (`{"object_id": null}` or a specific `object_id`) to weld close vertices, remove duplicates, fix winding, and fill holes (or use `layercraft-cli repair` / `layercraft-cli slice --repair`).
    - Manage multi-plate `.3mf` projects with `plates.list`, `plates.select` (`index`, `id`, or `name`), `plates.add`, `plates.rename`, and `plates.remove` (inspect all plates at once via `inspect_plate`).
    - Use `config_patch` for quick overrides (layer height, infill density, wall generator, supports, brim, thumbnails).

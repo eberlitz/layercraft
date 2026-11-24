@@ -1,6 +1,7 @@
 //! Shared desktop and WebAssembly `egui` + `wgpu` slicer application (`LayerCraftApp`).
 
 mod icons;
+pub mod prefs;
 mod sidebar;
 mod theme;
 mod toolbar;
@@ -14,10 +15,11 @@ use std::sync::mpsc;
 use egui::{Align, Margin, RichText, Stroke, pos2};
 use layercraft_config::{
     ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileKind, ProfileSummary,
+    SupportStyle,
 };
 use layercraft_engine::{
     HistoryActionResult, PlateRepairResult, PrinterAuth, PrinterProfile, ProjectLoadResult,
-    Session, execute, export_project_3mf_bytes,
+    SaveUserProfileResult, Session, execute, export_project_3mf_bytes,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_engine::{
@@ -25,6 +27,7 @@ use layercraft_engine::{
 };
 use layercraft_gcode::{BgcodeOptions, encode_bgcode};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
+use layercraft_slice::{PrintabilityReport, PrintabilityRisk};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
     build_bed_plate_mesh, build_mesh_vertices, build_toolpath_instances_with_config,
@@ -104,6 +107,30 @@ fn slugify_printer_id(name: &str) -> String {
     }
 }
 
+/// Viewport interaction tool mode (deferred 3D gizmos / face painting extend this enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportToolMode {
+    #[default]
+    Select,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingDiscardAction {
+    ClearPlate,
+    LoadSample(SampleShape),
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenFileDialog,
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenRecentPath(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SavePresetDialogState {
+    pub kind: ProfileKind,
+    pub name: String,
+    pub error: Option<String>,
+}
+
 /// Shared application state driving both native `eframe` and browser `WebRunner`.
 pub struct LayerCraftApp {
     pub(crate) session: Session,
@@ -147,6 +174,13 @@ pub struct LayerCraftApp {
     pub(crate) pointer_active: bool,
     pub(crate) plate_rename_buf: (u32, String),
     pub(crate) printer_draft: PrinterProfile,
+    pub tool_mode: ViewportToolMode,
+    pub prefs: prefs::AppPreferences,
+    pub printability_report: Option<PrintabilityReport>,
+    pub project_dirty: bool,
+    pub(crate) pending_discard_action: Option<PendingDiscardAction>,
+    pub(crate) save_preset_dialog: Option<SavePresetDialogState>,
+    pub(crate) last_window_inner_size: Option<[f32; 2]>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) printer_status_report: Option<PrinterStatusReport>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -181,13 +215,81 @@ impl LayerCraftApp {
     /// Construct a new UI session, optionally preloading a sample shape.
     pub fn new(initial_sample: Option<SampleShape>) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let session = {
+        let mut session = {
             let mut s = Session::default();
             let _ = s.load_printers_from_disk();
+            #[cfg(not(test))]
+            let _ = s.load_user_profiles_from_disk();
             s
         };
         #[cfg(target_arch = "wasm32")]
-        let session = Session::default();
+        let mut session = Session::default();
+
+        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        let loaded_prefs = prefs::AppPreferences::load_from_disk();
+        #[cfg(any(target_arch = "wasm32", test))]
+        let loaded_prefs = prefs::AppPreferences::default();
+
+        let initial_theme = match loaded_prefs
+            .theme_mode
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("light") => ThemeMode::Light,
+            Some("system") => ThemeMode::System,
+            _ => ThemeMode::Dark,
+        };
+        let initial_scene_dark = initial_theme != ThemeMode::Light;
+
+        let valid_profile = |lib: &layercraft_config::ProfileLibrary,
+                             kind: ProfileKind,
+                             slot: &Option<String>|
+         -> Option<String> {
+            slot.as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && lib.get(kind, name).is_some())
+                .map(str::to_owned)
+        };
+        let saved_machine = valid_profile(
+            &session.profiles,
+            ProfileKind::Machine,
+            &loaded_prefs.active_profiles.machine,
+        );
+        let saved_filament = valid_profile(
+            &session.profiles,
+            ProfileKind::Filament,
+            &loaded_prefs.active_profiles.filament,
+        );
+        let saved_process = valid_profile(
+            &session.profiles,
+            ProfileKind::Process,
+            &loaded_prefs.active_profiles.process,
+        );
+
+        let mut initial_warnings = 0usize;
+        if (saved_machine.is_some() || saved_filament.is_some() || saved_process.is_some())
+            && let Ok(val) = execute(
+                &mut session,
+                "profile.apply",
+                serde_json::json!({
+                    "machine": saved_machine,
+                    "filament": saved_filament,
+                    "process": saved_process,
+                    "reset_to_defaults": true
+                }),
+            )
+        {
+            initial_warnings = serde_json::from_value::<ProfileApplyResult>(val)
+                .map(|r| r.warnings.len())
+                .unwrap_or(0);
+            session.clear_history();
+        }
+        let applied_machine = session.active_profiles.machine.clone();
+        let applied_filament = session.active_profiles.filament.clone();
+        let applied_process = session.active_profiles.process.clone();
+
         let initial_printer_draft = session
             .printers
             .first()
@@ -211,23 +313,23 @@ impl LayerCraftApp {
             selected_sample: initial_sample.unwrap_or(SampleShape::Cube20),
             selected_object_id: None,
             selected_modifier_id: None,
-            selected_machine_profile: None,
-            selected_filament_profile: None,
-            selected_process_profile: None,
-            profile_warning_count: 0,
+            selected_machine_profile: applied_machine,
+            selected_filament_profile: applied_filament,
+            selected_process_profile: applied_process,
+            profile_warning_count: initial_warnings,
             status_message: "Drop an .stl or .3mf onto the window, or load a sample part."
                 .to_owned(),
             last_error: None,
             scene_revision: 0,
             scene: Arc::new(GpuSceneSnapshot::default()),
             viewport_aspect: 1.5,
-            theme_mode: ThemeMode::Dark,
+            theme_mode: initial_theme,
             styles_installed: false,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Plate,
             ribbon_collapsed: false,
             show_legend_hud: true,
-            last_scene_dark: true,
+            last_scene_dark: initial_scene_dark,
             external_poller: None,
             bridge_endpoint: None,
             last_mcp_activity: None,
@@ -236,6 +338,13 @@ impl LayerCraftApp {
             pointer_active: false,
             plate_rename_buf: (0, String::new()),
             printer_draft: initial_printer_draft,
+            tool_mode: ViewportToolMode::Select,
+            prefs: loaded_prefs,
+            printability_report: None,
+            project_dirty: false,
+            pending_discard_action: None,
+            save_preset_dialog: None,
+            last_window_inner_size: None,
             #[cfg(not(target_arch = "wasm32"))]
             printer_status_report: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -262,6 +371,7 @@ impl LayerCraftApp {
         if let Some(sample) = initial_sample {
             app.load_sample(sample);
             app.session.clear_history();
+            app.project_dirty = false;
         } else {
             app.rebuild_scene();
         }
@@ -437,6 +547,21 @@ impl LayerCraftApp {
         }
 
         self.rebuild_scene();
+        if sliced_just_now {
+            self.refresh_printability_after_slice();
+        } else if command == "plate.clear"
+            || command == "project.load_file"
+            || command == "project.load_3mf_bytes"
+        {
+            self.printability_report = None;
+            self.project_dirty = false;
+        } else if !command.starts_with("layer.")
+            && !command.starts_with("session.")
+            && !command.starts_with("plate.inspect")
+            && !command.starts_with("plate.check_layout")
+        {
+            self.printability_report = None;
+        }
         if sliced_just_now
             || (command == "plates.select"
                 && self.session.sliced.is_some()
@@ -486,6 +611,8 @@ impl LayerCraftApp {
                     && res.applied
                 {
                     self.last_error = None;
+                    self.printability_report = None;
+                    self.project_dirty = true;
                     self.sync_selections_after_history();
                     let what = res.label.unwrap_or_else(|| "change".to_owned());
                     self.status_message = format!("Undid `{what}`.");
@@ -504,6 +631,8 @@ impl LayerCraftApp {
                     && res.applied
                 {
                     self.last_error = None;
+                    self.printability_report = None;
+                    self.project_dirty = true;
                     self.sync_selections_after_history();
                     let what = res.label.unwrap_or_else(|| "change".to_owned());
                     self.status_message = format!("Redid `{what}`.");
@@ -576,6 +705,7 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
                 self.playback_playing = false;
                 self.layer_move_step = 0;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
@@ -611,6 +741,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_object_id = None;
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -655,6 +787,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.playback_playing = false;
                 self.layer_move_step = 0;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
@@ -810,6 +944,8 @@ impl LayerCraftApp {
                         );
                     }
                     self.append_repair_warning_to_status();
+                    self.printability_report = None;
+                    self.project_dirty = !res.as_ref().is_some_and(|r| r.is_layercraft_project);
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
@@ -833,6 +969,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -957,6 +1095,9 @@ impl LayerCraftApp {
                 let res: Option<ProfileApplyResult> = serde_json::from_value(val).ok();
                 self.profile_warning_count = res.as_ref().map(|r| r.warnings.len()).unwrap_or(0);
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
+                self.sync_and_save_prefs();
                 self.status_message = if self.profile_warning_count > 0 {
                     format!(
                         "Applied profiles ({} warning(s)).",
@@ -990,6 +1131,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -1014,12 +1157,14 @@ impl LayerCraftApp {
             Ok(val) => {
                 let res: Option<PlateRepairResult> = serde_json::from_value(val).ok();
                 self.last_error = None;
+                self.printability_report = None;
                 self.view_mode = ViewMode::Prepare;
                 if let Some(r) = res {
                     if !r.changed {
                         self.status_message =
                             "Mesh already clean (no repairable defects found).".to_owned();
                     } else {
+                        self.project_dirty = true;
                         let welded: usize =
                             r.objects.iter().map(|o| o.report.welded_vertices).sum();
                         let flipped: usize =
@@ -1072,6 +1217,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!(
                     "Arranged {} object(s) on plate.",
@@ -1095,6 +1242,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
@@ -1127,6 +1276,8 @@ impl LayerCraftApp {
                     self.session.set_undo_suppressed(true);
                 }
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
             }
@@ -1147,6 +1298,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
                 self.selected_object_id = None;
                 self.sidebar_tab = SidebarTab::Plate;
@@ -1167,6 +1320,8 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
@@ -1203,6 +1358,8 @@ impl LayerCraftApp {
                     self.session.set_undo_suppressed(true);
                 }
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
             }
@@ -1355,6 +1512,7 @@ impl LayerCraftApp {
                 self.last_error = None;
                 self.status_message =
                     format!("Sliced {layers} layers in {:.1} ms.", out.elapsed_ms);
+                self.refresh_printability_after_slice();
                 self.rebuild_scene();
                 self.set_active_layer(layers.saturating_sub(1));
             }
@@ -1398,6 +1556,7 @@ impl LayerCraftApp {
         self.view_mode = ViewMode::Preview;
         self.last_error = None;
         self.status_message = format!("Sliced {layers} layers in {elapsed_ms:.1} ms.");
+        self.refresh_printability_after_slice();
         self.rebuild_scene();
         self.set_active_layer(layers.saturating_sub(1));
     }
@@ -1443,6 +1602,23 @@ impl LayerCraftApp {
             )
         };
 
+        let (selected_oob_col, oob_col, selected_overlap_col, overlap_col) = if self.last_scene_dark
+        {
+            (
+                [0.98_f32, 0.34, 0.32, 1.0],
+                [0.88_f32, 0.24, 0.22, 1.0],
+                [0.98_f32, 0.68, 0.24, 1.0],
+                [0.92_f32, 0.56, 0.16, 1.0],
+            )
+        } else {
+            (
+                [0.86_f32, 0.20, 0.18, 1.0],
+                [0.78_f32, 0.16, 0.14, 1.0],
+                [0.88_f32, 0.50, 0.12, 1.0],
+                [0.80_f32, 0.44, 0.08, 1.0],
+            )
+        };
+
         let mut mesh = Vec::new();
         if self.session.objects.is_empty() {
             if let Some(m) = &self.session.prepared_mesh {
@@ -1450,7 +1626,30 @@ impl LayerCraftApp {
             }
         } else {
             for obj in &self.session.objects {
-                let col = if self.selected_object_id == Some(obj.id) {
+                let is_selected = self.selected_object_id == Some(obj.id);
+                let is_oob = self
+                    .session
+                    .plate_layout
+                    .out_of_bounds_object_ids
+                    .contains(&obj.id);
+                let is_overlap = self
+                    .session
+                    .plate_layout
+                    .colliding_object_ids
+                    .contains(&obj.id);
+                let col = if is_oob {
+                    if is_selected {
+                        selected_oob_col
+                    } else {
+                        oob_col
+                    }
+                } else if is_overlap {
+                    if is_selected {
+                        selected_overlap_col
+                    } else {
+                        overlap_col
+                    }
+                } else if is_selected {
                     selected_col
                 } else {
                     unselected_col
@@ -1618,6 +1817,11 @@ impl LayerCraftApp {
                         );
                     }
                     self.append_repair_warning_to_status();
+                    self.printability_report = None;
+                    let loaded_proj = res.as_ref().is_some_and(|r| r.is_layercraft_project);
+                    self.project_dirty = !loaded_proj;
+                    self.prefs.push_recent_file(path);
+                    self.sync_and_save_prefs();
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
@@ -1641,6 +1845,12 @@ impl LayerCraftApp {
         ) {
             Ok(_) => {
                 self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = true;
+                if !append {
+                    self.prefs.push_recent_file(path);
+                    self.sync_and_save_prefs();
+                }
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -1675,6 +1885,10 @@ impl LayerCraftApp {
                 match std::fs::write(&path, &bytes) {
                     Ok(()) => {
                         self.last_error = None;
+                        self.project_dirty = false;
+                        let p_str = path.to_string_lossy().into_owned();
+                        self.prefs.push_recent_file(&p_str);
+                        self.sync_and_save_prefs();
                         self.status_message = format!("Saved project `{}`.", path.display());
                     }
                     Err(e) => {
@@ -1693,6 +1907,7 @@ impl LayerCraftApp {
             ) {
                 Ok(()) => {
                     self.last_error = None;
+                    self.project_dirty = false;
                     self.status_message =
                         "Triggered browser download `layercraft_project.3mf`.".to_owned();
                 }
@@ -2528,8 +2743,12 @@ impl LayerCraftApp {
 
         let cfg_before_sidebar = self.session.config.clone();
         sidebar::draw_sidebar(self, ui, &palette);
-        if self.session.config != cfg_before_sidebar && self.pending_config_undo.is_none() {
-            self.pending_config_undo = Some(cfg_before_sidebar);
+        if self.session.config != cfg_before_sidebar {
+            self.printability_report = None;
+            self.project_dirty = true;
+            if self.pending_config_undo.is_none() {
+                self.pending_config_undo = Some(cfg_before_sidebar);
+            }
         }
         if !ui.ctx().egui_is_using_pointer()
             && !ui.ctx().egui_wants_keyboard_input()
@@ -2540,9 +2759,406 @@ impl LayerCraftApp {
                 .push_config_undo_snapshot("Edit settings", prev_cfg);
         }
 
+        if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
+            let sz = [rect.width(), rect.height()];
+            if sz[0] >= 320.0 && sz[1] >= 240.0 {
+                self.last_window_inner_size = Some(sz);
+                if !ui.ctx().egui_is_using_pointer() {
+                    let changed = self.prefs.window_size.is_none_or(|prev| {
+                        (prev[0] - sz[0]).abs() > 2.0 || (prev[1] - sz[1]).abs() > 2.0
+                    });
+                    if changed {
+                        self.sync_and_save_prefs();
+                    }
+                }
+            }
+        }
+
         self.viewport_panel(ui, &palette);
         #[cfg(not(target_arch = "wasm32"))]
         self.draw_printer_upload_dialog(ui.ctx(), &palette);
+        self.draw_save_preset_dialog(ui.ctx(), &palette);
+        self.draw_unsaved_changes_dialog(ui.ctx(), &palette);
+    }
+
+    pub(crate) fn sync_and_save_prefs(&mut self) {
+        self.prefs.theme_mode = Some(
+            match self.theme_mode {
+                ThemeMode::Dark => "dark",
+                ThemeMode::Light => "light",
+                ThemeMode::System => "system",
+            }
+            .to_owned(),
+        );
+        self.prefs.active_profiles = self.session.active_profiles.clone();
+        if let Some(sz) = self.last_window_inner_size {
+            self.prefs.window_size = Some(sz);
+        }
+        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        {
+            let _ = self.prefs.save_to_disk();
+        }
+    }
+
+    pub(crate) fn cycle_theme_mode(&mut self) {
+        self.theme_mode = self.theme_mode.cycle();
+        self.sync_and_save_prefs();
+    }
+
+    fn refresh_printability_after_slice(&mut self) {
+        let Some(mesh) = self
+            .session
+            .prepared_mesh
+            .as_deref()
+            .or(self.session.mesh.as_deref())
+        else {
+            self.printability_report = None;
+            return;
+        };
+        let report = layercraft_slice::analyze_printability(
+            mesh,
+            self.session.sliced.as_ref(),
+            &self.session.config,
+        );
+        self.printability_report = Some(report);
+    }
+
+    /// Run Printability / DFM diagnostics without blocking on a full slice when pre-slice checks suffice.
+    pub fn analyze_printability_action(&mut self) {
+        match execute(
+            &mut self.session,
+            "plate.analyze_printability",
+            serde_json::json!({ "auto_slice": false }),
+        ) {
+            Ok(val) => {
+                self.last_error = None;
+                match serde_json::from_value::<PrintabilityReport>(val) {
+                    Ok(report) => {
+                        let summary = format!(
+                            "DFM: {} ({} issue(s))",
+                            match report.overall_risk {
+                                PrintabilityRisk::Low => "Low risk",
+                                PrintabilityRisk::Medium => "Moderate risk",
+                                PrintabilityRisk::High => "High risk",
+                            },
+                            report.issues.len()
+                        );
+                        self.printability_report = Some(report);
+                        self.status_message = summary;
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed decoding DFM report: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("DFM analysis failed: {e}"));
+            }
+        }
+    }
+
+    /// Enable automatic Tree Supports (undoable) and refresh DFM analysis.
+    pub fn apply_quick_fix_tree_supports(&mut self) {
+        self.cancel_pending_slice();
+        let prev_cfg = self.session.config.clone();
+        self.session.config.process.support.enabled = true;
+        self.session.config.process.support.style = SupportStyle::Tree;
+        if self.session.config != prev_cfg {
+            self.session
+                .push_config_undo_snapshot("Enable tree supports", prev_cfg);
+        }
+        self.session.sliced = None;
+        self.session.last_gcode = None;
+        self.project_dirty = true;
+        self.view_mode = ViewMode::Prepare;
+        self.rebuild_scene();
+        self.analyze_printability_action();
+        self.status_message = "Enabled automatic Tree supports.".to_owned();
+    }
+
+    /// Add a 5 mm outer brim (undoable) to improve first-layer bed adhesion and refresh DFM analysis.
+    pub fn apply_quick_fix_brim(&mut self) {
+        self.cancel_pending_slice();
+        let prev_cfg = self.session.config.clone();
+        if self.session.config.process.brim_width_mm < 5.0 {
+            self.session.config.process.brim_width_mm = 5.0;
+        }
+        if self.session.config != prev_cfg {
+            self.session
+                .push_config_undo_snapshot("Add 5mm brim", prev_cfg);
+        }
+        self.session.sliced = None;
+        self.session.last_gcode = None;
+        self.project_dirty = true;
+        self.view_mode = ViewMode::Prepare;
+        self.rebuild_scene();
+        self.analyze_printability_action();
+        self.status_message = "Enabled 5 mm outer brim.".to_owned();
+    }
+
+    pub(crate) fn open_save_preset_dialog(&mut self, kind: ProfileKind) {
+        let base_name = match kind {
+            ProfileKind::Machine => self
+                .selected_machine_profile
+                .as_deref()
+                .unwrap_or("Printer"),
+            ProfileKind::Filament => self
+                .selected_filament_profile
+                .as_deref()
+                .unwrap_or("Filament"),
+            ProfileKind::Process => self
+                .selected_process_profile
+                .as_deref()
+                .unwrap_or("Process"),
+            ProfileKind::MachineModel => "Preset",
+        };
+        let suggested = if self.session.profiles.is_builtin(kind, base_name) {
+            format!("Custom {base_name}")
+        } else {
+            base_name.to_owned()
+        };
+        self.save_preset_dialog = Some(SavePresetDialogState {
+            kind,
+            name: suggested,
+            error: None,
+        });
+    }
+
+    pub(crate) fn save_user_preset(
+        &mut self,
+        kind: ProfileKind,
+        name: &str,
+    ) -> Result<String, String> {
+        let persist = !cfg!(any(target_arch = "wasm32", test));
+        let val = execute(
+            &mut self.session,
+            "profile.save_user",
+            serde_json::json!({
+                "kind": kind,
+                "name": name,
+                "activate": true,
+                "persist": persist,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+        let res: SaveUserProfileResult = serde_json::from_value(val).map_err(|e| e.to_string())?;
+        match kind {
+            ProfileKind::Machine => {
+                self.selected_machine_profile = Some(res.summary.name.clone());
+            }
+            ProfileKind::Filament => {
+                self.selected_filament_profile = Some(res.summary.name.clone());
+            }
+            ProfileKind::Process => {
+                self.selected_process_profile = Some(res.summary.name.clone());
+            }
+            ProfileKind::MachineModel => {}
+        }
+        self.last_error = None;
+        self.sync_and_save_prefs();
+        self.status_message = format!("Saved custom preset `{}`.", res.summary.name);
+        Ok(res.summary.name)
+    }
+
+    pub fn delete_user_preset_action(&mut self, kind: ProfileKind, name: &str) {
+        let persist = !cfg!(any(target_arch = "wasm32", test));
+        match execute(
+            &mut self.session,
+            "profile.delete_user",
+            serde_json::json!({
+                "kind": kind,
+                "name": name,
+                "persist": persist,
+            }),
+        ) {
+            Ok(_) => {
+                match kind {
+                    ProfileKind::Machine => {
+                        if self.selected_machine_profile.as_deref() == Some(name) {
+                            self.selected_machine_profile = None;
+                        }
+                    }
+                    ProfileKind::Filament => {
+                        if self.selected_filament_profile.as_deref() == Some(name) {
+                            self.selected_filament_profile = None;
+                        }
+                    }
+                    ProfileKind::Process => {
+                        if self.selected_process_profile.as_deref() == Some(name) {
+                            self.selected_process_profile = None;
+                        }
+                    }
+                    ProfileKind::MachineModel => {}
+                }
+                self.last_error = None;
+                self.sync_and_save_prefs();
+                self.status_message = format!("Deleted custom preset `{name}`.");
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Delete preset failed: {e}"));
+            }
+        }
+    }
+
+    pub fn clear_plate_action(&mut self) {
+        self.cancel_pending_slice();
+        match execute(&mut self.session, "plate.clear", Value::Null) {
+            Ok(_) => {
+                self.last_error = None;
+                self.printability_report = None;
+                self.project_dirty = false;
+                self.selected_object_id = None;
+                self.selected_modifier_id = None;
+                self.view_mode = ViewMode::Prepare;
+                self.max_layer = 0;
+                self.layer_move_step = 0;
+                self.playback_playing = false;
+                self.status_message = "Cleared build plate.".to_owned();
+                self.rebuild_scene();
+            }
+            Err(e) => self.last_error = Some(format!("Failed clearing plate: {e}")),
+        }
+    }
+
+    pub(crate) fn request_discard_or_run(&mut self, action: PendingDiscardAction) {
+        if self.project_dirty && !self.session.objects.is_empty() {
+            self.pending_discard_action = Some(action);
+        } else {
+            self.execute_discard_action(action);
+        }
+    }
+
+    fn execute_discard_action(&mut self, action: PendingDiscardAction) {
+        match action {
+            PendingDiscardAction::ClearPlate => self.clear_plate_action(),
+            PendingDiscardAction::LoadSample(shape) => self.load_sample_with_mode(shape, false),
+            #[cfg(not(target_arch = "wasm32"))]
+            PendingDiscardAction::OpenFileDialog => self.open_file_dialog(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            PendingDiscardAction::OpenRecentPath(path) => {
+                self.load_native_path_with_mode(&path, false)
+            }
+        }
+    }
+
+    fn draw_save_preset_dialog(&mut self, ctx: &egui::Context, p: &ThemePalette) {
+        let Some(mut state) = self.save_preset_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_clicked = false;
+        let mut cancel_clicked = false;
+        let kind_label = match state.kind {
+            ProfileKind::Machine => "Printer",
+            ProfileKind::Filament => "Filament",
+            ProfileKind::Process => "Process",
+            ProfileKind::MachineModel => "Preset",
+        };
+
+        egui::Window::new(format!("Save Custom {kind_label} Preset"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Snapshots the current settings as a reusable custom preset.")
+                        .size(11.5)
+                        .color(p.text_secondary),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut state.name)
+                            .desired_width(220.0)
+                            .hint_text("My Preset"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        save_clicked = true;
+                    }
+                });
+                if let Some(err) = &state.error {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(err).size(11.0).color(p.danger));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui_kit::primary_button(ui, p, icons::Icon::SaveProject, "Save Preset")
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui_kit::secondary_button(ui, p, None, "Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if cancel_clicked || !open {
+            return;
+        }
+        if save_clicked {
+            match self.save_user_preset(state.kind, &state.name) {
+                Ok(_) => return,
+                Err(err) => {
+                    state.error = Some(err);
+                }
+            }
+        }
+        self.save_preset_dialog = Some(state);
+    }
+
+    fn draw_unsaved_changes_dialog(&mut self, ctx: &egui::Context, p: &ThemePalette) {
+        let Some(action) = self.pending_discard_action.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut save_and_continue = false;
+        let mut discard_clicked = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("Unsaved Project Changes")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "You have unsaved plate or settings changes. Save as .3mf before continuing, or discard them?",
+                    )
+                    .size(12.0)
+                    .color(p.text_primary),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui_kit::primary_button(ui, p, icons::Icon::SaveProject, "Save .3mf")
+                        .clicked()
+                    {
+                        save_and_continue = true;
+                    }
+                    if ui_kit::secondary_button(ui, p, None, "Discard Changes").clicked() {
+                        discard_clicked = true;
+                    }
+                    if ui_kit::secondary_button(ui, p, None, "Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if cancel_clicked || !open {
+            self.pending_discard_action = None;
+        } else if discard_clicked {
+            self.pending_discard_action = None;
+            self.execute_discard_action(action);
+        } else if save_and_continue {
+            self.save_project_action();
+            if !self.project_dirty {
+                self.pending_discard_action = None;
+                self.execute_discard_action(action);
+            }
+        }
     }
 }
 
@@ -2870,5 +3486,117 @@ mod tests {
         assert!(app.last_error.is_none());
         assert!(!app.session.plate_inspection.as_ref().unwrap().needs_repair);
         assert!(app.status_message.contains("Repaired mesh"));
+    }
+
+    #[test]
+    fn ui_prefs_roundtrip_and_recent_files_dedup_cap() {
+        let mut p = prefs::AppPreferences::default();
+        for idx in 0..15 {
+            p.push_recent_file(&format!("/tmp/part_{idx}.stl"));
+        }
+        assert_eq!(p.recent_files.len(), prefs::MAX_RECENT_FILES);
+        assert_eq!(p.recent_files[0], "/tmp/part_14.stl");
+
+        // Re-pushing existing path moves it back to index 0 without duplicating.
+        p.push_recent_file("/tmp/part_10.stl");
+        assert_eq!(p.recent_files.len(), prefs::MAX_RECENT_FILES);
+        assert_eq!(p.recent_files[0], "/tmp/part_10.stl");
+        assert_eq!(
+            p.recent_files
+                .iter()
+                .filter(|x| *x == "/tmp/part_10.stl")
+                .count(),
+            1
+        );
+
+        p.theme_mode = Some("light".to_owned());
+        p.window_size = Some([1440.0, 900.0]);
+        p.active_profiles.machine = Some("LayerCraft CORE One+ HF 0.4mm".to_owned());
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("layercraft_ui_prefs_{unique}.json"));
+        p.save_to_path(&path).unwrap();
+        let loaded = prefs::AppPreferences::load_from_path(&path).unwrap();
+        assert_eq!(loaded, p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ui_plate_safety_colors_and_dfm_quick_fixes_work() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        assert!(!app.project_dirty);
+        let a_id = app.session.objects[0].id;
+
+        // Move off bed -> OOB highlighted red in scene mesh vertices.
+        app.transform_object(a_id, [5.0, 125.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!(app.project_dirty);
+        assert_eq!(
+            app.session.plate_layout.out_of_bounds_object_ids,
+            vec![a_id]
+        );
+        assert!(!app.scene.mesh_verts.is_empty());
+        assert!(app.scene.mesh_verts[0][6] > 0.75);
+        assert!(app.scene.mesh_verts[0][7] < 0.40);
+
+        // Add second cube and overlap -> colliding highlighted amber.
+        app.transform_object(a_id, [125.0, 125.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        app.load_sample_with_mode(SampleShape::Cube20, true);
+        let b_id = app.session.objects[1].id;
+        app.transform_object(b_id, [125.0, 125.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        assert!(app.session.plate_layout.has_issues);
+
+        app.auto_arrange_plate();
+        assert!(!app.session.plate_layout.has_issues);
+
+        // Pre-slice DFM analysis and quick-fix toggles work cleanly.
+        app.analyze_printability_action();
+        assert!(app.printability_report.is_some());
+
+        app.apply_quick_fix_tree_supports();
+        assert!(app.session.config.process.support.enabled);
+        assert_eq!(app.session.config.process.support.style, SupportStyle::Tree);
+
+        app.apply_quick_fix_brim();
+        assert!(app.session.config.process.brim_width_mm >= 5.0);
+    }
+
+    #[test]
+    fn ui_custom_preset_save_delete_and_dirty_guard() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        assert!(!app.project_dirty);
+
+        // Built-in cannot be overwritten via save_user_preset.
+        assert!(
+            app.save_user_preset(ProfileKind::Machine, "LayerCraft CORE One+ HF 0.4mm")
+                .is_err()
+        );
+
+        let saved = app
+            .save_user_preset(ProfileKind::Filament, "UI Custom Filament")
+            .unwrap();
+        assert_eq!(saved, "UI Custom Filament");
+        assert_eq!(
+            app.selected_filament_profile.as_deref(),
+            Some("UI Custom Filament")
+        );
+
+        app.delete_user_preset_action(ProfileKind::Filament, "UI Custom Filament");
+        assert!(app.last_error.is_none());
+        assert!(app.selected_filament_profile.is_none());
+
+        // Dirty plate intercepts destructive actions cleanly via non-blocking guard.
+        app.load_sample_with_mode(SampleShape::Cylinder, true);
+        assert!(app.project_dirty);
+        app.request_discard_or_run(PendingDiscardAction::LoadSample(SampleShape::Dome));
+        assert!(app.pending_discard_action.is_some());
+        assert_eq!(app.session.objects.len(), 2);
+
+        if let Some(pending) = app.pending_discard_action.take() {
+            app.execute_discard_action(pending);
+        }
+        assert_eq!(app.session.objects.len(), 1);
     }
 }

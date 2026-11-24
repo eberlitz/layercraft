@@ -319,6 +319,115 @@ impl ProfileLibrary {
         summary
     }
 
+    /// Look up a profile document by kind and exact (or trimmed) name.
+    pub fn get(&self, kind: ProfileKind, name: &str) -> Option<&ProfileDocument> {
+        let trimmed = name.trim();
+        self.docs
+            .get(&(kind, name.to_owned()))
+            .or_else(|| self.docs.get(&(kind, trimmed.to_owned())))
+    }
+
+    /// Return `true` when `(kind, name)` refers to a built-in LayerCraft preset.
+    pub fn is_builtin(&self, kind: ProfileKind, name: &str) -> bool {
+        self.get(kind, name).is_some_and(is_builtin_document)
+    }
+
+    /// Insert or replace a user-authored profile, refusing to overwrite built-ins.
+    pub fn upsert_user_profile(
+        &mut self,
+        mut doc: ProfileDocument,
+    ) -> Result<ProfileSummary, ProfileError> {
+        let trimmed = doc.name.trim().to_owned();
+        if trimmed.is_empty() {
+            return Err(ProfileError::InvalidValue {
+                key: "name".to_owned(),
+                reason: "profile name must not be empty".to_owned(),
+            });
+        }
+        if !supports_user_preset_kind(doc.kind) {
+            return Err(ProfileError::InvalidValue {
+                key: "type".to_owned(),
+                reason: "machine_model cannot be saved as a user preset".to_owned(),
+            });
+        }
+        if self.is_builtin(doc.kind, &trimmed) {
+            return Err(ProfileError::InvalidValue {
+                key: "name".to_owned(),
+                reason: format!("cannot overwrite built-in profile `{trimmed}`"),
+            });
+        }
+        doc.name = trimmed;
+        doc.instantiation = true;
+        doc.from = doc
+            .from
+            .take()
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("layercraft"))
+            .or_else(|| Some("user".to_owned()));
+        Ok(self.add_document(doc))
+    }
+
+    /// Remove a user-authored profile from the library, refusing to delete built-ins.
+    pub fn remove_user_profile(
+        &mut self,
+        kind: ProfileKind,
+        name: &str,
+    ) -> Result<(), ProfileError> {
+        let trimmed = name.trim();
+        let canonical = self
+            .get(kind, trimmed)
+            .map(|d| (d.name.clone(), is_builtin_document(d)))
+            .ok_or_else(|| ProfileError::NotFound {
+                kind,
+                name: trimmed.to_owned(),
+            })?;
+        if canonical.1 {
+            return Err(ProfileError::InvalidValue {
+                key: "name".to_owned(),
+                reason: format!("cannot delete built-in profile `{}`", canonical.0),
+            });
+        }
+        self.docs.remove(&(kind, canonical.0));
+        Ok(())
+    }
+
+    /// Serialize any stored profile back into canonical JSON format.
+    pub fn export_document_json(
+        &self,
+        kind: ProfileKind,
+        name: &str,
+        pretty: bool,
+    ) -> Result<String, ProfileError> {
+        let doc = self.get(kind, name).ok_or_else(|| ProfileError::NotFound {
+            kind,
+            name: name.trim().to_owned(),
+        })?;
+        let val = profile_document_to_json_value(doc);
+        if pretty {
+            serde_json::to_string_pretty(&val)
+        } else {
+            serde_json::to_string(&val)
+        }
+        .map_err(|e| ProfileError::JsonParse(e.to_string()))
+    }
+
+    /// Load user profile JSON files from a base directory without overwriting built-ins.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_user_profiles_from_dir(
+        &mut self,
+        base_dir: &std::path::Path,
+    ) -> Result<usize, ProfileError> {
+        let docs = load_user_profiles_from_dir(base_dir)?;
+        let mut loaded = 0usize;
+        for doc in docs {
+            if !self.is_builtin(doc.kind, &doc.name) {
+                self.upsert_user_profile(doc)?;
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
+    }
+
     /// Load one profile object, a JSON array of profiles, or `{"profiles": [...]}`.
     pub fn load_json_str(&mut self, json: &str) -> Result<Vec<ProfileSummary>, ProfileError> {
         self.load_json_str_with_fallback(json, None)
@@ -2690,6 +2799,1013 @@ fn apply_process_line_widths_pass2(
     Ok(())
 }
 
+fn supports_user_preset_kind(kind: ProfileKind) -> bool {
+    matches!(
+        kind,
+        ProfileKind::Machine | ProfileKind::Filament | ProfileKind::Process
+    )
+}
+
+fn is_builtin_document(doc: &ProfileDocument) -> bool {
+    doc.from
+        .as_deref()
+        .is_some_and(|f| f.trim().eq_ignore_ascii_case("layercraft"))
+}
+
+fn profile_kind_str(kind: ProfileKind) -> &'static str {
+    match kind {
+        ProfileKind::Machine => "machine",
+        ProfileKind::MachineModel => "machine_model",
+        ProfileKind::Filament => "filament",
+        ProfileKind::Process => "process",
+    }
+}
+
+/// Convert any [`ProfileDocument`] into a canonical JSON [`Value`].
+pub fn profile_document_to_json_value(doc: &ProfileDocument) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "type".to_owned(),
+        Value::String(profile_kind_str(doc.kind).to_owned()),
+    );
+    map.insert("name".to_owned(), Value::String(doc.name.clone()));
+    map.insert(
+        "instantiation".to_owned(),
+        Value::String(if doc.instantiation { "true" } else { "false" }.to_owned()),
+    );
+    if let Some(from) = &doc.from {
+        map.insert("from".to_owned(), Value::String(from.clone()));
+    }
+    if !doc.inherits.is_empty() {
+        map.insert(
+            "inherits".to_owned(),
+            Value::Array(doc.inherits.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    for (k, v) in &doc.settings {
+        map.insert(k.clone(), v.clone());
+    }
+    Value::Object(map)
+}
+
+/// Sanitize a human-readable profile name into a safe lowercase filename stem.
+pub fn sanitize_profile_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore && !out.is_empty() {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "profile".to_owned()
+    } else {
+        out
+    }
+}
+
+fn fmt_profile_f64(value: f64) -> String {
+    if !value.is_finite() || value == 0.0 {
+        return "0".to_owned();
+    }
+    let rounded = format!("{value:.6}");
+    let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-0" {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn fmt_profile_pct(ratio: f64) -> String {
+    format!("{}%", fmt_profile_f64(ratio * 100.0))
+}
+
+fn insert_str(settings: &mut BTreeMap<String, Value>, key: &str, val: impl Into<String>) {
+    settings.insert(key.to_owned(), Value::String(val.into()));
+}
+
+fn insert_bool_flag(settings: &mut BTreeMap<String, Value>, key: &str, flag: bool) {
+    insert_str(settings, key, if flag { "1" } else { "0" });
+}
+
+fn insert_scalar_arr(settings: &mut BTreeMap<String, Value>, key: &str, val: impl Into<String>) {
+    settings.insert(
+        key.to_owned(),
+        Value::Array(vec![Value::String(val.into())]),
+    );
+}
+
+fn populate_machine_profile_settings(
+    m: &crate::MachineConfig,
+    settings: &mut BTreeMap<String, Value>,
+) {
+    let flavor = match m.flavor {
+        GcodeFlavor::Klipper => "klipper",
+        GcodeFlavor::Marlin => "marlin",
+        GcodeFlavor::MarlinBuddy => "marlin_buddy",
+    };
+    insert_str(settings, "gcode_flavor", flavor);
+    if let Some(model) = &m.printer_model
+        && !model.trim().is_empty()
+    {
+        insert_str(settings, "printer_model", model.clone());
+    }
+    insert_scalar_arr(
+        settings,
+        "nozzle_diameter",
+        fmt_profile_f64(m.nozzle_diameter_mm),
+    );
+    insert_bool_flag(settings, "nozzle_high_flow", m.nozzle_high_flow);
+    let w = fmt_profile_f64(m.bed_width_mm);
+    let d = fmt_profile_f64(m.bed_depth_mm);
+    settings.insert(
+        "printable_area".to_owned(),
+        Value::Array(vec![
+            Value::String("0x0".to_owned()),
+            Value::String(format!("{w}x0")),
+            Value::String(format!("{w}x{d}")),
+            Value::String(format!("0x{d}")),
+        ]),
+    );
+    insert_str(
+        settings,
+        "printable_height",
+        fmt_profile_f64(m.bed_height_mm),
+    );
+    insert_bool_flag(settings, "use_relative_e_distances", m.relative_extrusion);
+    insert_bool_flag(settings, "remaining_times", m.emit_progress_m73);
+    insert_bool_flag(settings, "binary_gcode", m.binary_gcode);
+    if !m.thumbnails.is_empty() {
+        settings.insert(
+            "thumbnails".to_owned(),
+            Value::Array(
+                m.thumbnails
+                    .iter()
+                    .map(|t| {
+                        let fmt = match t.format {
+                            ThumbnailFormat::Png => "PNG",
+                            ThumbnailFormat::Qoi => "QOI",
+                        };
+                        Value::String(format!("{}x{}/{}", t.width, t.height, fmt))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    insert_scalar_arr(
+        settings,
+        "retraction_length",
+        fmt_profile_f64(m.retraction_length_mm),
+    );
+    insert_scalar_arr(
+        settings,
+        "retraction_speed",
+        fmt_profile_f64(m.retraction_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "travel_speed",
+        fmt_profile_f64(m.travel_speed_mm_s),
+    );
+    insert_scalar_arr(settings, "z_hop", fmt_profile_f64(m.z_hop_mm));
+    insert_scalar_arr(settings, "z_hop_speed", fmt_profile_f64(m.z_hop_speed_mm_s));
+    insert_bool_flag(settings, "wipe", m.wipe_on_retract);
+    insert_scalar_arr(
+        settings,
+        "wipe_distance",
+        fmt_profile_f64(m.wipe_distance_mm),
+    );
+    insert_scalar_arr(
+        settings,
+        "retraction_minimum_travel",
+        fmt_profile_f64(m.min_travel_for_retract_mm),
+    );
+    insert_str(
+        settings,
+        "machine_start_gcode",
+        m.start_gcode.as_deref().unwrap_or(""),
+    );
+    insert_str(
+        settings,
+        "machine_end_gcode",
+        m.end_gcode.as_deref().unwrap_or(""),
+    );
+    insert_str(
+        settings,
+        "layer_change_gcode",
+        m.layer_change_gcode.as_deref().unwrap_or(""),
+    );
+}
+
+fn populate_filament_profile_settings(
+    f: &crate::FilamentConfig,
+    settings: &mut BTreeMap<String, Value>,
+) {
+    if let Some(ft) = &f.filament_type
+        && !ft.trim().is_empty()
+    {
+        insert_scalar_arr(settings, "filament_type", ft.clone());
+    }
+    insert_scalar_arr(
+        settings,
+        "filament_diameter",
+        fmt_profile_f64(f.diameter_mm),
+    );
+    insert_scalar_arr(
+        settings,
+        "filament_density",
+        fmt_profile_f64(f.density_g_cm3),
+    );
+    insert_scalar_arr(settings, "nozzle_temperature", f.nozzle_temp_c.to_string());
+    if let Some(t) = f.first_layer_nozzle_temp_c {
+        insert_scalar_arr(settings, "nozzle_temperature_initial_layer", t.to_string());
+    }
+    insert_scalar_arr(settings, "hot_plate_temp", f.bed_temp_c.to_string());
+    if let Some(t) = f.first_layer_bed_temp_c {
+        insert_scalar_arr(settings, "hot_plate_temp_initial_layer", t.to_string());
+    }
+    if let Some(t) = f.chamber_temp_c {
+        insert_scalar_arr(settings, "chamber_temperature", t.to_string());
+    }
+    insert_bool_flag(settings, "wait_for_chamber_temp", f.wait_for_chamber_temp);
+    if let Some(pa) = f.pressure_advance {
+        insert_bool_flag(settings, "enable_pressure_advance", true);
+        insert_scalar_arr(settings, "pressure_advance", fmt_profile_f64(pa));
+    } else {
+        insert_bool_flag(settings, "enable_pressure_advance", false);
+    }
+    insert_scalar_arr(
+        settings,
+        "filament_flow_ratio",
+        fmt_profile_f64(f.flow_ratio),
+    );
+    insert_scalar_arr(
+        settings,
+        "filament_max_volumetric_speed",
+        fmt_profile_f64(f.max_volumetric_speed_mm3_s),
+    );
+    insert_scalar_arr(settings, "fan_min_speed", f.fan_min_percent.to_string());
+    insert_scalar_arr(settings, "fan_max_speed", f.fan_max_percent.to_string());
+    insert_scalar_arr(
+        settings,
+        "close_fan_the_first_x_layers",
+        f.disable_fan_first_layers.to_string(),
+    );
+    insert_scalar_arr(
+        settings,
+        "full_fan_speed_layer",
+        f.full_fan_speed_layer.to_string(),
+    );
+    insert_bool_flag(
+        settings,
+        "slow_down_for_layer_cooling",
+        f.slow_down_layer_time_s > 0.0,
+    );
+    insert_scalar_arr(
+        settings,
+        "slow_down_layer_time",
+        fmt_profile_f64(f.slow_down_layer_time_s),
+    );
+    insert_scalar_arr(
+        settings,
+        "slow_down_min_speed",
+        fmt_profile_f64(f.slow_down_min_speed_mm_s),
+    );
+    insert_scalar_arr(
+        settings,
+        "overhang_fan_speed",
+        f.bridge_fan_percent.to_string(),
+    );
+}
+
+fn surface_pattern_str(pat: SurfacePattern) -> &'static str {
+    match pat {
+        SurfacePattern::Monotonic => "monotonic",
+        SurfacePattern::Rectilinear => "rectilinear",
+        SurfacePattern::Concentric => "concentric",
+    }
+}
+
+fn populate_process_profile_settings(
+    p: &crate::ProcessConfig,
+    settings: &mut BTreeMap<String, Value>,
+) {
+    insert_str(settings, "layer_height", fmt_profile_f64(p.layer_height_mm));
+    insert_str(
+        settings,
+        "initial_layer_print_height",
+        fmt_profile_f64(p.first_layer_height_mm),
+    );
+    insert_bool_flag(
+        settings,
+        "enable_adaptive_layer_height",
+        p.adaptive_layer_height.enabled,
+    );
+    insert_str(
+        settings,
+        "min_layer_height",
+        p.adaptive_layer_height
+            .min_layer_height_mm
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "max_layer_height",
+        p.adaptive_layer_height
+            .max_layer_height_mm
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "adaptive_layer_height_quality",
+        fmt_profile_pct(p.adaptive_layer_height.quality),
+    );
+    insert_str(
+        settings,
+        "adaptive_layer_height_smooth_radius",
+        fmt_profile_f64(p.adaptive_layer_height.smooth_radius_mm),
+    );
+    insert_str(
+        settings,
+        "adaptive_layer_height_max_step_ratio",
+        fmt_profile_f64(p.adaptive_layer_height.max_step_ratio),
+    );
+    insert_str(settings, "wall_loops", p.wall_loops.to_string());
+    insert_str(
+        settings,
+        "wall_sequence",
+        match p.wall_order {
+            WallOrder::InnerOuter => "inner_outer",
+            WallOrder::OuterInner => "outer_inner",
+            WallOrder::InnerOuterInner => "inner_outer_inner",
+        },
+    );
+    insert_str(
+        settings,
+        "wall_generator",
+        match p.wall_generator {
+            WallGenerator::Classic => "classic",
+            WallGenerator::Arachne => "arachne",
+        },
+    );
+    insert_str(
+        settings,
+        "min_bead_width",
+        fmt_profile_pct(p.arachne.min_bead_width_ratio),
+    );
+    insert_str(
+        settings,
+        "min_feature_size",
+        fmt_profile_pct(p.arachne.min_feature_size_ratio),
+    );
+    insert_str(
+        settings,
+        "wall_distribution_count",
+        p.arachne.wall_distribution_count.to_string(),
+    );
+    insert_str(
+        settings,
+        "wall_transition_length",
+        fmt_profile_pct(p.arachne.transition_length_ratio),
+    );
+    insert_str(
+        settings,
+        "wall_transition_angle",
+        fmt_profile_f64(p.arachne.transition_threshold_angle_deg),
+    );
+    insert_str(
+        settings,
+        "wall_transition_filter_deviation",
+        fmt_profile_pct(p.arachne.transition_filter_deviation_ratio),
+    );
+    insert_str(settings, "top_shell_layers", p.top_shell_layers.to_string());
+    insert_str(
+        settings,
+        "bottom_shell_layers",
+        p.bottom_shell_layers.to_string(),
+    );
+    insert_str(
+        settings,
+        "top_shell_thickness",
+        p.top_shell_thickness_mm
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "bottom_shell_thickness",
+        p.bottom_shell_thickness_mm
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "top_surface_pattern",
+        surface_pattern_str(p.top_surface_pattern),
+    );
+    insert_str(
+        settings,
+        "bottom_surface_pattern",
+        surface_pattern_str(p.bottom_surface_pattern),
+    );
+    insert_str(
+        settings,
+        "elefant_foot_compensation",
+        fmt_profile_f64(p.elephant_foot_compensation_mm),
+    );
+    insert_str(
+        settings,
+        "xy_contour_compensation",
+        fmt_profile_f64(p.xy_contour_compensation_mm),
+    );
+    insert_str(
+        settings,
+        "xy_hole_compensation",
+        fmt_profile_f64(p.xy_hole_compensation_mm),
+    );
+    insert_bool_flag(settings, "avoid_crossing_wall", p.avoid_crossing_perimeters);
+    insert_str(
+        settings,
+        "avoid_crossing_wall_max_detour",
+        fmt_profile_f64(p.avoid_crossing_perimeters_max_detour_mm),
+    );
+    insert_bool_flag(
+        settings,
+        "reduce_infill_retraction",
+        p.reduce_infill_retraction,
+    );
+    insert_str(
+        settings,
+        "sparse_infill_density",
+        fmt_profile_pct(p.sparse_infill_density),
+    );
+    insert_str(
+        settings,
+        "sparse_infill_pattern",
+        match p.sparse_infill_pattern {
+            InfillPattern::Rectilinear => "rectilinear",
+            InfillPattern::Grid => "grid",
+            InfillPattern::Gyroid => "gyroid",
+            InfillPattern::Cubic => "cubic",
+        },
+    );
+    insert_str(
+        settings,
+        "outer_wall_line_width",
+        fmt_profile_f64(p.outer_wall_width_mm),
+    );
+    insert_str(
+        settings,
+        "inner_wall_line_width",
+        fmt_profile_f64(p.inner_wall_width_mm),
+    );
+    insert_str(
+        settings,
+        "internal_solid_infill_line_width",
+        fmt_profile_f64(p.solid_infill_width_mm),
+    );
+    insert_str(
+        settings,
+        "sparse_infill_line_width",
+        fmt_profile_f64(p.sparse_infill_width_mm),
+    );
+    insert_str(
+        settings,
+        "outer_wall_speed",
+        fmt_profile_f64(p.outer_wall_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "inner_wall_speed",
+        fmt_profile_f64(p.inner_wall_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "sparse_infill_speed",
+        fmt_profile_f64(p.infill_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "initial_layer_speed",
+        fmt_profile_f64(p.first_layer_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "initial_layer_infill_speed",
+        p.first_layer_infill_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "top_surface_speed",
+        p.top_surface_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "internal_solid_infill_speed",
+        p.solid_infill_speed_mm_s
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "seam_position",
+        match p.seam_position {
+            SeamPosition::Aligned => "aligned",
+            SeamPosition::Back => "back",
+            SeamPosition::Nearest => "nearest",
+            SeamPosition::Random => "random",
+        },
+    );
+    insert_bool_flag(settings, "detect_bridges", p.detect_bridges);
+    insert_str(
+        settings,
+        "bridge_speed",
+        fmt_profile_f64(p.bridge_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "bridge_flow",
+        fmt_profile_f64(p.bridge_flow_ratio),
+    );
+    insert_bool_flag(settings, "detect_overhang_wall", p.detect_overhangs);
+    insert_str(
+        settings,
+        "overhang_threshold_deg",
+        fmt_profile_f64(p.overhang_threshold_deg),
+    );
+    insert_str(
+        settings,
+        "overhang_3_4_speed",
+        fmt_profile_f64(p.overhang_speed_mm_s),
+    );
+    insert_bool_flag(settings, "monotonic_solid_infill", p.monotonic_solid_infill);
+    insert_str(
+        settings,
+        "default_acceleration",
+        p.default_acceleration_mm_s2
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "outer_wall_acceleration",
+        p.outer_wall_acceleration_mm_s2
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "inner_wall_acceleration",
+        p.inner_wall_acceleration_mm_s2
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "initial_layer_acceleration",
+        p.first_layer_acceleration_mm_s2
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "travel_acceleration",
+        p.travel_acceleration_mm_s2
+            .map_or_else(|| "0".to_owned(), fmt_profile_f64),
+    );
+    insert_str(
+        settings,
+        "ironing_type",
+        match p.ironing.mode {
+            IroningType::Off => "off",
+            IroningType::TopmostSurface => "topmost_surface",
+            IroningType::AllTopSurfaces => "all_top_surfaces",
+        },
+    );
+    insert_str(
+        settings,
+        "ironing_flow",
+        fmt_profile_pct(p.ironing.flow_ratio),
+    );
+    insert_str(
+        settings,
+        "ironing_spacing",
+        fmt_profile_f64(p.ironing.line_spacing_mm),
+    );
+    insert_str(
+        settings,
+        "ironing_inset",
+        fmt_profile_f64(p.ironing.inset_mm),
+    );
+    insert_str(
+        settings,
+        "ironing_speed",
+        fmt_profile_f64(p.ironing.speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "ironing_angle",
+        fmt_profile_f64(p.ironing.angle_offset_deg),
+    );
+    insert_str(
+        settings,
+        "seam_slope_type",
+        if p.scarf_seam.enabled {
+            "contour"
+        } else {
+            "none"
+        },
+    );
+    insert_str(
+        settings,
+        "seam_slope_start_height",
+        fmt_profile_pct(p.scarf_seam.start_height_ratio),
+    );
+    insert_str(
+        settings,
+        "seam_slope_min_length",
+        fmt_profile_f64(p.scarf_seam.min_length_mm),
+    );
+    insert_str(
+        settings,
+        "seam_slope_length",
+        fmt_profile_f64(p.scarf_seam.length_mm),
+    );
+    insert_str(settings, "seam_slope_steps", p.scarf_seam.steps.to_string());
+    insert_bool_flag(settings, "seam_slope_entire_loop", p.scarf_seam.entire_loop);
+    insert_bool_flag(settings, "enable_arc_fitting", p.arc_fitting);
+    insert_str(
+        settings,
+        "arc_fitting_tolerance",
+        fmt_profile_f64(p.arc_tolerance_mm),
+    );
+    insert_str(settings, "skirt_loops", p.skirt_loops.to_string());
+    insert_str(
+        settings,
+        "brim_type",
+        if p.brim_width_mm > 0.0 {
+            "outer_only"
+        } else {
+            "no_brim"
+        },
+    );
+    insert_str(settings, "brim_width", fmt_profile_f64(p.brim_width_mm));
+    insert_bool_flag(settings, "enable_support", p.support.enabled);
+    insert_str(
+        settings,
+        "support_style",
+        match p.support.style {
+            SupportStyle::Grid => "grid",
+            SupportStyle::Snug => "snug",
+            SupportStyle::Tree => "tree",
+        },
+    );
+    insert_bool_flag(
+        settings,
+        "support_on_build_plate_only",
+        p.support.on_build_plate_only,
+    );
+    insert_str(
+        settings,
+        "support_threshold_angle",
+        fmt_profile_f64(p.support.threshold_angle_deg),
+    );
+    insert_str(
+        settings,
+        "support_top_z_distance",
+        fmt_profile_f64(p.support.top_z_distance_mm),
+    );
+    insert_str(
+        settings,
+        "support_bottom_z_distance",
+        fmt_profile_f64(p.support.bottom_z_distance_mm),
+    );
+    insert_str(
+        settings,
+        "support_object_xy_distance",
+        fmt_profile_f64(p.support.xy_distance_mm),
+    );
+    insert_str(
+        settings,
+        "support_base_pattern_spacing",
+        fmt_profile_f64(p.support.base_pattern_spacing_mm),
+    );
+    insert_str(
+        settings,
+        "support_interface_top_layers",
+        p.support.interface_layers.to_string(),
+    );
+    insert_str(
+        settings,
+        "support_interface_spacing",
+        fmt_profile_f64(p.support.interface_spacing_mm),
+    );
+    insert_str(
+        settings,
+        "support_line_width",
+        fmt_profile_f64(p.support.line_width_mm),
+    );
+    insert_str(
+        settings,
+        "support_speed",
+        fmt_profile_f64(p.support.speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "support_interface_speed",
+        fmt_profile_f64(p.support.interface_speed_mm_s),
+    );
+    insert_str(
+        settings,
+        "tree_support_branch_angle",
+        fmt_profile_f64(p.support.tree.max_branch_angle_deg),
+    );
+    insert_str(
+        settings,
+        "tree_support_tip_diameter",
+        fmt_profile_f64(p.support.tree.tip_diameter_mm),
+    );
+    insert_str(
+        settings,
+        "tree_support_branch_diameter",
+        fmt_profile_f64(p.support.tree.branch_diameter_mm),
+    );
+    insert_str(
+        settings,
+        "tree_support_branch_diameter_angle",
+        fmt_profile_f64(p.support.tree.branch_diameter_angle_deg),
+    );
+    insert_str(
+        settings,
+        "tree_support_branch_distance",
+        fmt_profile_f64(p.support.tree.branch_distance_mm),
+    );
+    insert_str(
+        settings,
+        "tree_support_wall_count",
+        p.support.tree.branch_wall_loops.to_string(),
+    );
+    insert_str(
+        settings,
+        "tree_support_brim_width",
+        fmt_profile_f64(p.support.tree.trunk_base_flare_mm),
+    );
+}
+
+/// Snapshot the relevant subset of `config` into a portable user [`ProfileDocument`].
+pub fn profile_document_from_config(
+    kind: ProfileKind,
+    name: impl Into<String>,
+    config: &PrintConfig,
+) -> Result<ProfileDocument, ProfileError> {
+    let raw_name = name.into();
+    let trimmed = raw_name.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(ProfileError::InvalidValue {
+            key: "name".to_owned(),
+            reason: "profile name must not be empty".to_owned(),
+        });
+    }
+    if !supports_user_preset_kind(kind) {
+        return Err(ProfileError::InvalidValue {
+            key: "type".to_owned(),
+            reason: "machine_model cannot be snapshotted from PrintConfig".to_owned(),
+        });
+    }
+    config.validate().map_err(|e| ProfileError::InvalidValue {
+        key: "config".to_owned(),
+        reason: e.to_string(),
+    })?;
+
+    let mut settings = BTreeMap::new();
+    match kind {
+        ProfileKind::Machine => populate_machine_profile_settings(&config.machine, &mut settings),
+        ProfileKind::Filament => {
+            populate_filament_profile_settings(&config.filament, &mut settings);
+        }
+        ProfileKind::Process => populate_process_profile_settings(&config.process, &mut settings),
+        ProfileKind::MachineModel => {}
+    }
+
+    Ok(ProfileDocument {
+        name: trimmed,
+        kind,
+        instantiation: true,
+        from: Some("user".to_owned()),
+        inherits: Vec::new(),
+        settings,
+    })
+}
+
+/// Default native user profile directory (`$XDG_CONFIG_HOME/layercraft/profiles` or `~/.config/layercraft/profiles`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_user_profiles_dir() -> Option<std::path::PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(
+            std::path::PathBuf::from(xdg)
+                .join("layercraft")
+                .join("profiles"),
+        );
+    }
+    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| {
+        std::path::PathBuf::from(h)
+            .join(".config")
+            .join("layercraft")
+            .join("profiles")
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_sorted_profile_files(
+    dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, ProfileError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| ProfileError::Io {
+        path: dir.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut paths = Vec::new();
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| ProfileError::Io {
+            path: dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("json"))
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_matching_profile_file(
+    dir: &std::path::Path,
+    kind: ProfileKind,
+    target_name: &str,
+) -> Result<Option<std::path::PathBuf>, ProfileError> {
+    let trimmed = target_name.trim();
+    for path in collect_sorted_profile_files(dir)? {
+        let raw = std::fs::read_to_string(&path).map_err(|e| ProfileError::Io {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let stem = path.file_stem().and_then(|s| s.to_str());
+        if let Ok(val) = serde_json::from_str::<Value>(&raw)
+            && let Ok(doc) = ProfileDocument::from_json_value(val, stem)
+            && doc.kind == kind
+            && doc.name.trim() == trimmed
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Save a user profile JSON document under `base_dir/{machine,filament,process}/<slug>.json`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_user_profile_to_dir(
+    base_dir: &std::path::Path,
+    doc: &ProfileDocument,
+) -> Result<std::path::PathBuf, ProfileError> {
+    if !supports_user_preset_kind(doc.kind) {
+        return Err(ProfileError::InvalidValue {
+            key: "type".to_owned(),
+            reason: "machine_model cannot be saved as a user preset".to_owned(),
+        });
+    }
+    let trimmed = doc.name.trim();
+    if trimmed.is_empty() {
+        return Err(ProfileError::InvalidValue {
+            key: "name".to_owned(),
+            reason: "profile name must not be empty".to_owned(),
+        });
+    }
+    if is_builtin_document(doc) {
+        return Err(ProfileError::InvalidValue {
+            key: "from".to_owned(),
+            reason: format!("cannot save built-in profile `{trimmed}` as a user file"),
+        });
+    }
+
+    let kind_dir = base_dir.join(profile_kind_str(doc.kind));
+    std::fs::create_dir_all(&kind_dir).map_err(|e| ProfileError::Io {
+        path: kind_dir.display().to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let target_path =
+        if let Some(existing) = find_matching_profile_file(&kind_dir, doc.kind, trimmed)? {
+            existing
+        } else {
+            let slug = sanitize_profile_filename(trimmed);
+            let candidate = kind_dir.join(format!("{slug}.json"));
+            if !candidate.exists() {
+                candidate
+            } else {
+                let mut chosen = None;
+                for idx in 2..=1000u32 {
+                    let p = kind_dir.join(format!("{slug}-{idx}.json"));
+                    if !p.exists() {
+                        chosen = Some(p);
+                        break;
+                    }
+                }
+                chosen.ok_or_else(|| ProfileError::Io {
+                    path: candidate.display().to_string(),
+                    reason: "unable to allocate unique profile filename".to_owned(),
+                })?
+            }
+        };
+
+    let mut clean_doc = doc.clone();
+    clean_doc.name = trimmed.to_owned();
+    clean_doc.instantiation = true;
+    clean_doc.from = clean_doc
+        .from
+        .filter(|f| !f.trim().is_empty() && !f.trim().eq_ignore_ascii_case("layercraft"))
+        .or_else(|| Some("user".to_owned()));
+
+    let json = serde_json::to_string_pretty(&profile_document_to_json_value(&clean_doc))
+        .map_err(|e| ProfileError::JsonParse(e.to_string()))?;
+    std::fs::write(&target_path, json).map_err(|e| ProfileError::Io {
+        path: target_path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(target_path)
+}
+
+/// Delete a user profile JSON file from `base_dir/{machine,filament,process}/`.
+///
+/// Returns `Ok(true)` if a matching file was removed, or `Ok(false)` if none existed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_user_profile_from_dir(
+    base_dir: &std::path::Path,
+    kind: ProfileKind,
+    name: &str,
+) -> Result<bool, ProfileError> {
+    if !supports_user_preset_kind(kind) {
+        return Ok(false);
+    }
+    let kind_dir = base_dir.join(profile_kind_str(kind));
+    let Some(path) = find_matching_profile_file(&kind_dir, kind, name)? else {
+        return Ok(false);
+    };
+    std::fs::remove_file(&path).map_err(|e| ProfileError::Io {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(true)
+}
+
+/// Load all user profile JSON files found in `base_dir/{machine,filament,process}/`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_user_profiles_from_dir(
+    base_dir: &std::path::Path,
+) -> Result<Vec<ProfileDocument>, ProfileError> {
+    if !base_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut docs = Vec::new();
+    for kind in [
+        ProfileKind::Machine,
+        ProfileKind::Filament,
+        ProfileKind::Process,
+    ] {
+        let kind_dir = base_dir.join(profile_kind_str(kind));
+        for path in collect_sorted_profile_files(&kind_dir)? {
+            let raw = std::fs::read_to_string(&path).map_err(|e| ProfileError::Io {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            let val: Value = serde_json::from_str(&raw)
+                .map_err(|e| ProfileError::JsonParse(format!("{}: {e}", path.display())))?;
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            let mut doc = ProfileDocument::from_json_value(val, stem)?;
+            doc.instantiation = true;
+            doc.from = doc
+                .from
+                .filter(|f| !f.trim().is_empty() && !f.trim().eq_ignore_ascii_case("layercraft"))
+                .or_else(|| Some("user".to_owned()));
+            docs.push(doc);
+        }
+    }
+    Ok(docs)
+}
+
 fn doc_from_parts(
     name: &str,
     kind: ProfileKind,
@@ -2770,6 +3886,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "printable_area": ["0x0", "250x0", "250x220", "0x220"],
                 "printable_height": "270",
                 "use_relative_e_distances": "1",
+                "binary_gcode": "1",
                 "retraction_length": ["0.7"],
                 "retraction_speed": ["35"],
                 "z_hop": ["0.2"],
@@ -2829,6 +3946,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "printable_area": ["0x0", "250x0", "250x220", "0x220"],
                 "printable_height": "270",
                 "use_relative_e_distances": "1",
+                "binary_gcode": "1",
                 "retraction_length": ["0.7"],
                 "retraction_speed": ["35"],
                 "z_hop": ["0.2"],
@@ -2989,6 +4107,77 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "close_fan_the_first_x_layers": ["3"],
                 "full_fan_speed_layer": ["6"],
                 "overhang_fan_speed": ["40"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft Generic ASA",
+            ProfileKind::Filament,
+            true,
+            vec!["lc_filament_base".to_owned()],
+            json!({
+                "filament_type": ["ASA"],
+                "filament_density": ["1.07"],
+                "nozzle_temperature": ["260"],
+                "nozzle_temperature_initial_layer": ["260"],
+                "hot_plate_temp": ["110"],
+                "hot_plate_temp_initial_layer": ["110"],
+                "chamber_temperature": ["55"],
+                "wait_for_chamber_temp": "1",
+                "enable_pressure_advance": "1",
+                "pressure_advance": ["0.032"],
+                "filament_flow_ratio": ["0.96"],
+                "filament_max_volumetric_speed": ["16"],
+                "fan_min_speed": ["0"],
+                "fan_max_speed": ["30"],
+                "close_fan_the_first_x_layers": ["3"],
+                "full_fan_speed_layer": ["6"],
+                "overhang_fan_speed": ["45"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft ASA (0.4mm HF Nozzle)",
+            ProfileKind::Filament,
+            true,
+            vec!["LayerCraft Generic ASA".to_owned()],
+            json!({
+                "filament_max_volumetric_speed": ["20"],
+                "pressure_advance": ["0.03"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft Generic TPU 95A",
+            ProfileKind::Filament,
+            true,
+            vec!["lc_filament_base".to_owned()],
+            json!({
+                "filament_type": ["TPU"],
+                "filament_density": ["1.21"],
+                "nozzle_temperature": ["230"],
+                "nozzle_temperature_initial_layer": ["235"],
+                "hot_plate_temp": ["50"],
+                "hot_plate_temp_initial_layer": ["55"],
+                "chamber_temperature": ["0"],
+                "wait_for_chamber_temp": "0",
+                "enable_pressure_advance": "1",
+                "pressure_advance": ["0.08"],
+                "filament_flow_ratio": ["1.0"],
+                "filament_max_volumetric_speed": ["4"],
+                "fan_min_speed": ["60"],
+                "fan_max_speed": ["100"],
+                "close_fan_the_first_x_layers": ["2"],
+                "full_fan_speed_layer": ["4"],
+                "slow_down_layer_time": ["6"],
+                "overhang_fan_speed": ["100"]
+            }),
+        ),
+        doc_from_parts(
+            "LayerCraft TPU 95A (0.4mm HF Nozzle)",
+            ProfileKind::Filament,
+            true,
+            vec!["LayerCraft Generic TPU 95A".to_owned()],
+            json!({
+                "filament_max_volumetric_speed": ["5"],
+                "pressure_advance": ["0.075"]
             }),
         ),
         // Abstract Process Base -> Standard 0.20, Quality 0.16, Draft 0.28, plus 0.2mm Nozzle Fine / Ultra-Fine
@@ -3173,7 +4362,7 @@ mod tests {
         let processes = lib.list(Some(ProfileKind::Process), false);
 
         assert_eq!(machines.len(), 4);
-        assert_eq!(filaments.len(), 6);
+        assert_eq!(filaments.len(), 10);
         assert_eq!(processes.len(), 6);
 
         // Abstract bases excluded when include_abstract=false, included when true.
@@ -3857,5 +5046,191 @@ mod tests {
         assert!(res.warnings.is_empty(), "{:?}", res.warnings);
         assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
         assert!(res.config.machine.binary_gcode);
+    }
+
+    #[test]
+    fn core_one_hf_defaults_enable_bgcode_and_asa_tpu_presets_map_cleanly() {
+        let lib = ProfileLibrary::with_builtin_presets();
+        for machine in [
+            "LayerCraft CORE One+ HF 0.4mm",
+            "LayerCraft CORE One+ HF 0.2mm",
+        ] {
+            let m_res = lib
+                .build_print_config(&PrintConfig::default(), Some(machine), None, None)
+                .unwrap();
+            assert!(m_res.warnings.is_empty(), "{machine}: {:?}", m_res.warnings);
+            assert!(
+                m_res.unmapped_keys.is_empty(),
+                "{machine}: {:?}",
+                m_res.unmapped_keys
+            );
+            assert!(m_res.config.machine.binary_gcode, "{machine}");
+        }
+
+        let asa = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft ASA (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap();
+        assert!(asa.config.validate().is_ok());
+        assert!(asa.warnings.is_empty(), "{:?}", asa.warnings);
+        assert!(asa.unmapped_keys.is_empty(), "{:?}", asa.unmapped_keys);
+        assert_eq!(asa.config.filament.filament_type.as_deref(), Some("ASA"));
+        assert_eq!(asa.config.filament.chamber_temp_c, Some(55));
+        assert!(asa.config.filament.wait_for_chamber_temp);
+        assert!((asa.config.filament.max_volumetric_speed_mm3_s - 20.0).abs() < 1e-9);
+
+        let tpu = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft TPU 95A (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap();
+        assert!(tpu.config.validate().is_ok());
+        assert!(tpu.warnings.is_empty(), "{:?}", tpu.warnings);
+        assert!(tpu.unmapped_keys.is_empty(), "{:?}", tpu.unmapped_keys);
+        assert_eq!(tpu.config.filament.filament_type.as_deref(), Some("TPU"));
+        assert_eq!(tpu.config.filament.nozzle_temp_c, 230);
+        assert!((tpu.config.filament.max_volumetric_speed_mm3_s - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profile_document_from_config_roundtrips_with_zero_warnings() {
+        let mut cfg = PrintConfig::default();
+        cfg.machine.flavor = GcodeFlavor::MarlinBuddy;
+        cfg.machine.nozzle_diameter_mm = 0.4;
+        cfg.machine.nozzle_high_flow = true;
+        cfg.machine.printer_model = Some("COREONE".to_owned());
+        cfg.machine.bed_width_mm = 250.0;
+        cfg.machine.bed_depth_mm = 220.0;
+        cfg.machine.bed_height_mm = 270.0;
+        cfg.machine.binary_gcode = true;
+        cfg.machine.thumbnails = vec![ThumbnailSize::png(160, 120), ThumbnailSize::qoi(313, 173)];
+        cfg.machine.start_gcode = Some("M17\nG28".to_owned());
+        cfg.filament.filament_type = Some("ASA".to_owned());
+        cfg.filament.nozzle_temp_c = 260;
+        cfg.filament.first_layer_nozzle_temp_c = Some(265);
+        cfg.filament.bed_temp_c = 105;
+        cfg.filament.chamber_temp_c = Some(55);
+        cfg.filament.wait_for_chamber_temp = true;
+        cfg.filament.pressure_advance = Some(0.032);
+        cfg.process.layer_height_mm = 0.16;
+        cfg.process.wall_generator = WallGenerator::Arachne;
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Tree;
+        cfg.process.ironing.mode = IroningType::TopmostSurface;
+        cfg.process.scarf_seam.enabled = true;
+        cfg.process.adaptive_layer_height.enabled = true;
+        cfg.process.adaptive_layer_height.min_layer_height_mm = Some(0.08);
+        cfg.process.adaptive_layer_height.max_layer_height_mm = Some(0.24);
+        cfg.validate().unwrap();
+
+        let mut lib = ProfileLibrary::with_builtin_presets();
+        for (kind, name) in [
+            (ProfileKind::Machine, "User Machine"),
+            (ProfileKind::Filament, "User Filament"),
+            (ProfileKind::Process, "User Process"),
+        ] {
+            let doc = profile_document_from_config(kind, name, &cfg).unwrap();
+            let sum = lib.upsert_user_profile(doc).unwrap();
+            assert_eq!(sum.from.as_deref(), Some("user"));
+            assert!(!lib.is_builtin(kind, name));
+            let exported = lib.export_document_json(kind, name, true).unwrap();
+            let mut reload_lib = ProfileLibrary::new();
+            reload_lib.load_json_str(&exported).unwrap();
+            assert!(reload_lib.get(kind, name).is_some());
+        }
+
+        let res = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("User Machine"),
+                Some("User Filament"),
+                Some("User Process"),
+            )
+            .unwrap();
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert_eq!(res.config.machine, cfg.machine);
+        assert_eq!(res.config.filament, cfg.filament);
+        assert_eq!(
+            res.config.process.layer_height_mm,
+            cfg.process.layer_height_mm
+        );
+        assert_eq!(
+            res.config.process.wall_generator,
+            cfg.process.wall_generator
+        );
+        assert_eq!(res.config.process.support.style, cfg.process.support.style);
+        assert_eq!(res.config.process.ironing.mode, cfg.process.ironing.mode);
+        assert_eq!(
+            res.config.process.scarf_seam.enabled,
+            cfg.process.scarf_seam.enabled
+        );
+        assert_eq!(
+            res.config.process.adaptive_layer_height,
+            cfg.process.adaptive_layer_height
+        );
+    }
+
+    #[test]
+    fn user_profile_crud_protects_builtins_and_persists_to_dir() {
+        let mut lib = ProfileLibrary::with_builtin_presets();
+        assert!(lib.is_builtin(ProfileKind::Machine, "LayerCraft CORE One+ HF 0.4mm"));
+
+        let mut bad_doc = profile_document_from_config(
+            ProfileKind::Machine,
+            "LayerCraft CORE One+ HF 0.4mm",
+            &PrintConfig::default(),
+        )
+        .unwrap();
+        assert!(lib.upsert_user_profile(bad_doc.clone()).is_err());
+        assert!(
+            lib.remove_user_profile(ProfileKind::Machine, "LayerCraft CORE One+ HF 0.4mm")
+                .is_err()
+        );
+
+        bad_doc.name = "My Custom CORE One+".to_owned();
+        lib.upsert_user_profile(bad_doc.clone()).unwrap();
+        assert!(!lib.is_builtin(ProfileKind::Machine, "My Custom CORE One+"));
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("layercraft_profile_test_{unique}"));
+        let saved_path = save_user_profile_to_dir(&temp_dir, &bad_doc).unwrap();
+        assert!(saved_path.exists());
+
+        let mut loaded_lib = ProfileLibrary::with_builtin_presets();
+        let count = loaded_lib.load_user_profiles_from_dir(&temp_dir).unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            loaded_lib
+                .get(ProfileKind::Machine, "My Custom CORE One+")
+                .is_some()
+        );
+        assert!(!loaded_lib.is_builtin(ProfileKind::Machine, "My Custom CORE One+"));
+
+        assert!(
+            delete_user_profile_from_dir(&temp_dir, ProfileKind::Machine, "My Custom CORE One+")
+                .unwrap()
+        );
+        assert!(!saved_path.exists());
+        loaded_lib
+            .remove_user_profile(ProfileKind::Machine, "My Custom CORE One+")
+            .unwrap();
+        assert!(
+            loaded_lib
+                .get(ProfileKind::Machine, "My Custom CORE One+")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

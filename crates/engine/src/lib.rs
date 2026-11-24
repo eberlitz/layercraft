@@ -7,8 +7,13 @@ use base64::Engine as _;
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_config::ProfileDirLoadReport;
 use layercraft_config::{
-    ActiveProfiles, ConfigError, ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult,
-    ProfileError, ProfileKind, ProfileLibrary, ProfileSummary, ResolvedProfile,
+    ActiveProfiles, ConfigError, MachineConfig, ModifierOverrides, ModifierRole, PrintConfig,
+    ProfileApplyResult, ProfileError, ProfileKind, ProfileLibrary, ProfileSummary, ResolvedProfile,
+    profile_document_from_config,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use layercraft_config::{
+    default_user_profiles_dir, delete_user_profile_from_dir, save_user_profile_to_dir,
 };
 pub use layercraft_gcode::{BgcodeCompression, decode_bgcode, encode_bgcode, is_bgcode};
 use layercraft_gcode::{
@@ -276,6 +281,81 @@ pub struct HistoryActionResult {
     pub history: HistoryStatus,
 }
 
+/// Pair of build-plate object IDs whose XY footprints overlap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ObjectCollisionPair {
+    pub a_id: u64,
+    pub b_id: u64,
+}
+
+/// Cached XY/Z bed bounds and object-overlap layout report for the active plate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PlateLayoutCheck {
+    pub out_of_bounds_object_ids: Vec<u64>,
+    pub colliding_pairs: Vec<ObjectCollisionPair>,
+    pub colliding_object_ids: Vec<u64>,
+    pub has_issues: bool,
+}
+
+fn push_unique_id(list: &mut Vec<u64>, id: u64) {
+    if !list.contains(&id) {
+        list.push(id);
+    }
+}
+
+/// Compute bed-bounds violations and pairwise XY footprint overlaps for `objects`.
+pub fn check_plate_layout(
+    objects: &[PlateObjectEntry],
+    machine: &MachineConfig,
+) -> PlateLayoutCheck {
+    let mut out_of_bounds_object_ids = Vec::new();
+    let mut colliding_pairs = Vec::new();
+    let mut colliding_object_ids = Vec::new();
+    let mut bounds: Vec<(u64, Aabb3)> = Vec::with_capacity(objects.len());
+
+    let tol_mm = 1e-4;
+    for obj in objects {
+        let Some(bb) = obj.prepared_mesh.aabb() else {
+            continue;
+        };
+        if bb.min.x < -tol_mm
+            || bb.max.x > machine.bed_width_mm + tol_mm
+            || bb.min.y < -tol_mm
+            || bb.max.y > machine.bed_depth_mm + tol_mm
+            || bb.max.z > machine.bed_height_mm + tol_mm
+        {
+            out_of_bounds_object_ids.push(obj.id);
+        }
+        bounds.push((obj.id, bb));
+    }
+
+    let overlap_eps = 1e-3;
+    for (i, (a_id, a_bb)) in bounds.iter().enumerate() {
+        for (b_id, b_bb) in bounds.iter().skip(i + 1) {
+            let x_overlap =
+                a_bb.min.x < b_bb.max.x - overlap_eps && a_bb.max.x > b_bb.min.x + overlap_eps;
+            let y_overlap =
+                a_bb.min.y < b_bb.max.y - overlap_eps && a_bb.max.y > b_bb.min.y + overlap_eps;
+            if x_overlap && y_overlap {
+                colliding_pairs.push(ObjectCollisionPair {
+                    a_id: *a_id,
+                    b_id: *b_id,
+                });
+                push_unique_id(&mut colliding_object_ids, *a_id);
+                push_unique_id(&mut colliding_object_ids, *b_id);
+            }
+        }
+    }
+
+    let has_issues = !out_of_bounds_object_ids.is_empty() || !colliding_pairs.is_empty();
+    PlateLayoutCheck {
+        out_of_bounds_object_ids,
+        colliding_pairs,
+        colliding_object_ids,
+        has_issues,
+    }
+}
+
 /// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -292,6 +372,8 @@ pub struct Session {
     pub prepared_mesh: Option<Arc<TriangleMesh>>,
     /// Cached topology/volume inspection of [`Session::prepared_mesh`] (kept in sync by every mutation).
     pub plate_inspection: Option<MeshInspection>,
+    /// Cached bed-bounds and pairwise overlap status of the active build plate.
+    pub plate_layout: PlateLayoutCheck,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
     /// Saved local/LAN printer connection profiles (never persisted inside `.3mf` files).
@@ -317,6 +399,7 @@ impl Default for Session {
             mesh: None,
             prepared_mesh: None,
             plate_inspection: None,
+            plate_layout: PlateLayoutCheck::default(),
             sliced: None,
             last_gcode: None,
             printers: Vec::new(),
@@ -435,6 +518,20 @@ impl Session {
         save_printer_profiles(&path, &self.printers)
     }
 
+    /// Recompute cached bed bounds and pairwise overlap state for the active build plate.
+    pub fn recompute_plate_layout(&mut self) {
+        self.plate_layout = check_plate_layout(&self.objects, &self.config.machine);
+    }
+
+    /// Load user-saved machine, filament, and process presets from disk without overwriting built-ins.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_user_profiles_from_disk(&mut self) -> Result<usize, ProfileError> {
+        let Some(dir) = default_user_profiles_dir() else {
+            return Ok(0);
+        };
+        self.profiles.load_user_profiles_from_dir(&dir)
+    }
+
     fn plate_summary_at(&self, index: usize) -> Option<PlateSummary> {
         let slot = self.plate_slots.get(index)?;
         let active = index == self.active_plate_idx;
@@ -491,6 +588,7 @@ impl Session {
             self.swap_slot_with_live(prev_idx);
             self.swap_slot_with_live(index);
             self.active_plate_idx = index;
+            self.recompute_plate_layout();
         }
         self.plate_summary_at(index)
             .ok_or_else(|| EngineError::PlateNotFound(format!("index {index}")))
@@ -629,6 +727,7 @@ impl Session {
         self.next_plate_id = snap.next_plate_id.max(2);
         self.sliced = None;
         self.last_gcode = None;
+        self.recompute_plate_layout();
     }
 
     fn push_undo_entry(&mut self, snap: SessionSnapshot) {
@@ -952,6 +1051,53 @@ pub struct ApplyProfilesParams {
     pub process: Option<String>,
     #[serde(default)]
     pub reset_to_defaults: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SaveUserProfileParams {
+    pub kind: ProfileKind,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub activate: bool,
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SaveUserProfileResult {
+    pub summary: ProfileSummary,
+    pub persisted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeleteUserProfileParams {
+    pub kind: ProfileKind,
+    pub name: String,
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeleteUserProfileResult {
+    pub deleted: bool,
+    pub deleted_from_disk: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExportProfileJsonParams {
+    pub kind: ProfileKind,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub pretty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportProfileJsonResult {
+    pub kind: ProfileKind,
+    pub name: String,
+    pub json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1403,6 +1549,12 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             result_schema: schema_val::<PlateRepairResult>(),
         },
         CommandDescriptor {
+            name: "plate.check_layout",
+            summary: "Check active build plate object bounds and pairwise XY footprint overlaps.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<PlateLayoutCheck>(),
+        },
+        CommandDescriptor {
             name: "plate.list_objects",
             summary: "List individual objects on the build plate with IDs, names, transforms, and bounds.",
             params_schema: schema_val::<EmptyParams>(),
@@ -1497,6 +1649,24 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             summary: "Resolve and apply machine, filament, and/or process profiles onto the active configuration.",
             params_schema: schema_val::<ApplyProfilesParams>(),
             result_schema: schema_val::<ProfileApplyResult>(),
+        },
+        CommandDescriptor {
+            name: "profile.save_user",
+            summary: "Snapshot the active configuration section as a user preset (optionally persisting to disk).",
+            params_schema: schema_val::<SaveUserProfileParams>(),
+            result_schema: schema_val::<SaveUserProfileResult>(),
+        },
+        CommandDescriptor {
+            name: "profile.delete_user",
+            summary: "Delete a user preset from the library (optionally removing its disk file; built-ins protected).",
+            params_schema: schema_val::<DeleteUserProfileParams>(),
+            result_schema: schema_val::<DeleteUserProfileResult>(),
+        },
+        CommandDescriptor {
+            name: "profile.export_json",
+            summary: "Serialize a stored machine, filament, or process profile into JSON.",
+            params_schema: schema_val::<ExportProfileJsonParams>(),
+            result_schema: schema_val::<ExportProfileJsonResult>(),
         },
         CommandDescriptor {
             name: "slice.run",
@@ -1738,6 +1908,7 @@ fn rebuild_plate_mesh(session: &mut Session) -> Result<Option<MeshInspection>, E
     session.mesh = mesh;
     session.prepared_mesh = prepared_mesh;
     session.plate_inspection = insp.clone();
+    session.recompute_plate_layout();
     Ok(insp)
 }
 
@@ -2041,6 +2212,7 @@ fn add_3mf_document_objects(
     session.active_plate_idx = first_non_empty;
     session.next_plate_id = max_plate_id.saturating_add(1).max(2);
     session.swap_slot_with_live(first_non_empty);
+    session.recompute_plate_layout();
 
     session
         .plate_inspection
@@ -2410,6 +2582,7 @@ pub fn load_project_3mf_bytes(
         session.active_plate_idx = target_idx;
         session.next_plate_id = max_plate_id.saturating_add(1).max(2);
         session.swap_slot_with_live(target_idx);
+        session.recompute_plate_layout();
     }
 
     Ok(ProjectLoadResult {
@@ -2517,6 +2690,7 @@ fn apply_session_config(session: &mut Session, new_config: PrintConfig) -> Resul
         slot.sliced = None;
         slot.last_gcode = None;
     }
+    session.recompute_plate_layout();
     Ok(())
 }
 
@@ -2879,6 +3053,15 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             let result = repair_plate_objects(session, p.object_id, p.config.unwrap_or_default())?;
             Ok(serde_json::to_value(result)?)
         }
+        "plate.check_layout" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            session.recompute_plate_layout();
+            Ok(serde_json::to_value(&session.plate_layout)?)
+        }
         "plate.list_objects" => {
             let _: EmptyParams = if params.is_null() {
                 EmptyParams {}
@@ -3125,6 +3308,101 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
                 session.active_profiles.process = Some(pr);
             }
             Ok(serde_json::to_value(apply_res)?)
+        }
+        "profile.save_user" => {
+            let p: SaveUserProfileParams = serde_json::from_value(params)?;
+            let doc = profile_document_from_config(p.kind, &p.name, &session.config)?;
+            let summary = session.profiles.upsert_user_profile(doc.clone())?;
+            if p.activate {
+                match p.kind {
+                    ProfileKind::Machine => {
+                        session.active_profiles.machine = Some(summary.name.clone());
+                    }
+                    ProfileKind::Filament => {
+                        session.active_profiles.filament = Some(summary.name.clone());
+                    }
+                    ProfileKind::Process => {
+                        session.active_profiles.process = Some(summary.name.clone());
+                    }
+                    ProfileKind::MachineModel => {}
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let (persisted, path) = if p.persist {
+                if let Some(dir) = default_user_profiles_dir() {
+                    let saved = save_user_profile_to_dir(&dir, &doc)?;
+                    (true, Some(saved.display().to_string()))
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let (persisted, path) = (false, None);
+            Ok(serde_json::to_value(SaveUserProfileResult {
+                summary,
+                persisted,
+                path,
+            })?)
+        }
+        "profile.delete_user" => {
+            let p: DeleteUserProfileParams = serde_json::from_value(params)?;
+            let canonical_name = session
+                .profiles
+                .get(p.kind, &p.name)
+                .map(|d| d.name.clone());
+            session.profiles.remove_user_profile(p.kind, &p.name)?;
+            let target_trimmed = p.name.trim();
+            let matches_active = |slot: &Option<String>| {
+                slot.as_deref()
+                    .is_some_and(|s| s == target_trimmed || canonical_name.as_deref() == Some(s))
+            };
+            match p.kind {
+                ProfileKind::Machine if matches_active(&session.active_profiles.machine) => {
+                    session.active_profiles.machine = None;
+                }
+                ProfileKind::Filament if matches_active(&session.active_profiles.filament) => {
+                    session.active_profiles.filament = None;
+                }
+                ProfileKind::Process if matches_active(&session.active_profiles.process) => {
+                    session.active_profiles.process = None;
+                }
+                _ => {}
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let deleted_from_disk = if p.persist {
+                if let Some(dir) = default_user_profiles_dir() {
+                    let match_name = canonical_name.as_deref().unwrap_or(target_trimmed);
+                    delete_user_profile_from_dir(&dir, p.kind, match_name)?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            #[cfg(target_arch = "wasm32")]
+            let deleted_from_disk = false;
+            Ok(serde_json::to_value(DeleteUserProfileResult {
+                deleted: true,
+                deleted_from_disk,
+            })?)
+        }
+        "profile.export_json" => {
+            let p: ExportProfileJsonParams = serde_json::from_value(params)?;
+            let canonical_name = session
+                .profiles
+                .get(p.kind, &p.name)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| p.name.trim().to_owned());
+            let json = session
+                .profiles
+                .export_document_json(p.kind, &p.name, p.pretty)?;
+            Ok(serde_json::to_value(ExportProfileJsonResult {
+                kind: p.kind,
+                name: canonical_name,
+                json,
+            })?)
         }
         "slice.run" => {
             let plate = slice_with_config(session, &session.config)?;
@@ -5109,5 +5387,189 @@ mod tests {
         assert!(sess.redo().applied);
         assert!(!sess.plate_inspection.as_ref().unwrap().needs_repair);
         execute(&mut sess, "slice.run", Value::Null).unwrap();
+    }
+
+    #[test]
+    fn plate_layout_checks_bounds_collisions_and_plate_switches() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "name": "A" }),
+        )
+        .unwrap();
+        let a_id = sess.objects[0].id;
+        assert!(!sess.plate_layout.has_issues);
+
+        // Move A partially off the bed in -X.
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({ "id": a_id, "position_xy_mm": [5.0, 125.0] }),
+        )
+        .unwrap();
+        assert!(sess.plate_layout.has_issues);
+        assert_eq!(sess.plate_layout.out_of_bounds_object_ids, vec![a_id]);
+
+        // Re-center A and exceed bed height via Z scale.
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({
+                "id": a_id,
+                "position_xy_mm": [125.0, 125.0],
+                "scale": [1.0, 1.0, 20.0]
+            }),
+        )
+        .unwrap();
+        assert_eq!(sess.plate_layout.out_of_bounds_object_ids, vec![a_id]);
+
+        // Restore unit scale and add B; auto-arrange resolves overlap.
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({ "id": a_id, "scale": [1.0, 1.0, 1.0] }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": true, "name": "B" }),
+        )
+        .unwrap();
+        let b_id = sess.objects[1].id;
+        assert!(!sess.plate_layout.has_issues);
+
+        // Force A and B onto the same XY spot -> collision detected.
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({ "id": b_id, "position_xy_mm": [125.0, 125.0] }),
+        )
+        .unwrap();
+        assert!(sess.plate_layout.has_issues);
+        assert_eq!(sess.plate_layout.colliding_pairs.len(), 1);
+        assert!(sess.plate_layout.colliding_object_ids.contains(&a_id));
+        assert!(sess.plate_layout.colliding_object_ids.contains(&b_id));
+
+        // Add empty second plate: plate_layout updates on switch; switching back restores issue.
+        execute(
+            &mut sess,
+            "plates.add",
+            serde_json::json!({ "name": "Empty", "select": true }),
+        )
+        .unwrap();
+        assert!(!sess.plate_layout.has_issues);
+        execute(
+            &mut sess,
+            "plates.select",
+            serde_json::json!({ "index": 0 }),
+        )
+        .unwrap();
+        assert!(sess.plate_layout.has_issues);
+
+        // Auto-arrange clears overlap; shrinking bed smaller than object footprint triggers OOB.
+        execute(&mut sess, "plate.auto_arrange", Value::Null).unwrap();
+        let check: PlateLayoutCheck =
+            serde_json::from_value(execute(&mut sess, "plate.check_layout", Value::Null).unwrap())
+                .unwrap();
+        assert!(!check.has_issues);
+    }
+
+    #[test]
+    fn user_profile_commands_save_export_delete_and_protect_builtins() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "config.patch",
+            serde_json::json!({
+                "patch": {
+                    "filament": { "nozzle_temp_c": 248, "bed_temp_c": 88 }
+                }
+            }),
+        )
+        .unwrap();
+
+        let saved: SaveUserProfileResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.save_user",
+                serde_json::json!({
+                    "kind": "filament",
+                    "name": "My Fast PETG",
+                    "activate": true,
+                    "persist": false
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.summary.name, "My Fast PETG");
+        assert!(!saved.persisted);
+        assert_eq!(
+            sess.active_profiles.filament.as_deref(),
+            Some("My Fast PETG")
+        );
+
+        let exported: ExportProfileJsonResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.export_json",
+                serde_json::json!({
+                    "kind": "filament",
+                    "name": "My Fast PETG"
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(exported.json.contains("My Fast PETG"));
+
+        // Built-ins cannot be overwritten or deleted.
+        assert!(
+            execute(
+                &mut sess,
+                "profile.save_user",
+                serde_json::json!({
+                    "kind": "machine",
+                    "name": "LayerCraft CORE One+ HF 0.4mm",
+                    "persist": false
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                &mut sess,
+                "profile.delete_user",
+                serde_json::json!({
+                    "kind": "machine",
+                    "name": "LayerCraft CORE One+ HF 0.4mm",
+                    "persist": false
+                }),
+            )
+            .is_err()
+        );
+
+        let del: DeleteUserProfileResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "profile.delete_user",
+                serde_json::json!({
+                    "kind": "filament",
+                    "name": "My Fast PETG",
+                    "persist": false
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(del.deleted);
+        assert!(sess.active_profiles.filament.is_none());
+        assert!(
+            sess.profiles
+                .get(ProfileKind::Filament, "My Fast PETG")
+                .is_none()
+        );
     }
 }

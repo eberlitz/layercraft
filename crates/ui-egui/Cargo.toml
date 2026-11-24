@@ -20,6 +20,7 @@ layercraft-mesh.workspace = true
 layercraft-slice.workspace = true
 layercraft-viewport.workspace = true
 layercraft-viewport-gpu.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 web-time.workspace = true
 

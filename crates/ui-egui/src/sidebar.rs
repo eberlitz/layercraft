@@ -8,6 +8,7 @@ use layercraft_config::{
 };
 use layercraft_engine::{PrinterAuth, PrinterProtocol};
 use layercraft_mesh::{ModifierPrimitive, ModifierTransform};
+use layercraft_slice::{IssueCategory, IssueSeverity, PrintabilityRisk};
 
 use crate::LayerCraftApp;
 use crate::icons::{Icon, paint_icon};
@@ -152,7 +153,16 @@ fn draw_preset_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
                     for item in &machines {
                         let sel =
                             app.selected_machine_profile.as_deref() == Some(item.name.as_str());
-                        if ui.selectable_label(sel, &item.name).clicked() {
+                        let label = if app
+                            .session
+                            .profiles
+                            .is_builtin(ProfileKind::Machine, &item.name)
+                        {
+                            item.name.clone()
+                        } else {
+                            format!("{} [user]", item.name)
+                        };
+                        if ui.selectable_label(sel, label).clicked() {
                             app.selected_machine_profile = Some(item.name.clone());
                             apply_requested = true;
                         }
@@ -179,7 +189,16 @@ fn draw_preset_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
                     for item in &filaments {
                         let sel =
                             app.selected_filament_profile.as_deref() == Some(item.name.as_str());
-                        if ui.selectable_label(sel, &item.name).clicked() {
+                        let label = if app
+                            .session
+                            .profiles
+                            .is_builtin(ProfileKind::Filament, &item.name)
+                        {
+                            item.name.clone()
+                        } else {
+                            format!("{} [user]", item.name)
+                        };
+                        if ui.selectable_label(sel, label).clicked() {
                             app.selected_filament_profile = Some(item.name.clone());
                             apply_requested = true;
                         }
@@ -206,13 +225,94 @@ fn draw_preset_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
                     for item in &processes {
                         let sel =
                             app.selected_process_profile.as_deref() == Some(item.name.as_str());
-                        if ui.selectable_label(sel, &item.name).clicked() {
+                        let label = if app
+                            .session
+                            .profiles
+                            .is_builtin(ProfileKind::Process, &item.name)
+                        {
+                            item.name.clone()
+                        } else {
+                            format!("{} [user]", item.name)
+                        };
+                        if ui.selectable_label(sel, label).clicked() {
                             app.selected_process_profile = Some(item.name.clone());
                             apply_requested = true;
                         }
                     }
                 });
         });
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Save:").size(11.0).color(p.text_muted));
+            if ui
+                .small_button("Printer")
+                .on_hover_text("Save current Machine settings as a custom preset")
+                .clicked()
+            {
+                app.open_save_preset_dialog(ProfileKind::Machine);
+            }
+            if ui
+                .small_button("Filament")
+                .on_hover_text("Save current Filament settings as a custom preset")
+                .clicked()
+            {
+                app.open_save_preset_dialog(ProfileKind::Filament);
+            }
+            if ui
+                .small_button("Process")
+                .on_hover_text("Save current Process settings as a custom preset")
+                .clicked()
+            {
+                app.open_save_preset_dialog(ProfileKind::Process);
+            }
+        });
+
+        let deletables = [
+            (
+                ProfileKind::Machine,
+                "Printer",
+                app.selected_machine_profile.clone(),
+            ),
+            (
+                ProfileKind::Filament,
+                "Filament",
+                app.selected_filament_profile.clone(),
+            ),
+            (
+                ProfileKind::Process,
+                "Process",
+                app.selected_process_profile.clone(),
+            ),
+        ];
+        let custom_selected: Vec<(ProfileKind, &str, String)> = deletables
+            .into_iter()
+            .filter_map(|(kind, kind_lbl, opt)| {
+                let name = opt?;
+                if app.session.profiles.get(kind, &name).is_some()
+                    && !app.session.profiles.is_builtin(kind, &name)
+                {
+                    Some((kind, kind_lbl, name))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !custom_selected.is_empty() {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Delete:").size(11.0).color(p.text_muted));
+                for (kind, kind_lbl, name) in custom_selected {
+                    if ui
+                        .small_button(format!("{kind_lbl} ×"))
+                        .on_hover_text(format!("Delete custom preset `{name}`"))
+                        .clicked()
+                    {
+                        app.delete_user_preset_action(kind, &name);
+                    }
+                }
+            });
+        }
 
         if app.profile_warning_count > 0 {
             ui.add_space(4.0);
@@ -471,15 +571,26 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         } else {
             for (id, name, _) in &entries {
                 let selected = app.selected_object_id == Some(*id);
+                let is_oob = app
+                    .session
+                    .plate_layout
+                    .out_of_bounds_object_ids
+                    .contains(id);
+                let is_overlap = app.session.plate_layout.colliding_object_ids.contains(id);
                 ui.horizontal(|ui| {
                     let dot_r = ui
                         .allocate_exact_size(vec2(10.0, 16.0), egui::Sense::hover())
                         .0;
-                    ui.painter().circle_filled(
-                        dot_r.center(),
-                        3.5,
-                        if selected { p.accent } else { p.axis_z },
-                    );
+                    let dot_col = if is_oob {
+                        p.danger
+                    } else if is_overlap {
+                        p.warning
+                    } else if selected {
+                        p.accent
+                    } else {
+                        p.axis_z
+                    };
+                    ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
                     if ui
                         .selectable_label(selected, format!("#{id} {name}"))
                         .clicked()
@@ -492,7 +603,39 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                         if small_icon_button(ui, p, Icon::Trash, "Remove object").clicked() {
                             action = Some(PlateAction::RemoveObject(*id));
                         }
+                        if is_overlap {
+                            badge(ui, p.bg_panel, p.warning, "Overlap");
+                        }
+                        if is_oob {
+                            badge(ui, p.bg_panel, p.danger, "OOB");
+                        }
                     });
+                });
+            }
+            if app.session.plate_layout.has_issues {
+                let oob_n = app.session.plate_layout.out_of_bounds_object_ids.len();
+                let ov_n = app.session.plate_layout.colliding_pairs.len();
+                let mut parts = Vec::new();
+                if oob_n > 0 {
+                    parts.push(format!("{oob_n} out of bounds"));
+                }
+                if ov_n > 0 {
+                    parts.push(format!("{ov_n} overlap(s)"));
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, p.bg_panel, p.danger, "Plate Check");
+                    ui.label(
+                        RichText::new(parts.join(", "))
+                            .size(11.0)
+                            .color(if oob_n > 0 { p.danger } else { p.warning }),
+                    );
+                    if secondary_button(ui, p, Some(Icon::ArrangeGrid), "Auto-Arrange")
+                        .on_hover_text("Pack all objects cleanly inside bed bounds")
+                        .clicked()
+                    {
+                        app.auto_arrange_plate();
+                    }
                 });
             }
         }
@@ -946,6 +1089,153 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
         });
         if repair_clicked {
             app.repair_plate_mesh(None);
+        }
+
+        ui.add_space(6.0);
+        let mut analyze_clicked = false;
+        let mut fix_tree_supports = false;
+        let mut fix_brim = false;
+        let mut fix_repair = false;
+        let mut fix_arrange = false;
+        let mesh_needs_repair = insp.needs_repair;
+        let layout_has_issues = app.session.plate_layout.has_issues;
+        let can_arrange = app.session.objects.len() > 1;
+        let support_enabled = app.session.config.process.support.enabled;
+        let brim_width = app.session.config.process.brim_width_mm;
+
+        card(ui, p, Some("Printability / DFM"), |ui| {
+            if let Some(report) = &app.printability_report {
+                let (risk_col, risk_lbl) = match report.overall_risk {
+                    PrintabilityRisk::Low => (p.success, "Low Risk"),
+                    PrintabilityRisk::Medium => (p.warning, "Moderate Risk"),
+                    PrintabilityRisk::High => (p.danger, "High Risk"),
+                };
+                ui.horizontal(|ui| {
+                    badge(ui, p.bg_panel, risk_col, risk_lbl);
+                    let scope = if report.sliced {
+                        format!("{} layers", report.layer_count)
+                    } else {
+                        "pre-slice".to_owned()
+                    };
+                    ui.label(
+                        RichText::new(format!("{} issue(s) ({scope})", report.issues.len()))
+                            .size(11.0)
+                            .color(p.text_muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Re-analyze").clicked() {
+                            analyze_clicked = true;
+                        }
+                    });
+                });
+
+                if report.issues.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("No printability warnings detected.")
+                            .size(11.0)
+                            .color(p.text_muted),
+                    );
+                } else {
+                    ui.add_space(3.0);
+                    for issue in report.issues.iter().take(4) {
+                        let (sev_col, sev_lbl) = match issue.severity {
+                            IssueSeverity::Critical => (p.danger, "Crit"),
+                            IssueSeverity::Warning => (p.warning, "Warn"),
+                            IssueSeverity::Info => (p.accent, "Info"),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            badge(ui, p.bg_panel, sev_col, sev_lbl);
+                            ui.label(
+                                RichText::new(&issue.summary)
+                                    .size(11.0)
+                                    .color(p.text_secondary),
+                            )
+                            .on_hover_text(&issue.suggestion);
+                        });
+                    }
+                    if report.issues.len() > 4 {
+                        ui.label(
+                            RichText::new(format!("+{} more issue(s)", report.issues.len() - 4))
+                                .size(10.5)
+                                .color(p.text_muted),
+                        );
+                    }
+                }
+
+                let needs_supports_fix = !support_enabled
+                    && report.issues.iter().any(|i| {
+                        matches!(
+                            i.category,
+                            IssueCategory::FloatingIsland | IssueCategory::Overhang
+                        )
+                    });
+                let needs_brim_fix = brim_width < 5.0
+                    && report
+                        .issues
+                        .iter()
+                        .any(|i| i.category == IssueCategory::BedAdhesion);
+
+                if needs_supports_fix
+                    || needs_brim_fix
+                    || mesh_needs_repair
+                    || (layout_has_issues && can_arrange)
+                {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if needs_supports_fix
+                            && secondary_button(ui, p, None, "Enable Tree Supports")
+                                .on_hover_text("Turn on organic/tree supports (undoable)")
+                                .clicked()
+                        {
+                            fix_tree_supports = true;
+                        }
+                        if needs_brim_fix
+                            && secondary_button(ui, p, None, "Add 5mm Brim")
+                                .on_hover_text("Set brim width to 5 mm for bed adhesion")
+                                .clicked()
+                        {
+                            fix_brim = true;
+                        }
+                        if mesh_needs_repair
+                            && secondary_button(ui, p, None, "Repair Mesh").clicked()
+                        {
+                            fix_repair = true;
+                        }
+                        if layout_has_issues
+                            && can_arrange
+                            && secondary_button(ui, p, Some(Icon::ArrangeGrid), "Auto-Arrange")
+                                .clicked()
+                        {
+                            fix_arrange = true;
+                        }
+                    });
+                }
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Inspect overhangs, floating islands, thin walls, and bed adhesion.",
+                    )
+                    .size(11.0)
+                    .color(p.text_muted),
+                );
+                ui.add_space(3.0);
+                if secondary_button(ui, p, None, "Analyze Printability").clicked() {
+                    analyze_clicked = true;
+                }
+            }
+        });
+
+        if analyze_clicked {
+            app.analyze_printability_action();
+        } else if fix_tree_supports {
+            app.apply_quick_fix_tree_supports();
+        } else if fix_brim {
+            app.apply_quick_fix_brim();
+        } else if fix_repair {
+            app.repair_plate_mesh(None);
+        } else if fix_arrange {
+            app.auto_arrange_plate();
         }
     }
 }

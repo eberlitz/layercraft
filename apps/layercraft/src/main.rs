@@ -8,6 +8,7 @@ use clap::Parser;
 use layercraft_mcp::bridge::StudioBridgeHost;
 use layercraft_mcp::{UiViewMode, handle_studio_bridge_request};
 use layercraft_mesh::SampleShape;
+use layercraft_ui_egui::prefs::AppPreferences;
 use layercraft_ui_egui::{LayerCraftApp, ThemeMode, ViewMode};
 use layercraft_viewport_gpu::{ViewportGpuRenderer, install_renderer};
 
@@ -298,11 +299,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let startup_window_size = AppPreferences::load_from_disk()
+        .window_size
+        .map(|[w, h]| [w.clamp(800.0, 3840.0), h.clamp(600.0, 2160.0)])
+        .unwrap_or([1360.0, 840.0]);
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("LayerCraft")
-            .with_inner_size([1360.0, 840.0]),
+            .with_inner_size(startup_window_size),
         ..Default::default()
     };
 
