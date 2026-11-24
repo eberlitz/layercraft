@@ -10,6 +10,9 @@ pub enum Icon {
     OpenFile,
     #[cfg(not(target_arch = "wasm32"))]
     AddPlus,
+    SaveProject,
+    Undo,
+    Redo,
     SampleCube,
     ArrangeGrid,
     Trash,
@@ -83,6 +86,46 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::AddPlus => {
             painter.line_segment([pt(0.50, 0.15), pt(0.50, 0.85)], stroke);
             painter.line_segment([pt(0.15, 0.50), pt(0.85, 0.50)], stroke);
+        }
+        Icon::SaveProject => {
+            let poly = vec![
+                pt(0.14, 0.12),
+                pt(0.72, 0.12),
+                pt(0.86, 0.26),
+                pt(0.86, 0.88),
+                pt(0.14, 0.88),
+            ];
+            painter.add(egui::Shape::closed_line(poly, stroke));
+            let top_bay = Rect::from_min_max(pt(0.28, 0.12), pt(0.64, 0.36));
+            painter.rect_stroke(top_bay, CornerRadius::same(1), stroke, StrokeKind::Inside);
+            let bot_bay = Rect::from_min_max(pt(0.26, 0.54), pt(0.74, 0.88));
+            painter.rect_stroke(bot_bay, CornerRadius::same(1), stroke, StrokeKind::Inside);
+        }
+        Icon::Undo => {
+            let arc = vec![
+                pt(0.22, 0.40),
+                pt(0.42, 0.24),
+                pt(0.68, 0.28),
+                pt(0.82, 0.50),
+                pt(0.76, 0.72),
+                pt(0.52, 0.80),
+            ];
+            painter.add(egui::Shape::line(arc, stroke));
+            painter.line_segment([pt(0.18, 0.22), pt(0.20, 0.44)], stroke);
+            painter.line_segment([pt(0.20, 0.44), pt(0.42, 0.42)], stroke);
+        }
+        Icon::Redo => {
+            let arc = vec![
+                pt(0.78, 0.40),
+                pt(0.58, 0.24),
+                pt(0.32, 0.28),
+                pt(0.18, 0.50),
+                pt(0.24, 0.72),
+                pt(0.48, 0.80),
+            ];
+            painter.add(egui::Shape::line(arc, stroke));
+            painter.line_segment([pt(0.82, 0.22), pt(0.80, 0.44)], stroke);
+            painter.line_segment([pt(0.80, 0.44), pt(0.58, 0.42)], stroke);
         }
         Icon::SampleCube | Icon::BoxShape => {
             // Isometric wireframe cube.

@@ -185,6 +185,110 @@ impl OrbitCamera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         self.proj_matrix(aspect) * self.view_matrix()
     }
+
+    /// Construct a world-space picking ray through NDC coordinates `(-1..=1, -1..=1)` (+Y up).
+    pub fn screen_ray(&self, ndc_x: f32, ndc_y: f32, aspect: f32) -> Ray3 {
+        let inv = self.view_proj(aspect).inverse();
+        let unproject = |ndc_z: f32| -> Option<Vec3> {
+            let v = inv * Vec4::new(ndc_x, ndc_y, ndc_z, 1.0);
+            if v.w.abs() > 1e-7 && v.is_finite() {
+                Some(v.truncate() / v.w)
+            } else {
+                None
+            }
+        };
+        let origin_v = self.eye_pos();
+        let dir_v = match (unproject(0.0), unproject(1.0)) {
+            (Some(near_p), Some(far_p)) => (far_p - near_p).normalize_or_zero(),
+            _ => (Vec3::from_array(self.target) - origin_v).normalize_or_zero(),
+        };
+        Ray3 {
+            origin: origin_v.to_array(),
+            dir: dir_v.to_array(),
+        }
+    }
+}
+
+/// 3D picking ray in world-space millimeters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ray3 {
+    pub origin: [f32; 3],
+    pub dir: [f32; 3],
+}
+
+/// Intersect `ray` against an axis-aligned bounding box, returning entry distance `t >= 0` on hit.
+pub fn ray_intersect_aabb(ray: Ray3, aabb: Aabb3) -> Option<f32> {
+    let [ox, oy, oz] = ray.origin;
+    let [dx, dy, dz] = ray.dir;
+    let mut tmin = 0.0_f64;
+    let mut tmax = f64::INFINITY;
+
+    for (o, d, min_b, max_b) in [
+        (f64::from(ox), f64::from(dx), aabb.min.x, aabb.max.x),
+        (f64::from(oy), f64::from(dy), aabb.min.y, aabb.max.y),
+        (f64::from(oz), f64::from(dz), aabb.min.z, aabb.max.z),
+    ] {
+        if d.abs() < 1e-8 {
+            if o < min_b || o > max_b {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            let mut t1 = (min_b - o) * inv_d;
+            let mut t2 = (max_b - o) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmax < tmin {
+                return None;
+            }
+        }
+    }
+
+    (tmax >= tmin.max(0.0)).then_some(tmin.max(0.0) as f32)
+}
+
+/// Exact double-sided Möller–Trumbore ray-triangle picking with AABB pre-check.
+pub fn ray_intersect_mesh(ray: Ray3, mesh: &TriangleMesh) -> Option<f32> {
+    let aabb = mesh.aabb()?;
+    let _ = ray_intersect_aabb(ray, aabb)?;
+
+    let [ox, oy, oz] = ray.origin;
+    let [dx, dy, dz] = ray.dir;
+    let orig = glam::DVec3::new(f64::from(ox), f64::from(oy), f64::from(oz));
+    let dir = glam::DVec3::new(f64::from(dx), f64::from(dy), f64::from(dz));
+    let mut best_t: Option<f32> = None;
+
+    for tri in &mesh.triangles {
+        let a = tri.a.to_vec3();
+        let e1 = tri.b.to_vec3() - a;
+        let e2 = tri.c.to_vec3() - a;
+        let pvec = dir.cross(e2);
+        let det = e1.dot(pvec);
+        if det.abs() <= 1e-9 {
+            continue;
+        }
+        let inv_det = 1.0 / det;
+        let tvec = orig - a;
+        let u = tvec.dot(pvec) * inv_det;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let qvec = tvec.cross(e1);
+        let v = dir.dot(qvec) * inv_det;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = e2.dot(qvec) * inv_det;
+        if t > 1e-4 {
+            let tf = t as f32;
+            best_t = Some(best_t.map_or(tf, |prev| prev.min(tf)));
+        }
+    }
+
+    best_t
 }
 
 /// Lit 3D triangle vertex (position, outward normal, RGBA color).
@@ -1089,5 +1193,27 @@ mod tests {
 
         let nozzle = build_nozzle_marker_mesh([125.0, 125.0, 10.0], true);
         assert_eq!(nozzle.len(), 12 * 18);
+    }
+
+    #[test]
+    fn screen_ray_picks_centered_cube_and_misses_corner() {
+        let front_cube = sample_cube();
+        let mut back_cube = sample_cube();
+        back_cube.translate(0.0, 60.0, 0.0).unwrap();
+
+        let aabb = front_cube.aabb().unwrap();
+        let mut cam = OrbitCamera::framed_on_aabb(CameraPreset::Front, aabb, 250.0, 250.0);
+        // Frame slightly elevated from -Y looking towards +Y at front_cube first, back_cube behind it.
+        cam.pitch_rad = 0.0;
+        let aspect = 16.0 / 9.0;
+
+        let center_ray = cam.screen_ray(0.0, 0.0, aspect);
+        let t_front =
+            ray_intersect_mesh(center_ray, &front_cube).expect("center ray hits front cube");
+        let t_back = ray_intersect_mesh(center_ray, &back_cube).expect("center ray hits back cube");
+        assert!(t_front < t_back, "expected front {t_front} < back {t_back}");
+
+        let corner_ray = cam.screen_ray(0.95, 0.95, aspect);
+        assert!(ray_intersect_mesh(corner_ray, &front_cube).is_none());
     }
 }

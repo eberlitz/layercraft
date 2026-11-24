@@ -8,16 +8,20 @@ mod ui_kit;
 mod viewport_hud;
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 
 use egui::{Align, Margin, RichText, Stroke, pos2};
 use layercraft_config::{
-    ModifierOverrides, ModifierRole, ProfileApplyResult, ProfileKind, ProfileSummary,
+    ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileKind, ProfileSummary,
 };
-use layercraft_engine::{Session, execute};
+use layercraft_engine::{
+    HistoryActionResult, ProjectLoadResult, Session, execute, export_project_3mf_bytes,
+};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
-    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh_with_config,
+    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh_with_config, ray_intersect_mesh,
 };
 use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
@@ -31,6 +35,18 @@ pub use theme::ThemeMode;
 pub enum ViewMode {
     Prepare,
     Preview,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingSliceOutcome {
+    job_id: u64,
+    elapsed_ms: f64,
+    result: Result<(layercraft_slice::SlicedPlate, layercraft_gcode::GcodeOutput), String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingSliceJob {
+    rx: mpsc::Receiver<PendingSliceOutcome>,
 }
 
 /// Frame callback invoked before UI layout to pump external controllers (e.g. Live MCP bridge).
@@ -74,8 +90,15 @@ pub struct LayerCraftApp {
     pub(crate) external_poller: Option<ExternalPoller>,
     pub(crate) bridge_endpoint: Option<String>,
     pub(crate) last_mcp_activity: Option<String>,
+    pub(crate) pending_config_undo: Option<PrintConfig>,
+    pub(crate) drag_undo_active: bool,
+    pub(crate) pointer_active: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_slice: Option<PendingSliceJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    next_slice_job_id: u64,
     #[cfg(target_arch = "wasm32")]
     pending_drops: std::rc::Rc<std::cell::RefCell<Vec<(String, Result<Vec<u8>, String>)>>>,
 }
@@ -127,13 +150,21 @@ impl LayerCraftApp {
             external_poller: None,
             bridge_endpoint: None,
             last_mcp_activity: None,
+            pending_config_undo: None,
+            drag_undo_active: false,
+            pointer_active: false,
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_slice: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            next_slice_job_id: 0,
             #[cfg(target_arch = "wasm32")]
             pending_drops: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         };
         if let Some(sample) = initial_sample {
             app.load_sample(sample);
+            app.session.clear_history();
         } else {
             app.rebuild_scene();
         }
@@ -225,6 +256,7 @@ impl LayerCraftApp {
 
     /// Synchronize sidebar selections, view mode, and 3D scene after an external engine mutation.
     pub fn sync_after_external_command(&mut self, command: &str) {
+        self.cancel_pending_slice();
         self.last_error = None;
         self.selected_machine_profile = self.session.active_profiles.machine.clone();
         self.selected_filament_profile = self.session.active_profiles.filament.clone();
@@ -252,6 +284,18 @@ impl LayerCraftApp {
             self.layer_move_step = 0;
             self.playback_playing = false;
             self.status_message = "Cleared plate via MCP.".to_owned();
+        } else if command == "project.load_file" || command == "project.load_3mf_bytes" {
+            self.view_mode = ViewMode::Prepare;
+            self.max_layer = 0;
+            self.layer_move_step = 0;
+            self.playback_playing = false;
+            self.frame_camera(CameraPreset::Isometric);
+            self.status_message = format!("Loaded project via MCP ({command}).");
+        } else if command == "session.undo" || command == "session.redo" {
+            if self.session.sliced.is_none() {
+                self.view_mode = ViewMode::Prepare;
+            }
+            self.status_message = format!("Updated session via MCP ({command}).");
         } else if command.starts_with("plate.add_") || command == "plate.auto_arrange" {
             if self.session.sliced.is_none() {
                 self.view_mode = ViewMode::Prepare;
@@ -278,17 +322,172 @@ impl LayerCraftApp {
         }
     }
 
-    /// Load a mesh from raw STL or 3MF bytes via `layercraft-engine` commands.
+    fn sync_selections_after_history(&mut self) {
+        self.selected_machine_profile = self.session.active_profiles.machine.clone();
+        self.selected_filament_profile = self.session.active_profiles.filament.clone();
+        self.selected_process_profile = self.session.active_profiles.process.clone();
+
+        if !self
+            .selected_object_id
+            .is_some_and(|id| self.session.objects.iter().any(|o| o.id == id))
+        {
+            self.selected_object_id = self.session.objects.last().map(|o| o.id);
+        }
+        if !self
+            .selected_modifier_id
+            .is_some_and(|id| self.session.modifiers.iter().any(|m| m.id == id))
+        {
+            self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+        }
+        if self.session.sliced.is_none() {
+            self.view_mode = ViewMode::Prepare;
+            self.max_layer = 0;
+            self.layer_move_step = 0;
+            self.playback_playing = false;
+        }
+    }
+
+    pub(crate) fn undo_action(&mut self) {
+        self.cancel_pending_slice();
+        if let Some(prev_cfg) = self.pending_config_undo.take()
+            && self.session.config != prev_cfg
+        {
+            self.session
+                .push_config_undo_snapshot("Edit settings", prev_cfg);
+        }
+        match execute(&mut self.session, "session.undo", Value::Null) {
+            Ok(val) => {
+                if let Ok(res) = serde_json::from_value::<HistoryActionResult>(val)
+                    && res.applied
+                {
+                    self.last_error = None;
+                    self.sync_selections_after_history();
+                    let what = res.label.unwrap_or_else(|| "change".to_owned());
+                    self.status_message = format!("Undid `{what}`.");
+                    self.rebuild_scene();
+                }
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    pub(crate) fn redo_action(&mut self) {
+        self.cancel_pending_slice();
+        match execute(&mut self.session, "session.redo", Value::Null) {
+            Ok(val) => {
+                if let Ok(res) = serde_json::from_value::<HistoryActionResult>(val)
+                    && res.applied
+                {
+                    self.last_error = None;
+                    self.sync_selections_after_history();
+                    let what = res.label.unwrap_or_else(|| "change".to_owned());
+                    self.status_message = format!("Redid `{what}`.");
+                    self.rebuild_scene();
+                }
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    /// Pick the closest 3D object or modifier intersecting screen ray at NDC `(ndc_x, ndc_y)`.
+    pub(crate) fn pick_at_ndc(&mut self, ndc_x: f32, ndc_y: f32) -> bool {
+        let ray = self.camera.screen_ray(ndc_x, ndc_y, self.viewport_aspect);
+        enum PickTarget {
+            Object(u64, String),
+            Modifier(u64, String),
+        }
+        let mut best: Option<(f32, PickTarget)> = None;
+
+        for obj in &self.session.objects {
+            if let Some(t) = ray_intersect_mesh(ray, &obj.prepared_mesh)
+                && best.as_ref().is_none_or(|(bt, _)| t < *bt)
+            {
+                best = Some((t, PickTarget::Object(obj.id, obj.name.clone())));
+            }
+        }
+        for m in &self.session.modifiers {
+            if let Some(t) = ray_intersect_mesh(ray, &m.prepared_mesh)
+                && best.as_ref().is_none_or(|(bt, _)| t < *bt)
+            {
+                best = Some((t, PickTarget::Modifier(m.id, m.name.clone())));
+            }
+        }
+
+        match best {
+            Some((_, PickTarget::Object(id, name))) => {
+                self.selected_object_id = Some(id);
+                self.selected_modifier_id = None;
+                self.sidebar_tab = SidebarTab::Plate;
+                self.status_message = format!("Selected object #{id} `{name}`.");
+                self.rebuild_scene();
+                true
+            }
+            Some((_, PickTarget::Modifier(id, name))) => {
+                self.selected_modifier_id = Some(id);
+                self.selected_object_id = None;
+                self.sidebar_tab = SidebarTab::Plate;
+                self.status_message = format!("Selected modifier #{id} `{name}`.");
+                self.rebuild_scene();
+                true
+            }
+            None => {
+                if self.selected_object_id.is_some() || self.selected_modifier_id.is_some() {
+                    self.selected_object_id = None;
+                    self.selected_modifier_id = None;
+                    self.rebuild_scene();
+                }
+                false
+            }
+        }
+    }
+
+    /// Load a mesh or LayerCraft `.3mf` project from raw STL or 3MF bytes via `layercraft-engine`.
     pub fn load_mesh_bytes(&mut self, name: &str, bytes: Vec<u8>) {
+        self.cancel_pending_slice();
         let is_3mf = name.to_ascii_lowercase().ends_with(".3mf");
-        let cmd = if is_3mf {
-            "plate.add_3mf_bytes"
-        } else {
-            "plate.add_stl_bytes"
-        };
+        if is_3mf {
+            match execute(
+                &mut self.session,
+                "project.load_3mf_bytes",
+                serde_json::json!({ "bytes": bytes, "name": name }),
+            ) {
+                Ok(val) => {
+                    let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
+                    self.last_error = None;
+                    if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
+                        self.selected_machine_profile =
+                            self.session.active_profiles.machine.clone();
+                        self.selected_filament_profile =
+                            self.session.active_profiles.filament.clone();
+                        self.selected_process_profile =
+                            self.session.active_profiles.process.clone();
+                        self.status_message = format!(
+                            "Loaded project `{name}` ({} object(s), {} modifier(s)).",
+                            self.session.objects.len(),
+                            self.session.modifiers.len()
+                        );
+                    } else {
+                        self.status_message = format!(
+                            "Loaded `{name}` ({} object(s)).",
+                            self.session.objects.len()
+                        );
+                    }
+                    self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                    self.selected_modifier_id = None;
+                    self.view_mode = ViewMode::Prepare;
+                    self.frame_camera(CameraPreset::Isometric);
+                    self.rebuild_scene();
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed to load `{name}`: {e}"));
+                }
+            }
+            return;
+        }
+
         match execute(
             &mut self.session,
-            cmd,
+            "plate.add_stl_bytes",
             serde_json::json!({ "bytes": bytes, "name": name }),
         ) {
             Ok(_) => {
@@ -401,6 +600,7 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn apply_selected_profiles(&mut self) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "profile.apply",
@@ -439,6 +639,7 @@ impl LayerCraftApp {
 
     /// Load or append a built-in sample primitive on the build plate.
     pub fn load_sample_with_mode(&mut self, shape: SampleShape, append: bool) {
+        self.cancel_pending_slice();
         self.selected_sample = shape;
         match execute(
             &mut self.session,
@@ -462,6 +663,7 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn auto_arrange_plate(&mut self) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.auto_arrange",
@@ -484,6 +686,7 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn remove_object(&mut self, id: u64) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.remove_object",
@@ -506,6 +709,7 @@ impl LayerCraftApp {
         rot: [f64; 3],
         scale: [f64; 3],
     ) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.transform_object",
@@ -517,6 +721,10 @@ impl LayerCraftApp {
             }),
         ) {
             Ok(_) => {
+                if self.pointer_active && !self.drag_undo_active {
+                    self.drag_undo_active = true;
+                    self.session.set_undo_suppressed(true);
+                }
                 self.last_error = None;
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
@@ -530,6 +738,7 @@ impl LayerCraftApp {
         primitive: ModifierPrimitive,
         role: ModifierRole,
     ) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.add_modifier_primitive",
@@ -549,6 +758,7 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn remove_modifier(&mut self, id: u64) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.remove_modifier",
@@ -573,6 +783,7 @@ impl LayerCraftApp {
         scale: [f64; 3],
         overrides: ModifierOverrides,
     ) {
+        self.cancel_pending_slice();
         match execute(
             &mut self.session,
             "plate.update_modifier",
@@ -586,11 +797,169 @@ impl LayerCraftApp {
             }),
         ) {
             Ok(_) => {
+                if self.pointer_active && !self.drag_undo_active {
+                    self.drag_undo_active = true;
+                    self.session.set_undo_suppressed(true);
+                }
                 self.last_error = None;
                 self.view_mode = ViewMode::Prepare;
                 self.rebuild_scene();
             }
             Err(e) => self.last_error = Some(e.to_string()),
+        }
+    }
+
+    /// Return `true` while a native background slice job is active.
+    pub(crate) fn is_slicing(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_slice.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn cancel_pending_slice(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.next_slice_job_id = self.next_slice_job_id.wrapping_add(1);
+            self.pending_slice = None;
+        }
+    }
+
+    /// Trigger slicing from interactive UI controls (async background thread on native, sync on WASM).
+    pub(crate) fn start_slice_action(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            self.run_slice();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.pending_slice.is_some() {
+                return;
+            }
+            if self.session.prepared_mesh.is_none() && self.session.mesh.is_none() {
+                self.last_error = Some("No mesh loaded on build plate.".to_owned());
+                return;
+            }
+            if let Err(e) = self.session.config.validate() {
+                self.last_error = Some(e.to_string());
+                return;
+            }
+            if let Some(prev_cfg) = self.pending_config_undo.take()
+                && self.session.config != prev_cfg
+            {
+                self.session
+                    .push_config_undo_snapshot("Edit settings", prev_cfg);
+            }
+
+            let job_id = self.next_slice_job_id.wrapping_add(1);
+            self.next_slice_job_id = job_id;
+            let cfg = self.session.config.clone();
+            let prepared = self.session.prepared_mesh.clone();
+            let raw = self.session.mesh.clone();
+            let mod_vols: Vec<layercraft_slice::ModifierVolume> = self
+                .session
+                .modifiers
+                .iter()
+                .map(|m| layercraft_slice::ModifierVolume {
+                    id: m.id,
+                    name: m.name.clone(),
+                    role: m.role,
+                    mesh: m.prepared_mesh.clone(),
+                    overrides: m.overrides.clone(),
+                })
+                .collect();
+
+            let (tx, rx) = mpsc::channel();
+            let ctx_clone = ctx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("layercraft-slice".to_owned())
+                .spawn(move || {
+                    let t0 = web_time::Instant::now();
+                    let res = (|| -> Result<
+                        (layercraft_slice::SlicedPlate, layercraft_gcode::GcodeOutput),
+                        String,
+                    > {
+                        let plate = if let Some(prep) = prepared.as_ref() {
+                            layercraft_slice::slice_prepared_mesh_with_modifiers(
+                                prep, &cfg, &mod_vols,
+                            )
+                            .map_err(|e| e.to_string())?
+                        } else if let Some(r) = raw.as_ref() {
+                            layercraft_slice::slice_single_mesh_with_modifiers(r, &cfg, &mod_vols)
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            return Err("no mesh loaded on build plate".to_owned());
+                        };
+                        let gcode_out =
+                            layercraft_gcode::emit_gcode(&plate, &cfg).map_err(|e| e.to_string())?;
+                        Ok((plate, gcode_out))
+                    })();
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let _ = tx.send(PendingSliceOutcome {
+                        job_id,
+                        elapsed_ms,
+                        result: res,
+                    });
+                    ctx_clone.request_repaint();
+                });
+
+            match spawned {
+                Ok(_) => {
+                    self.last_error = None;
+                    self.status_message = "Slicing in background...".to_owned();
+                    self.pending_slice = Some(PendingSliceJob { rx });
+                }
+                Err(_) => {
+                    self.run_slice();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_pending_slice(&mut self, ctx: &egui::Context) {
+        let outcome = match self.pending_slice.as_ref() {
+            Some(job) => match job.rx.try_recv() {
+                Ok(out) => Some(out),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_slice = None;
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(out) = outcome else {
+            return;
+        };
+        self.pending_slice = None;
+        if out.job_id != self.next_slice_job_id {
+            return;
+        }
+        match out.result {
+            Ok((plate, gcode_out)) => {
+                let layers = plate.layers.len();
+                self.session.sliced = Some(plate);
+                self.session.last_gcode = Some(gcode_out);
+                self.last_slice_ms = Some(out.elapsed_ms);
+                self.view_mode = ViewMode::Preview;
+                self.last_error = None;
+                self.status_message =
+                    format!("Sliced {layers} layers in {:.1} ms.", out.elapsed_ms);
+                self.rebuild_scene();
+                self.set_active_layer(layers.saturating_sub(1));
+            }
+            Err(err_msg) => {
+                self.last_error = Some(err_msg);
+            }
         }
     }
 
@@ -799,6 +1168,48 @@ impl LayerCraftApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn load_native_path_with_mode(&mut self, path: &str, append: bool) {
+        self.cancel_pending_slice();
+        let is_3mf = path.to_ascii_lowercase().ends_with(".3mf");
+        if !append && is_3mf {
+            match execute(
+                &mut self.session,
+                "project.load_file",
+                serde_json::json!({ "path": path }),
+            ) {
+                Ok(val) => {
+                    let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
+                    self.last_error = None;
+                    if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
+                        self.selected_machine_profile =
+                            self.session.active_profiles.machine.clone();
+                        self.selected_filament_profile =
+                            self.session.active_profiles.filament.clone();
+                        self.selected_process_profile =
+                            self.session.active_profiles.process.clone();
+                        self.status_message = format!(
+                            "Loaded project `{path}` ({} object(s), {} modifier(s)).",
+                            self.session.objects.len(),
+                            self.session.modifiers.len()
+                        );
+                    } else {
+                        self.status_message = format!(
+                            "Loaded `{path}` ({} object(s)).",
+                            self.session.objects.len()
+                        );
+                    }
+                    self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                    self.selected_modifier_id = None;
+                    self.view_mode = ViewMode::Prepare;
+                    self.frame_camera(CameraPreset::Isometric);
+                    self.rebuild_scene();
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Failed loading `{path}`: {e}"));
+                }
+            }
+            return;
+        }
+
         match execute(
             &mut self.session,
             "plate.add_mesh_file",
@@ -815,6 +1226,54 @@ impl LayerCraftApp {
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed loading `{path}`: {e}"));
+            }
+        }
+    }
+
+    pub(crate) fn save_project_action(&mut self) {
+        let bytes = match export_project_3mf_bytes(&self.session) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_error = Some(format!("Project export failed: {e}"));
+                return;
+            }
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Save LayerCraft Project (.3mf)")
+                .set_file_name("layercraft_project.3mf")
+                .add_filter("3MF Project", &["3mf", "3MF"])
+                .save_file()
+            {
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.status_message = format!("Saved project `{}`.", path.display());
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Save project failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match trigger_browser_download_bytes(
+                "layercraft_project.3mf",
+                &bytes,
+                "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+            ) {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.status_message =
+                        "Triggered browser download `layercraft_project.3mf`.".to_owned();
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Download failed: {e}"));
+                }
             }
         }
     }
@@ -929,6 +1388,7 @@ impl LayerCraftApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let avail_w = ui.available_width();
                         if let Some(ep) = &self.bridge_endpoint {
                             let label = match &self.last_mcp_activity {
                                 Some(act) => format!("MCP: {act}"),
@@ -947,16 +1407,18 @@ impl LayerCraftApp {
                                 .response
                                 .on_hover_text(format!("MCP Live Studio bridge listening at {ep}"));
                         }
-                        ui.label(
-                            RichText::new(format!(
-                                "Bed {:.0}×{:.0}×{:.0} mm  ·  Drag: orbit · Shift+Drag: pan · Wheel: zoom · F: fit",
-                                self.session.config.machine.bed_width_mm,
-                                self.session.config.machine.bed_depth_mm,
-                                self.session.config.machine.bed_height_mm,
-                            ))
-                            .size(11.0)
-                            .color(p.text_muted),
-                        );
+                        if avail_w >= 460.0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Bed {:.0}×{:.0}×{:.0} mm  ·  Drag: orbit · Shift+Drag: pan · Wheel: zoom · F: fit",
+                                    self.session.config.machine.bed_width_mm,
+                                    self.session.config.machine.bed_depth_mm,
+                                    self.session.config.machine.bed_height_mm,
+                                ))
+                                .size(11.0)
+                                .color(p.text_muted),
+                            );
+                        }
                     });
                 });
             })
@@ -998,6 +1460,18 @@ impl LayerCraftApp {
                     if scroll.abs() > 0.0 {
                         self.camera.zoom(scroll);
                     }
+                }
+
+                if self.view_mode == ViewMode::Prepare
+                    && resp.clicked_by(egui::PointerButton::Primary)
+                    && !shift
+                    && rect.width() > 1.0
+                    && rect.height() > 1.0
+                    && let Some(pos) = resp.interact_pointer_pos()
+                {
+                    let ndc_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
+                    let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
+                    self.pick_at_ndc(ndc_x, ndc_y);
                 }
 
                 if self.view_mode == ViewMode::Preview && self.playback_playing {
@@ -1146,6 +1620,15 @@ impl LayerCraftApp {
                 self.external_poller = Some(poller);
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_pending_slice(ui.ctx());
+
+        self.pointer_active = ui.ctx().egui_is_using_pointer();
+        if !self.pointer_active {
+            self.drag_undo_active = false;
+            self.session.set_undo_suppressed(false);
+        }
+
         if !self.styles_installed {
             theme::install_styles(ui.ctx());
             self.styles_installed = true;
@@ -1160,6 +1643,24 @@ impl LayerCraftApp {
         self.handle_dropped_files(ui.ctx());
 
         if !ui.ctx().egui_wants_keyboard_input() {
+            let undo_pressed = ui.input(|i| {
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
+            });
+            let redo_pressed = ui.input(|i| {
+                i.modifiers.command
+                    && ((i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                        || i.key_pressed(egui::Key::Y))
+            });
+            let save_pressed = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
+
+            if undo_pressed {
+                self.undo_action();
+            } else if redo_pressed {
+                self.redo_action();
+            } else if save_pressed {
+                self.save_project_action();
+            }
+
             if ui.input(|i| i.key_pressed(egui::Key::F)) {
                 self.frame_camera(CameraPreset::Isometric);
             }
@@ -1212,7 +1713,21 @@ impl LayerCraftApp {
         toolbar::draw_header_bar(self, ui, &palette);
         toolbar::draw_ribbon_bar(self, ui, &palette);
         self.draw_status_bar(ui, &palette);
+
+        let cfg_before_sidebar = self.session.config.clone();
         sidebar::draw_sidebar(self, ui, &palette);
+        if self.session.config != cfg_before_sidebar && self.pending_config_undo.is_none() {
+            self.pending_config_undo = Some(cfg_before_sidebar);
+        }
+        if !ui.ctx().egui_is_using_pointer()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && let Some(prev_cfg) = self.pending_config_undo.take()
+            && self.session.config != prev_cfg
+        {
+            self.session
+                .push_config_undo_snapshot("Edit settings", prev_cfg);
+        }
+
         self.viewport_panel(ui, &palette);
     }
 }
@@ -1225,6 +1740,15 @@ impl eframe::App for LayerCraftApp {
 
 #[cfg(target_arch = "wasm32")]
 fn trigger_browser_download(filename: &str, contents: &str) -> Result<(), String> {
+    trigger_browser_download_bytes(filename, contents.as_bytes(), "text/plain;charset=utf-8")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trigger_browser_download_bytes(
+    filename: &str,
+    bytes: &[u8],
+    mime_type: &str,
+) -> Result<(), String> {
     use wasm_bindgen::JsCast as _;
 
     let win = web_sys::window().ok_or_else(|| "missing browser window".to_owned())?;
@@ -1236,9 +1760,10 @@ fn trigger_browser_download(filename: &str, contents: &str) -> Result<(), String
         .ok_or_else(|| "missing document body".to_owned())?;
 
     let bag = web_sys::BlobPropertyBag::new();
-    bag.set_type("text/plain;charset=utf-8");
-    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(contents));
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &bag)
+    bag.set_type(mime_type);
+    let array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from(array));
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &bag)
         .map_err(|e| format!("failed creating Blob: {e:?}"))?;
     let url = web_sys::Url::create_object_url_with_blob(&blob)
         .map_err(|e| format!("failed creating object URL: {e:?}"))?;
@@ -1312,5 +1837,130 @@ mod tests {
         assert_eq!(app.max_layer, 3);
         assert_eq!(app.layer_move_step, app.active_layer_step_count());
         assert!(!app.playback_playing);
+    }
+
+    #[test]
+    fn pick_at_ndc_selects_objects_modifiers_and_clears_on_miss() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        app.load_sample_with_mode(SampleShape::Cylinder, true);
+        app.auto_arrange_plate();
+        assert_eq!(app.session.objects.len(), 2);
+
+        app.viewport_aspect = 1.6;
+        app.frame_camera(CameraPreset::Top);
+        app.camera.pitch_rad = 1.54;
+
+        let project_ndc = |cam: &OrbitCamera, aspect: f32, pos: [f64; 3]| -> (f32, f32) {
+            let m = cam.view_proj(aspect).to_cols_array_2d();
+            let (x, y, z) = (pos[0] as f32, pos[1] as f32, pos[2] as f32);
+            let cx = m[0][0] * x + m[1][0] * y + m[2][0] * z + m[3][0];
+            let cy = m[0][1] * x + m[1][1] * y + m[2][1] * z + m[3][1];
+            let cw = m[0][3] * x + m[1][3] * y + m[2][3] * z + m[3][3];
+            (cx / cw, cy / cw)
+        };
+
+        let obj0_id = app.session.objects[0].id;
+        let obj1_id = app.session.objects[1].id;
+        let c0 = app.session.objects[0]
+            .prepared_mesh
+            .aabb()
+            .unwrap()
+            .center();
+        let c1 = app.session.objects[1]
+            .prepared_mesh
+            .aabb()
+            .unwrap()
+            .center();
+
+        let (x0, y0) = project_ndc(&app.camera, app.viewport_aspect, [c0.x, c0.y, c0.z]);
+        assert!(app.pick_at_ndc(x0, y0));
+        assert_eq!(app.selected_object_id, Some(obj0_id));
+        assert_eq!(app.selected_modifier_id, None);
+
+        let (x1, y1) = project_ndc(&app.camera, app.viewport_aspect, [c1.x, c1.y, c1.z]);
+        assert!(app.pick_at_ndc(x1, y1));
+        assert_eq!(app.selected_object_id, Some(obj1_id));
+
+        // Add modifier offset cleanly away from objects, then pick it.
+        app.add_modifier_primitive(
+            ModifierPrimitive::Box {
+                width_mm: 14.0,
+                depth_mm: 14.0,
+                height_mm: 14.0,
+            },
+            ModifierRole::SupportBlocker,
+        );
+        let mod_id = app.session.modifiers[0].id;
+        let mod_role = app.session.modifiers[0].role;
+        let mod_ov = app.session.modifiers[0].overrides.clone();
+        app.update_modifier(
+            mod_id,
+            mod_role,
+            [60.0, 60.0, 7.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            mod_ov,
+        );
+        app.frame_camera(CameraPreset::Top);
+        app.camera.target = [125.0, 125.0, 5.0];
+        app.camera.distance = 220.0;
+        let (xm, ym) = project_ndc(&app.camera, app.viewport_aspect, [60.0, 60.0, 7.0]);
+        assert!(app.pick_at_ndc(xm, ym));
+        assert_eq!(app.selected_modifier_id, Some(mod_id));
+        assert_eq!(app.selected_object_id, None);
+
+        // Far corner miss clears selection.
+        assert!(!app.pick_at_ndc(0.98, 0.98));
+        assert_eq!(app.selected_object_id, None);
+        assert_eq!(app.selected_modifier_id, None);
+    }
+
+    #[test]
+    fn undo_redo_and_project_3mf_roundtrip_in_app() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        // Startup sample does not pollute undo history.
+        assert!(!app.session.history_status().can_undo);
+
+        let id = app.session.objects[0].id;
+        app.transform_object(id, [85.0, 115.0], [0.0, 0.0, 20.0], [1.2, 1.2, 1.2]);
+        app.add_modifier_primitive(
+            ModifierPrimitive::Box {
+                width_mm: 10.0,
+                depth_mm: 10.0,
+                height_mm: 8.0,
+            },
+            ModifierRole::Modifier,
+        );
+        app.session.config.process.sparse_infill_density = 0.44;
+        app.session
+            .push_config_undo_snapshot("Edit settings", PrintConfig::default());
+
+        let exported_bytes = export_project_3mf_bytes(&app.session).unwrap();
+
+        // Undo settings edit -> reverts infill density
+        app.undo_action();
+        assert!(
+            (app.session.config.process.sparse_infill_density
+                - PrintConfig::default().process.sparse_infill_density)
+                .abs()
+                < 1e-6
+        );
+
+        // Undo modifier add -> removes modifier
+        app.undo_action();
+        assert!(app.session.modifiers.is_empty());
+
+        // Redo modifier add -> brings modifier back
+        app.redo_action();
+        assert_eq!(app.session.modifiers.len(), 1);
+
+        // Load saved project .3mf into a fresh app via load_mesh_bytes
+        let mut app2 = LayerCraftApp::new(None);
+        app2.load_mesh_bytes("saved_project.3mf", exported_bytes);
+        assert!(app2.last_error.is_none());
+        assert_eq!(app2.session.objects.len(), 1);
+        assert_eq!(app2.session.modifiers.len(), 1);
+        assert!((app2.session.objects[0].transform.position_xy_mm[0] - 85.0).abs() < 1e-6);
+        assert!((app2.session.config.process.sparse_infill_density - 0.44).abs() < 1e-6);
     }
 }

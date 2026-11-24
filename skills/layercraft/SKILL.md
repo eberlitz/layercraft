@@ -33,6 +33,7 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
    - Use `config_patch` for quick overrides (layer height, infill density, wall generator, supports, brim, thumbnails).
 3. **Slice & run DFM diagnostics:**
    - Call `analyze_printability` (automatically slices if needed). Review `overall_risk`, `issues`, `floating_islands`, `overhang_triangle_area_mm2`, `thin_wall_dropped_layers`, `bed_contact_area_mm2`, and `by_feature`.
+   - Use `execute` with `session.undo` / `session.redo` / `session.history` to step through or inspect edit history, and `project.save_file` / `project.load_file` to save or reload full `.3mf` projects (objects, transforms, modifiers, active profiles, and print settings).
 4. **Compare variants visually & quantitatively (optional):**
    - Use `compare_slices` (`patch_b` vs baseline or `patch_a`) to measure filament volume, print time, travel distance, arc count, and per-layer 2D raster IoU without modifying the active session.
    - Use `compare_screenshot` to get a side-by-side 3-panel `A | B | Diff` PNG (`image/png`).

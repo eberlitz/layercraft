@@ -1,6 +1,6 @@
 //! Stateful slicing session and schema-typed command registry (`everything is a command`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_config::ProfileDirLoadReport;
@@ -13,7 +13,10 @@ use layercraft_gcode::{
     emit_gcode, evaluate_gcode,
 };
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
-use layercraft_io::{IoError, read_3mf_bytes, read_stl_bytes};
+use layercraft_io::{
+    IoError, ThreeMfBuildItem, ThreeMfDocument, ThreeMfExportDocument, ThreeMfResourceMesh,
+    read_3mf_document_bytes, read_stl_bytes, write_3mf_document_bytes,
+};
 use layercraft_mesh::{
     MeshError, MeshInspection, ModifierPrimitive, ModifierTransform, ObjectTransform, SampleShape,
     auto_arrange_footprints, build_modifier_primitive, build_sample_shape, inspect_mesh,
@@ -53,6 +56,8 @@ pub enum EngineError {
     #[cfg(not(target_arch = "wasm32"))]
     #[error("file error: {0}")]
     FileWrite(String),
+    #[error("invalid LayerCraft project archive: {0}")]
+    InvalidProject(String),
     #[error(transparent)]
     Geom(#[from] GeomError),
     #[error(transparent)]
@@ -152,6 +157,46 @@ pub struct PlateModifierInfo {
     pub aabb: Option<Aabb3>,
 }
 
+const MAX_UNDO_HISTORY: usize = 50;
+const PROJECT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+struct SessionSnapshot {
+    label: String,
+    config: PrintConfig,
+    active_profiles: ActiveProfiles,
+    objects: Vec<PlateObjectEntry>,
+    next_object_id: u64,
+    modifiers: Vec<PlateModifierEntry>,
+    next_modifier_id: u64,
+    mesh: Option<TriangleMesh>,
+    prepared_mesh: Option<TriangleMesh>,
+}
+
+/// Summary of the bounded session undo/redo history stacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HistoryStatus {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub undo_depth: usize,
+    pub redo_depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_label: Option<String>,
+    pub recent_undo: Vec<String>,
+    pub recent_redo: Vec<String>,
+}
+
+/// Result returned by `session.undo` and `session.redo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HistoryActionResult {
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub history: HistoryStatus,
+}
+
 /// Stateful slicing session driving CLI, WASM, GUI, and MCP frontends.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -166,6 +211,9 @@ pub struct Session {
     pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
+    undo_stack: Vec<SessionSnapshot>,
+    redo_stack: Vec<SessionSnapshot>,
+    suppress_undo_capture: bool,
 }
 
 impl Default for Session {
@@ -182,6 +230,153 @@ impl Default for Session {
             prepared_mesh: None,
             sliced: None,
             last_gcode: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            suppress_undo_capture: false,
+        }
+    }
+}
+
+impl Session {
+    fn capture_snapshot(&self, label: impl Into<String>) -> SessionSnapshot {
+        SessionSnapshot {
+            label: label.into(),
+            config: self.config.clone(),
+            active_profiles: self.active_profiles.clone(),
+            objects: self.objects.clone(),
+            next_object_id: self.next_object_id,
+            modifiers: self.modifiers.clone(),
+            next_modifier_id: self.next_modifier_id,
+            mesh: self.mesh.clone(),
+            prepared_mesh: self.prepared_mesh.clone(),
+        }
+    }
+
+    fn restore_snapshot(&mut self, snap: SessionSnapshot) {
+        self.config = snap.config;
+        self.active_profiles = snap.active_profiles;
+        self.objects = snap.objects;
+        self.next_object_id = snap.next_object_id;
+        self.modifiers = snap.modifiers;
+        self.next_modifier_id = snap.next_modifier_id;
+        self.mesh = snap.mesh;
+        self.prepared_mesh = snap.prepared_mesh;
+        self.sliced = None;
+        self.last_gcode = None;
+    }
+
+    fn push_undo_entry(&mut self, snap: SessionSnapshot) {
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > MAX_UNDO_HISTORY {
+            let excess = self.undo_stack.len() - MAX_UNDO_HISTORY;
+            self.undo_stack.drain(0..excess);
+        }
+        self.redo_stack.clear();
+    }
+
+    /// Inspect current undo/redo availability and labels.
+    pub fn history_status(&self) -> HistoryStatus {
+        let undo_label = self.undo_stack.last().map(|s| s.label.clone());
+        let redo_label = self.redo_stack.last().map(|s| s.label.clone());
+        let recent_undo = self
+            .undo_stack
+            .iter()
+            .rev()
+            .take(5)
+            .map(|s| s.label.clone())
+            .collect();
+        let recent_redo = self
+            .redo_stack
+            .iter()
+            .rev()
+            .take(5)
+            .map(|s| s.label.clone())
+            .collect();
+        HistoryStatus {
+            can_undo: !self.undo_stack.is_empty(),
+            can_redo: !self.redo_stack.is_empty(),
+            undo_depth: self.undo_stack.len(),
+            redo_depth: self.redo_stack.len(),
+            undo_label,
+            redo_label,
+            recent_undo,
+            recent_redo,
+        }
+    }
+
+    /// Clear undo and redo history (e.g. after initial startup sample preload).
+    pub fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// Temporarily suppress automatic command undo snapshots (used when coalescing pointer drags).
+    pub fn set_undo_suppressed(&mut self, suppressed: bool) {
+        self.suppress_undo_capture = suppressed;
+    }
+
+    /// Record the current session state on the undo stack under `label`.
+    pub fn push_undo_snapshot(&mut self, label: impl Into<String>) {
+        let snap = self.capture_snapshot(label);
+        self.push_undo_entry(snap);
+    }
+
+    /// Record a config edit snapshot given the pre-edit `PrintConfig` (for direct UI bindings).
+    pub fn push_config_undo_snapshot(
+        &mut self,
+        label: impl Into<String>,
+        previous_config: PrintConfig,
+    ) {
+        let mut snap = self.capture_snapshot(label);
+        snap.config = previous_config;
+        self.push_undo_entry(snap);
+    }
+
+    /// Revert to the most recent undo snapshot, pushing the current state to redo history.
+    pub fn undo(&mut self) -> HistoryActionResult {
+        let Some(prev) = self.undo_stack.pop() else {
+            return HistoryActionResult {
+                applied: false,
+                label: None,
+                history: self.history_status(),
+            };
+        };
+        let label = prev.label.clone();
+        let redo_snap = self.capture_snapshot(label.clone());
+        self.redo_stack.push(redo_snap);
+        if self.redo_stack.len() > MAX_UNDO_HISTORY {
+            let excess = self.redo_stack.len() - MAX_UNDO_HISTORY;
+            self.redo_stack.drain(0..excess);
+        }
+        self.restore_snapshot(prev);
+        HistoryActionResult {
+            applied: true,
+            label: Some(label),
+            history: self.history_status(),
+        }
+    }
+
+    /// Re-apply the most recently undone snapshot, pushing the current state back to undo history.
+    pub fn redo(&mut self) -> HistoryActionResult {
+        let Some(next) = self.redo_stack.pop() else {
+            return HistoryActionResult {
+                applied: false,
+                label: None,
+                history: self.history_status(),
+            };
+        };
+        let label = next.label.clone();
+        let undo_snap = self.capture_snapshot(label.clone());
+        self.undo_stack.push(undo_snap);
+        if self.undo_stack.len() > MAX_UNDO_HISTORY {
+            let excess = self.undo_stack.len() - MAX_UNDO_HISTORY;
+            self.undo_stack.drain(0..excess);
+        }
+        self.restore_snapshot(next);
+        HistoryActionResult {
+            applied: true,
+            label: Some(label),
+            history: self.history_status(),
         }
     }
 }
@@ -520,6 +715,84 @@ pub struct BatchResult {
     pub error: Option<String>,
 }
 
+/// Parameters for loading a `.3mf` project or model archive from raw bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadProject3mfBytesParams {
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Raw `.3mf` project archive bytes and counts returned by `project.export_3mf_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectExportBytesResult {
+    pub bytes: Vec<u8>,
+    pub object_count: usize,
+    pub modifier_count: usize,
+}
+
+/// Summary returned by `project.load_3mf_bytes` and `project.load_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectLoadResult {
+    pub is_layercraft_project: bool,
+    pub object_count: usize,
+    pub modifier_count: usize,
+    pub active_profiles: ActiveProfiles,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SaveProjectFileParams {
+    pub path: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SaveProjectFileResult {
+    pub path: String,
+    pub bytes_written: usize,
+    pub object_count: usize,
+    pub modifier_count: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadProjectFileParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectObjectRecord {
+    id: u64,
+    name: String,
+    resource_id: u32,
+    transform: ObjectTransform,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectModifierRecord {
+    id: u64,
+    name: String,
+    role: ModifierRole,
+    #[serde(default)]
+    primitive: Option<ModifierPrimitive>,
+    #[serde(default)]
+    resource_id: Option<u32>,
+    transform: ModifierTransform,
+    overrides: ModifierOverrides,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LayerCraftProjectManifest {
+    format_version: u32,
+    config: PrintConfig,
+    #[serde(default)]
+    active_profiles: ActiveProfiles,
+    objects: Vec<ProjectObjectRecord>,
+    #[serde(default)]
+    modifiers: Vec<ProjectModifierRecord>,
+}
+
 /// List compact command names and one-line summaries (optionally filtered by prefix).
 pub fn list_command_summaries(prefix: Option<&str>) -> Vec<CommandSummary> {
     let filter = prefix.map(str::trim).filter(|s| !s.is_empty());
@@ -713,7 +986,51 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             params_schema: schema_val::<CompareSlicesParams>(),
             result_schema: schema_val::<SliceComparisonReport>(),
         },
+        CommandDescriptor {
+            name: "session.undo",
+            summary: "Undo the most recent mutating plate, modifier, profile, or settings change.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<HistoryActionResult>(),
+        },
+        CommandDescriptor {
+            name: "session.redo",
+            summary: "Re-apply the most recently undone change.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<HistoryActionResult>(),
+        },
+        CommandDescriptor {
+            name: "session.history",
+            summary: "Inspect current undo and redo stack depths and recent action labels.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<HistoryStatus>(),
+        },
+        CommandDescriptor {
+            name: "project.export_3mf_bytes",
+            summary: "Serialize the full plate (objects, transforms, modifiers, profiles, settings) into a `.3mf` project archive.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<ProjectExportBytesResult>(),
+        },
+        CommandDescriptor {
+            name: "project.load_3mf_bytes",
+            summary: "Load a LayerCraft `.3mf` project archive (or multi-part `.3mf` model) from raw bytes.",
+            params_schema: schema_val::<LoadProject3mfBytesParams>(),
+            result_schema: schema_val::<ProjectLoadResult>(),
+        },
     ];
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "project.save_file",
+        summary: "Save the full LayerCraft `.3mf` project archive directly to disk.",
+        params_schema: schema_val::<SaveProjectFileParams>(),
+        result_schema: schema_val::<SaveProjectFileResult>(),
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "project.load_file",
+        summary: "Load a LayerCraft `.3mf` project (or multi-part `.3mf` model) from disk.",
+        params_schema: schema_val::<LoadProjectFileParams>(),
+        result_schema: schema_val::<ProjectLoadResult>(),
+    });
     #[cfg(not(target_arch = "wasm32"))]
     cmds.push(CommandDescriptor {
         name: "gcode.save_file",
@@ -840,6 +1157,336 @@ fn add_plate_object(
         auto_arrange_session_objects(session, 6.0)?;
     }
     rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
+}
+
+fn add_3mf_document_objects(
+    session: &mut Session,
+    doc: ThreeMfDocument,
+    name_override: Option<String>,
+    append: bool,
+) -> Result<MeshInspection, EngineError> {
+    let mut parts = doc.parts;
+    if parts.is_empty() {
+        return Err(EngineError::NoMeshLoaded);
+    }
+    if parts.len() == 1
+        && let Some(part) = parts.pop()
+    {
+        let label = name_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or(part.name);
+        return add_plate_object(session, label, part.mesh, append);
+    }
+
+    if !append {
+        session.objects.clear();
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut part_entries: Vec<(String, TriangleMesh, [f64; 2])> = Vec::with_capacity(parts.len());
+
+    for part in parts {
+        let Some(bb) = part.mesh.aabb() else {
+            continue;
+        };
+        min_x = min_x.min(bb.min.x);
+        min_y = min_y.min(bb.min.y);
+        max_x = max_x.max(bb.max.x);
+        max_y = max_y.max(bb.max.y);
+        let c = bb.center();
+        part_entries.push((part.name, part.mesh, [c.x, c.y]));
+    }
+    if part_entries.is_empty() {
+        return Err(EngineError::NoMeshLoaded);
+    }
+
+    let group_cx = 0.5 * (min_x + max_x);
+    let group_cy = 0.5 * (min_y + max_y);
+    let shift_x = 0.5 * session.config.machine.bed_width_mm - group_cx;
+    let shift_y = 0.5 * session.config.machine.bed_depth_mm - group_cy;
+
+    for (name, raw_mesh, center_xy) in part_entries {
+        let id = if session.next_object_id == 0 {
+            1
+        } else {
+            session.next_object_id
+        };
+        session.next_object_id = id + 1;
+        let transform = ObjectTransform {
+            position_xy_mm: [center_xy[0] + shift_x, center_xy[1] + shift_y],
+            rotation_deg: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        };
+        let prepared = prepare_transformed_object(&raw_mesh, transform)?;
+        session.objects.push(PlateObjectEntry {
+            id,
+            name,
+            raw_mesh,
+            transform,
+            prepared_mesh: prepared,
+        });
+    }
+
+    if append && session.objects.len() > 1 {
+        auto_arrange_session_objects(session, 6.0)?;
+    }
+    rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
+}
+
+/// Compute the exact 3MF 4×3 row-vector affine matrix matching [`prepare_transformed_object`].
+pub fn object_transform_3mf_matrix(
+    raw_mesh: &TriangleMesh,
+    transform: ObjectTransform,
+) -> Result<[f64; 12], EngineError> {
+    let [px, py] = transform.position_xy_mm;
+    let [rx, ry, rz] = transform.rotation_deg;
+    let [sx, sy, sz] = transform.scale;
+    if !px.is_finite()
+        || !py.is_finite()
+        || !rx.is_finite()
+        || !ry.is_finite()
+        || !rz.is_finite()
+        || !sx.is_finite()
+        || !sy.is_finite()
+        || !sz.is_finite()
+        || sx <= 0.0
+        || sy <= 0.0
+        || sz <= 0.0
+    {
+        return Err(EngineError::InvalidArgument {
+            field: "transform",
+            reason: "object transform must be finite with positive scale",
+        });
+    }
+    let valid: Vec<_> = raw_mesh
+        .triangles
+        .iter()
+        .copied()
+        .filter(|t| t.is_finite() && t.area_mm2() > 1e-12)
+        .collect();
+    let mut clean = TriangleMesh::new(valid)?;
+    let bb0 = clean.aabb().ok_or(GeomError::EmptyMesh)?;
+    let c0 = bb0.center();
+    let ps = [c0.x, c0.y, bb0.min.z];
+
+    clean.scale(sx, sy, sz)?;
+    let bb1 = clean.aabb().ok_or(GeomError::EmptyMesh)?;
+    let pr = bb1.center();
+
+    clean.rotate_euler_deg(rx, ry, rz)?;
+    let bb2 = clean.aabb().ok_or(GeomError::EmptyMesh)?;
+    let c2 = bb2.center();
+    let gx = px - c2.x;
+    let gy = py - c2.y;
+    let gz = -bb2.min.z;
+
+    let [col0, col1, col2] = TriangleMesh::euler_xyz_deg_columns(rx, ry, rz)?;
+    let [r00, r10, r20] = col0;
+    let [r01, r11, r21] = col1;
+    let [r02, r12, r22] = col2;
+
+    let [psx, psy, psz] = ps;
+    let ux = psx * (1.0 - sx) - pr.x;
+    let uy = psy * (1.0 - sy) - pr.y;
+    let uz = psz * (1.0 - sz) - pr.z;
+
+    let tx = r00 * ux + r01 * uy + r02 * uz + pr.x + gx;
+    let ty = r10 * ux + r11 * uy + r12 * uz + pr.y + gy;
+    let tz = r20 * ux + r21 * uy + r22 * uz + pr.z + gz;
+
+    Ok([
+        r00 * sx,
+        r10 * sx,
+        r20 * sx,
+        r01 * sy,
+        r11 * sy,
+        r21 * sy,
+        r02 * sz,
+        r12 * sz,
+        r22 * sz,
+        tx,
+        ty,
+        tz,
+    ])
+}
+
+/// Export the full session (objects, transforms, modifiers, profiles, and settings) as a `.3mf` project archive.
+pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineError> {
+    let mut resources: Vec<ThreeMfResourceMesh> = Vec::new();
+    let mut build_items: Vec<ThreeMfBuildItem> = Vec::with_capacity(session.objects.len());
+    let mut obj_records: Vec<ProjectObjectRecord> = Vec::with_capacity(session.objects.len());
+    let mut mod_records: Vec<ProjectModifierRecord> = Vec::with_capacity(session.modifiers.len());
+    let mut next_res_id: u32 = 1;
+
+    for obj in &session.objects {
+        let res_id = next_res_id;
+        next_res_id += 1;
+        resources.push(ThreeMfResourceMesh {
+            id: res_id,
+            name: obj.name.clone(),
+            object_type: "model".to_owned(),
+            mesh: obj.raw_mesh.clone(),
+        });
+        let mat = object_transform_3mf_matrix(&obj.raw_mesh, obj.transform)?;
+        build_items.push(ThreeMfBuildItem {
+            object_id: res_id,
+            transform: Some(mat),
+        });
+        obj_records.push(ProjectObjectRecord {
+            id: obj.id,
+            name: obj.name.clone(),
+            resource_id: res_id,
+            transform: obj.transform,
+        });
+    }
+
+    for m in &session.modifiers {
+        let resource_id = if m.primitive.is_none() {
+            let res_id = next_res_id;
+            next_res_id += 1;
+            resources.push(ThreeMfResourceMesh {
+                id: res_id,
+                name: m.name.clone(),
+                object_type: "other".to_owned(),
+                mesh: m.raw_mesh.clone(),
+            });
+            Some(res_id)
+        } else {
+            None
+        };
+        mod_records.push(ProjectModifierRecord {
+            id: m.id,
+            name: m.name.clone(),
+            role: m.role,
+            primitive: m.primitive,
+            resource_id,
+            transform: m.transform,
+            overrides: m.overrides.clone(),
+        });
+    }
+
+    let manifest = LayerCraftProjectManifest {
+        format_version: PROJECT_FORMAT_VERSION,
+        config: session.config.clone(),
+        active_profiles: session.active_profiles.clone(),
+        objects: obj_records,
+        modifiers: mod_records,
+    };
+    let project_json = serde_json::to_string_pretty(&manifest)?;
+    let doc = ThreeMfExportDocument {
+        resources,
+        build_items,
+        project_json: Some(project_json),
+    };
+    Ok(write_3mf_document_bytes(&doc)?)
+}
+
+/// Load a LayerCraft `.3mf` project archive (or fall back to multi-part `.3mf` import if no manifest is present).
+pub fn load_project_3mf_bytes(
+    session: &mut Session,
+    bytes: &[u8],
+    fallback_name: Option<&str>,
+) -> Result<ProjectLoadResult, EngineError> {
+    let doc = read_3mf_document_bytes(bytes)?;
+    let Some(project_json) = doc.project_json.as_deref() else {
+        session.modifiers.clear();
+        let override_name = fallback_name.map(str::to_owned);
+        add_3mf_document_objects(session, doc, override_name, false)?;
+        return Ok(ProjectLoadResult {
+            is_layercraft_project: false,
+            object_count: session.objects.len(),
+            modifier_count: 0,
+            active_profiles: session.active_profiles.clone(),
+        });
+    };
+
+    let manifest: LayerCraftProjectManifest = serde_json::from_str(project_json)
+        .map_err(|e| EngineError::InvalidProject(format!("invalid project manifest JSON: {e}")))?;
+    if manifest.format_version != PROJECT_FORMAT_VERSION {
+        return Err(EngineError::InvalidProject(format!(
+            "unsupported project format version {}",
+            manifest.format_version
+        )));
+    }
+    manifest.config.validate()?;
+
+    let resource_map: HashMap<u32, &ThreeMfResourceMesh> =
+        doc.resources.iter().map(|r| (r.id, r)).collect();
+
+    let mut new_objects = Vec::with_capacity(manifest.objects.len());
+    let mut max_obj_id = 0u64;
+    for rec in manifest.objects {
+        let res = resource_map.get(&rec.resource_id).ok_or_else(|| {
+            EngineError::InvalidProject(format!(
+                "missing 3MF resource {} for object `{}`",
+                rec.resource_id, rec.name
+            ))
+        })?;
+        let prepared_mesh = prepare_transformed_object(&res.mesh, rec.transform)?;
+        max_obj_id = max_obj_id.max(rec.id);
+        new_objects.push(PlateObjectEntry {
+            id: rec.id,
+            name: rec.name,
+            raw_mesh: res.mesh.clone(),
+            transform: rec.transform,
+            prepared_mesh,
+        });
+    }
+
+    let mut new_modifiers = Vec::with_capacity(manifest.modifiers.len());
+    let mut max_mod_id = 0u64;
+    for rec in manifest.modifiers {
+        rec.overrides.validate()?;
+        let raw_mesh = if let Some(prim) = rec.primitive {
+            build_modifier_primitive(prim)?
+        } else if let Some(rid) = rec.resource_id {
+            let res = resource_map.get(&rid).ok_or_else(|| {
+                EngineError::InvalidProject(format!(
+                    "missing 3MF resource {rid} for modifier `{}`",
+                    rec.name
+                ))
+            })?;
+            res.mesh.clone()
+        } else {
+            return Err(EngineError::InvalidProject(format!(
+                "modifier `{}` has neither primitive nor resource_id",
+                rec.name
+            )));
+        };
+        let prepared_mesh = prepare_modifier_mesh(&raw_mesh, rec.transform)?;
+        max_mod_id = max_mod_id.max(rec.id);
+        new_modifiers.push(PlateModifierEntry {
+            id: rec.id,
+            name: rec.name,
+            role: rec.role,
+            primitive: rec.primitive,
+            raw_mesh,
+            transform: rec.transform,
+            prepared_mesh,
+            overrides: rec.overrides,
+        });
+    }
+
+    session.config = manifest.config;
+    session.active_profiles = manifest.active_profiles;
+    session.objects = new_objects;
+    session.next_object_id = max_obj_id + 1;
+    session.modifiers = new_modifiers;
+    session.next_modifier_id = max_mod_id + 1;
+    let _ = rebuild_plate_mesh(session)?;
+
+    Ok(ProjectLoadResult {
+        is_layercraft_project: true,
+        object_count: session.objects.len(),
+        modifier_count: session.modifiers.len(),
+        active_profiles: session.active_profiles.clone(),
+    })
 }
 
 fn object_infos(session: &Session) -> Vec<PlateObjectInfo> {
@@ -997,14 +1644,59 @@ pub fn slice_with_config(
     }
 }
 
-/// Execute a sequence of engine commands, optionally rolling back `session` on failure.
+fn undo_label_for_command(name: &str) -> Option<&'static str> {
+    match name {
+        "plate.clear" => Some("Clear plate"),
+        "plate.add_stl_bytes"
+        | "plate.add_3mf_bytes"
+        | "plate.add_sample_shape"
+        | "plate.add_mesh_file" => Some("Add object"),
+        "plate.remove_object" => Some("Remove object"),
+        "plate.transform_object" => Some("Transform object"),
+        "plate.auto_arrange" => Some("Auto-arrange plate"),
+        "plate.add_modifier_primitive"
+        | "plate.add_modifier_stl_bytes"
+        | "plate.add_modifier_3mf_bytes"
+        | "plate.add_modifier_mesh_file" => Some("Add modifier"),
+        "plate.update_modifier" => Some("Update modifier"),
+        "plate.remove_modifier" => Some("Remove modifier"),
+        "config.set" | "config.patch" => Some("Update settings"),
+        "profile.apply" => Some("Apply profiles"),
+        "project.load_3mf_bytes" | "project.load_file" => Some("Load project"),
+        _ => None,
+    }
+}
+
+/// Execute a sequence of engine commands, optionally rolling back `session` on failure
+/// and coalescing any mutating commands into a single undo snapshot.
 pub fn execute_batch(session: &mut Session, steps: &[BatchStep], atomic: bool) -> BatchResult {
-    let snapshot = if atomic { Some(session.clone()) } else { None };
+    let rollback_backup = if atomic { Some(session.clone()) } else { None };
+    let mut mutating_labels = steps
+        .iter()
+        .filter_map(|s| undo_label_for_command(&s.command));
+    let first_label = mutating_labels.next();
+    let batch_label = match (first_label, mutating_labels.next()) {
+        (Some(single), None) => single,
+        (Some(_), Some(_)) => "Batch edit",
+        (None, _) => "Batch",
+    };
+    let pre_batch = if first_label.is_some() && !session.suppress_undo_capture {
+        Some(session.capture_snapshot(batch_label))
+    } else {
+        None
+    };
+
+    let prev_suppress = session.suppress_undo_capture;
+    session.suppress_undo_capture = true;
     let mut results = Vec::with_capacity(steps.len());
+    let mut any_mutated = false;
 
     for (idx, step) in steps.iter().enumerate() {
-        match execute(session, &step.command, step.params.clone()) {
+        match execute_inner(session, &step.command, step.params.clone()) {
             Ok(result) => {
+                if undo_label_for_command(&step.command).is_some() {
+                    any_mutated = true;
+                }
                 results.push(BatchStepResult {
                     index: idx,
                     command: step.command.clone(),
@@ -1013,9 +1705,11 @@ pub fn execute_batch(session: &mut Session, steps: &[BatchStep], atomic: bool) -
             }
             Err(e) => {
                 let mut rolled_back = false;
-                if let Some(prev) = snapshot {
+                if let Some(prev) = rollback_backup {
                     *session = prev;
                     rolled_back = true;
+                } else {
+                    session.suppress_undo_capture = prev_suppress;
                 }
                 return BatchResult {
                     ok: false,
@@ -1026,6 +1720,11 @@ pub fn execute_batch(session: &mut Session, steps: &[BatchStep], atomic: bool) -
                 };
             }
         }
+    }
+
+    session.suppress_undo_capture = prev_suppress;
+    if any_mutated && let Some(snap) = pre_batch {
+        session.push_undo_entry(snap);
     }
 
     BatchResult {
@@ -1077,8 +1776,32 @@ fn build_side_metrics(
     Ok((metrics, segs))
 }
 
-/// Execute a named command with JSON parameters against `session`.
+/// Execute a named command with JSON parameters against `session` (capturing undo history for mutations).
 pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value, EngineError> {
+    let pre_snap = if !session.suppress_undo_capture
+        && let Some(label) = undo_label_for_command(name)
+    {
+        Some(session.capture_snapshot(label))
+    } else {
+        None
+    };
+
+    let out = execute_inner(session, name, params)?;
+
+    if let Some(snap) = pre_snap {
+        let is_noop =
+            matches!(name, "config.set" | "config.patch") && session.config == snap.config;
+        let is_noop_profile = name == "profile.apply"
+            && session.config == snap.config
+            && session.active_profiles == snap.active_profiles;
+        if !is_noop && !is_noop_profile {
+            session.push_undo_entry(snap);
+        }
+    }
+    Ok(out)
+}
+
+fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Value, EngineError> {
     match name {
         "plate.clear" => {
             let _: EmptyParams = if params.is_null() {
@@ -1100,9 +1823,8 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         }
         "plate.add_3mf_bytes" => {
             let p: Add3mfBytesParams = serde_json::from_value(params)?;
-            let mesh = read_3mf_bytes(&p.bytes)?;
-            let label = p.name.unwrap_or_else(|| "3MF Part".to_owned());
-            let insp = add_plate_object(session, label, mesh, p.append)?;
+            let doc = read_3mf_document_bytes(&p.bytes)?;
+            let insp = add_3mf_document_objects(session, doc, p.name, p.append)?;
             Ok(serde_json::to_value(insp)?)
         }
         "plate.add_sample_shape" => {
@@ -1116,15 +1838,26 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         "plate.add_mesh_file" => {
             let p: AddMeshFileParams = serde_json::from_value(params)?;
             let path = std::path::Path::new(&p.path);
-            let mesh = layercraft_io::read_mesh_file(path)?;
-            let label = p.name.unwrap_or_else(|| {
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Mesh Part")
-                    .to_owned()
-            });
-            let insp = add_plate_object(session, label, mesh, p.append)?;
-            Ok(serde_json::to_value(insp)?)
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if ext == "3mf" {
+                let doc = layercraft_io::read_3mf_document_file(path)?;
+                let insp = add_3mf_document_objects(session, doc, p.name, p.append)?;
+                Ok(serde_json::to_value(insp)?)
+            } else {
+                let mesh = layercraft_io::read_mesh_file(path)?;
+                let label = p.name.unwrap_or_else(|| {
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Mesh Part")
+                        .to_owned()
+                });
+                let insp = add_plate_object(session, label, mesh, p.append)?;
+                Ok(serde_json::to_value(insp)?)
+            }
         }
         "plate.inspect" => {
             let mesh = session
@@ -1211,7 +1944,7 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         }
         "plate.add_modifier_3mf_bytes" => {
             let p: AddModifierBytesParams = serde_json::from_value(params)?;
-            let raw = read_3mf_bytes(&p.bytes)?;
+            let raw = layercraft_io::read_3mf_bytes(&p.bytes)?;
             let label = p.name.unwrap_or_else(|| "3MF Modifier".to_owned());
             let info =
                 add_plate_modifier(session, label, p.role, None, raw, p.transform, p.overrides)?;
@@ -1554,6 +2287,94 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
                 stats: gcode_out.stats.clone(),
                 evaluation,
             })?)
+        }
+        "session.undo" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            let res = session.undo();
+            Ok(serde_json::to_value(res)?)
+        }
+        "session.redo" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            let res = session.redo();
+            Ok(serde_json::to_value(res)?)
+        }
+        "session.history" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            Ok(serde_json::to_value(session.history_status())?)
+        }
+        "project.export_3mf_bytes" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            let bytes = export_project_3mf_bytes(session)?;
+            Ok(serde_json::to_value(ProjectExportBytesResult {
+                bytes,
+                object_count: session.objects.len(),
+                modifier_count: session.modifiers.len(),
+            })?)
+        }
+        "project.load_3mf_bytes" => {
+            let p: LoadProject3mfBytesParams = serde_json::from_value(params)?;
+            let res = load_project_3mf_bytes(session, &p.bytes, p.name.as_deref())?;
+            Ok(serde_json::to_value(res)?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "project.save_file" => {
+            let p: SaveProjectFileParams = serde_json::from_value(params)?;
+            let trimmed = p.path.trim();
+            if trimmed.is_empty() {
+                return Err(EngineError::InvalidArgument {
+                    field: "path",
+                    reason: "must not be empty",
+                });
+            }
+            let bytes = export_project_3mf_bytes(session)?;
+            let out_path = std::path::Path::new(trimmed);
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| EngineError::FileWrite(format!("{}: {e}", parent.display())))?;
+            }
+            std::fs::write(out_path, &bytes)
+                .map_err(|e| EngineError::FileWrite(format!("{}: {e}", out_path.display())))?;
+            Ok(serde_json::to_value(SaveProjectFileResult {
+                path: trimmed.to_owned(),
+                bytes_written: bytes.len(),
+                object_count: session.objects.len(),
+                modifier_count: session.modifiers.len(),
+            })?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "project.load_file" => {
+            let p: LoadProjectFileParams = serde_json::from_value(params)?;
+            let trimmed = p.path.trim();
+            if trimmed.is_empty() {
+                return Err(EngineError::InvalidArgument {
+                    field: "path",
+                    reason: "must not be empty",
+                });
+            }
+            let path = std::path::Path::new(trimmed);
+            let bytes = std::fs::read(path)
+                .map_err(|e| EngineError::FileWrite(format!("{}: {e}", path.display())))?;
+            let fallback = path.file_name().and_then(|s| s.to_str());
+            let res = load_project_3mf_bytes(session, &bytes, fallback)?;
+            Ok(serde_json::to_value(res)?)
         }
         other => Err(EngineError::UnknownCommand(other.to_owned())),
     }
@@ -2166,5 +2987,302 @@ mod tests {
         assert!(saved.bytes_written > 200);
         assert!(saved.evaluation.as_ref().unwrap().safety.is_clean());
         let _ = std::fs::remove_file(tmp_gcode);
+    }
+
+    #[test]
+    fn object_transform_3mf_matrix_matches_prepare_transformed_object() {
+        let raw = build_sample_shape(SampleShape::SteppedBlock).unwrap();
+        let transform = ObjectTransform {
+            position_xy_mm: [82.5, 163.0],
+            rotation_deg: [17.0, -23.0, 41.0],
+            scale: [1.3, 0.85, 1.6],
+        };
+        let prepared = prepare_transformed_object(&raw, transform).unwrap();
+        let mat =
+            layercraft_io::ThreeMfMatrix(object_transform_3mf_matrix(&raw, transform).unwrap());
+        for (tri_raw, tri_prep) in raw.triangles.iter().zip(prepared.triangles.iter()) {
+            for (pr, pp) in [
+                (tri_raw.a, tri_prep.a),
+                (tri_raw.b, tri_prep.b),
+                (tri_raw.c, tri_prep.c),
+            ] {
+                let mapped = mat.apply(pr);
+                assert!((mapped.x - pp.x).abs() < 1e-6);
+                assert!((mapped.y - pp.y).abs() < 1e-6);
+                assert!((mapped.z - pp.z).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_3mf_preserves_relative_layout() {
+        let c1 = build_sample_shape(SampleShape::Cube20).unwrap();
+        let c2 = build_sample_shape(SampleShape::Cylinder).unwrap();
+        let doc_out = ThreeMfExportDocument {
+            resources: vec![
+                ThreeMfResourceMesh {
+                    id: 1,
+                    name: "Left Part".to_owned(),
+                    object_type: "model".to_owned(),
+                    mesh: c1,
+                },
+                ThreeMfResourceMesh {
+                    id: 2,
+                    name: "Right Part".to_owned(),
+                    object_type: "model".to_owned(),
+                    mesh: c2,
+                },
+            ],
+            build_items: vec![
+                ThreeMfBuildItem {
+                    object_id: 1,
+                    transform: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 10.0, 15.0, 0.0]),
+                },
+                ThreeMfBuildItem {
+                    object_id: 2,
+                    transform: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 60.0, 15.0, 0.0]),
+                },
+            ],
+            project_json: None,
+        };
+        let bytes = write_3mf_document_bytes(&doc_out).unwrap();
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_3mf_bytes",
+            serde_json::json!({ "bytes": bytes }),
+        )
+        .unwrap();
+        assert_eq!(sess.objects.len(), 2);
+        let dx = sess.objects[1].transform.position_xy_mm[0]
+            - sess.objects[0].transform.position_xy_mm[0];
+        assert!(
+            (dx - 40.0).abs() < 1e-4,
+            "expected relative X delta 40mm, got {dx}"
+        );
+    }
+
+    #[test]
+    fn project_3mf_roundtrip_preserves_objects_modifiers_and_config() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "profile.apply",
+            serde_json::json!({
+                "machine": "LayerCraft Generic Klipper 250mm",
+                "filament": "LayerCraft Generic PETG",
+                "process": "LayerCraft 0.16mm Quality",
+                "reset_to_defaults": true
+            }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "config.patch",
+            serde_json::json!({ "patch": { "process": { "sparse_infill_density": 0.37 } } }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "name": "Base Cube" }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cylinder", "append": true, "name": "Boss" }),
+        )
+        .unwrap();
+        let id0 = sess.objects[0].id;
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({
+                "id": id0,
+                "position_xy_mm": [75.0, 110.0],
+                "rotation_deg": [0.0, 0.0, 35.0],
+                "scale": [1.4, 0.9, 1.2]
+            }),
+        )
+        .unwrap();
+
+        execute(
+            &mut sess,
+            "plate.add_modifier_primitive",
+            serde_json::json!({
+                "primitive": { "kind": "box", "width_mm": 12.0, "depth_mm": 12.0, "height_mm": 10.0 },
+                "name": "Local Shell Boost",
+                "role": "modifier",
+                "overrides": { "wall_loops": 5 }
+            }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_modifier_stl_bytes",
+            serde_json::json!({
+                "bytes": sample_cube_bytes(),
+                "name": "Mesh Blocker",
+                "role": "support_blocker",
+                "transform": {
+                    "position_xyz_mm": [90.0, 120.0, 8.0],
+                    "rotation_deg": [0.0, 0.0, 15.0],
+                    "scale": [0.5, 0.5, 0.5]
+                }
+            }),
+        )
+        .unwrap();
+
+        let exported: ProjectExportBytesResult = serde_json::from_value(
+            execute(&mut sess, "project.export_3mf_bytes", Value::Null).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exported.object_count, 2);
+        assert_eq!(exported.modifier_count, 2);
+
+        // Plain 3MF readers see the 2 positioned print objects (and NOT the "other" modifier volume).
+        let plain_doc = read_3mf_document_bytes(&exported.bytes).unwrap();
+        assert_eq!(plain_doc.parts.len(), 2);
+        let p0_bb = plain_doc.parts[0].mesh.aabb().unwrap();
+        let orig_bb = sess.objects[0].prepared_mesh.aabb().unwrap();
+        assert!((p0_bb.min.x - orig_bb.min.x).abs() < 1e-4);
+        assert!((p0_bb.max.z - orig_bb.max.z).abs() < 1e-4);
+
+        let mut loaded_sess = Session::default();
+        let load_res: ProjectLoadResult = serde_json::from_value(
+            execute(
+                &mut loaded_sess,
+                "project.load_3mf_bytes",
+                serde_json::json!({ "bytes": exported.bytes }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_res.is_layercraft_project);
+        assert_eq!(loaded_sess.objects.len(), 2);
+        assert_eq!(loaded_sess.modifiers.len(), 2);
+        assert_eq!(loaded_sess.objects[0].transform, sess.objects[0].transform);
+        assert_eq!(loaded_sess.modifiers[0].overrides.wall_loops, Some(5));
+        assert_eq!(loaded_sess.modifiers[1].role, ModifierRole::SupportBlocker);
+        assert!(loaded_sess.modifiers[1].primitive.is_none());
+        assert!((loaded_sess.config.process.sparse_infill_density - 0.37).abs() < 1e-6);
+        assert_eq!(
+            loaded_sess.active_profiles.filament.as_deref(),
+            Some("LayerCraft Generic PETG")
+        );
+
+        // Corrupt project archive returns Err cleanly without panic.
+        assert!(
+            execute(
+                &mut loaded_sess,
+                "project.load_3mf_bytes",
+                serde_json::json!({ "bytes": [1, 2, 3] }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn undo_redo_and_atomic_batch_coalescing() {
+        let mut sess = Session::default();
+        let default_density = sess.config.process.sparse_infill_density;
+        let default_walls = sess.config.process.wall_loops;
+        let h0: HistoryStatus =
+            serde_json::from_value(execute(&mut sess, "session.history", Value::Null).unwrap())
+                .unwrap();
+        assert!(!h0.can_undo);
+        assert!(!h0.can_redo);
+
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20" }),
+        )
+        .unwrap();
+        let id = sess.objects[0].id;
+        execute(
+            &mut sess,
+            "plate.transform_object",
+            serde_json::json!({ "id": id, "position_xy_mm": [90.0, 100.0] }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "config.patch",
+            serde_json::json!({ "patch": { "process": { "sparse_infill_density": 0.42 } } }),
+        )
+        .unwrap();
+        // No-op config.set must NOT push onto undo stack.
+        let same_cfg = sess.config.clone();
+        execute(
+            &mut sess,
+            "config.set",
+            serde_json::json!({ "config": same_cfg }),
+        )
+        .unwrap();
+
+        let h1 = sess.history_status();
+        assert_eq!(h1.undo_depth, 3);
+
+        // Undo 1: revert infill density
+        let u1: HistoryActionResult =
+            serde_json::from_value(execute(&mut sess, "session.undo", Value::Null).unwrap())
+                .unwrap();
+        assert!(u1.applied);
+        assert!((sess.config.process.sparse_infill_density - default_density).abs() < 1e-6);
+
+        // Undo 2: revert transform
+        execute(&mut sess, "session.undo", Value::Null).unwrap();
+        assert!((sess.objects[0].transform.position_xy_mm[0] - 125.0).abs() < 1e-6);
+
+        // Redo 1: re-apply transform
+        execute(&mut sess, "session.redo", Value::Null).unwrap();
+        assert!((sess.objects[0].transform.position_xy_mm[0] - 90.0).abs() < 1e-6);
+
+        // Coalesced atomic batch produces ONE undo entry
+        let depth_before_batch = sess.history_status().undo_depth;
+        let batch = execute_batch(
+            &mut sess,
+            &[
+                BatchStep {
+                    command: "plate.add_sample_shape".to_owned(),
+                    params: serde_json::json!({ "shape": "cylinder", "append": true }),
+                },
+                BatchStep {
+                    command: "config.patch".to_owned(),
+                    params: serde_json::json!({ "patch": { "process": { "wall_loops": 4 } } }),
+                },
+            ],
+            true,
+        );
+        assert!(batch.ok);
+        assert_eq!(sess.history_status().undo_depth, depth_before_batch + 1);
+        assert_eq!(sess.objects.len(), 2);
+        assert_eq!(sess.config.process.wall_loops, 4);
+
+        // Failed atomic batch leaves undo stack untouched
+        let fail_batch = execute_batch(
+            &mut sess,
+            &[
+                BatchStep {
+                    command: "config.patch".to_owned(),
+                    params: serde_json::json!({ "patch": { "process": { "wall_loops": 6 } } }),
+                },
+                BatchStep {
+                    command: "missing.command".to_owned(),
+                    params: Value::Null,
+                },
+            ],
+            true,
+        );
+        assert!(!fail_batch.ok);
+        assert_eq!(sess.history_status().undo_depth, depth_before_batch + 1);
+        assert_eq!(sess.config.process.wall_loops, 4);
+
+        // Single undo reverts entire successful batch
+        execute(&mut sess, "session.undo", Value::Null).unwrap();
+        assert_eq!(sess.objects.len(), 1);
+        assert_eq!(sess.config.process.wall_loops, default_walls);
     }
 }

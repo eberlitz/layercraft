@@ -519,6 +519,29 @@ impl TriangleMesh {
         Ok(())
     }
 
+    /// Return the 3 orthonormal column vectors `[col_x, col_y, col_z]` of the Euler XYZ rotation in degrees.
+    pub fn euler_xyz_deg_columns(
+        rx_deg: f64,
+        ry_deg: f64,
+        rz_deg: f64,
+    ) -> Result<[[f64; 3]; 3], GeomError> {
+        if !rx_deg.is_finite() || !ry_deg.is_finite() || !rz_deg.is_finite() {
+            return Err(GeomError::InvalidTransform(
+                "rotation angles must be finite",
+            ));
+        }
+        let rot = glam::DQuat::from_euler(
+            glam::EulerRot::XYZ,
+            rx_deg.to_radians(),
+            ry_deg.to_radians(),
+            rz_deg.to_radians(),
+        );
+        let cx = rot * glam::DVec3::X;
+        let cy = rot * glam::DVec3::Y;
+        let cz = rot * glam::DVec3::Z;
+        Ok([[cx.x, cx.y, cx.z], [cy.x, cy.y, cy.z], [cz.x, cz.y, cz.z]])
+    }
+
     /// Combine triangles from multiple meshes into a single mesh.
     pub fn merge(meshes: &[TriangleMesh]) -> Result<TriangleMesh, GeomError> {
         let total: usize = meshes.iter().map(|m| m.triangles.len()).sum();

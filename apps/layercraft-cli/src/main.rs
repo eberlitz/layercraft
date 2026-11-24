@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use layercraft_config::{PrintConfig, ProfileKind, ProfileLibrary, ProfileSummary};
-use layercraft_engine::{Session, command_registry, execute};
+use layercraft_engine::{Session, command_registry, execute, slice_with_config};
 use layercraft_gcode::{compare_layer_iou, emit_gcode, evaluate_gcode};
 use layercraft_io::read_mesh_file;
 use layercraft_mcp::{McpConnectMode, McpServer};
@@ -222,41 +222,112 @@ fn run(cli: Cli) -> Result<(), String> {
             filament,
             process,
         } => {
-            let mut cfg: PrintConfig = match config {
-                Some(path) => {
-                    let txt = std::fs::read_to_string(&path)
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
-                    serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", path.display()))?
-                }
-                None => PrintConfig::default(),
-            };
-            if !profile_dir.is_empty()
+            let is_3mf = input
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"));
+            let has_explicit_profiles = !profile_dir.is_empty()
                 || !profile_file.is_empty()
                 || machine.is_some()
                 || filament.is_some()
-                || process.is_some()
-            {
-                let (lib, file_summaries) = load_cli_profile_library(&profile_dir, &profile_file)?;
-                let m_sel =
-                    machine.or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
-                let f_sel =
-                    filament.or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
-                let p_sel =
-                    process.or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
-                let res = lib
-                    .build_print_config(&cfg, m_sel.as_deref(), f_sel.as_deref(), p_sel.as_deref())
+                || process.is_some();
+
+            let (sliced, effective_cfg) = if is_3mf {
+                let mut session = Session::default();
+                let in_str = input.to_string_lossy().into_owned();
+                execute(
+                    &mut session,
+                    "project.load_file",
+                    serde_json::json!({ "path": in_str }),
+                )
+                .map_err(|e| format!("{}: {e}", input.display()))?;
+
+                if let Some(cfg_path) = &config {
+                    let txt = std::fs::read_to_string(cfg_path)
+                        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+                    let override_cfg: PrintConfig = serde_json::from_str(&txt)
+                        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+                    execute(
+                        &mut session,
+                        "config.set",
+                        serde_json::json!({ "config": override_cfg }),
+                    )
                     .map_err(|e| e.to_string())?;
-                for w in &res.warnings {
-                    eprintln!(
-                        "profile warning [{} :: {}]: {}",
-                        w.profile, w.key, w.message
-                    );
                 }
-                cfg = res.config;
-            }
-            let mesh = read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
-            let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
-            let gcode_out = emit_gcode(&sliced, &cfg).map_err(|e| e.to_string())?;
+                if has_explicit_profiles {
+                    let (lib, file_summaries) =
+                        load_cli_profile_library(&profile_dir, &profile_file)?;
+                    let m_sel = machine
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
+                    let f_sel = filament
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
+                    let p_sel = process
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
+                    let res = lib
+                        .build_print_config(
+                            &session.config,
+                            m_sel.as_deref(),
+                            f_sel.as_deref(),
+                            p_sel.as_deref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for w in &res.warnings {
+                        eprintln!(
+                            "profile warning [{} :: {}]: {}",
+                            w.profile, w.key, w.message
+                        );
+                    }
+                    execute(
+                        &mut session,
+                        "config.set",
+                        serde_json::json!({ "config": res.config }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                let sliced =
+                    slice_with_config(&session, &session.config).map_err(|e| e.to_string())?;
+                (sliced, session.config)
+            } else {
+                let mut cfg: PrintConfig = match config {
+                    Some(path) => {
+                        let txt = std::fs::read_to_string(&path)
+                            .map_err(|e| format!("{}: {e}", path.display()))?;
+                        serde_json::from_str(&txt)
+                            .map_err(|e| format!("{}: {e}", path.display()))?
+                    }
+                    None => PrintConfig::default(),
+                };
+                if has_explicit_profiles {
+                    let (lib, file_summaries) =
+                        load_cli_profile_library(&profile_dir, &profile_file)?;
+                    let m_sel = machine
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
+                    let f_sel = filament
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
+                    let p_sel = process
+                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
+                    let res = lib
+                        .build_print_config(
+                            &cfg,
+                            m_sel.as_deref(),
+                            f_sel.as_deref(),
+                            p_sel.as_deref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for w in &res.warnings {
+                        eprintln!(
+                            "profile warning [{} :: {}]: {}",
+                            w.profile, w.key, w.message
+                        );
+                    }
+                    cfg = res.config;
+                }
+                let mesh =
+                    read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+                let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
+                (sliced, cfg)
+            };
+            let gcode_out = emit_gcode(&sliced, &effective_cfg).map_err(|e| e.to_string())?;
             std::fs::write(&output, &gcode_out.gcode)
                 .map_err(|e| format!("{}: {e}", output.display()))?;
             if let Some(stats_path) = stats {

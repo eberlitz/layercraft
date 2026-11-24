@@ -22,21 +22,23 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                 .inner_margin(Margin::symmetric(12, 6)),
         )
         .show(ui, |ui| {
+            let avail_w = ui.available_width();
             ui.horizontal(|ui| {
                 ui.set_min_height(28.0);
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = if avail_w < 540.0 { 5.0 } else { 8.0 };
 
                 // Brand mark & title
                 let (mark_rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::hover());
                 paint_icon(ui.painter(), mark_rect, Icon::BrandMark, p.accent);
-                ui.label(
-                    RichText::new("LayerCraft")
-                        .size(14.5)
-                        .strong()
-                        .color(p.text_primary),
-                );
-
-                v_divider(ui, p);
+                if avail_w >= 540.0 {
+                    ui.label(
+                        RichText::new("LayerCraft")
+                            .size(14.5)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    v_divider(ui, p);
+                }
 
                 if icon_button(
                     ui,
@@ -58,29 +60,43 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                 draw_view_mode_switcher(app, ui, p);
 
                 // Compact active printer & layer height chip
-                let machine_short = app
-                    .selected_machine_profile
-                    .as_deref()
-                    .map(|s| s.strip_prefix("LayerCraft ").unwrap_or(s))
-                    .unwrap_or("Default Printer");
-                let summary = format!(
-                    "{machine_short} · {:.2} mm",
-                    app.session.config.process.layer_height_mm
-                );
-                badge(ui, p.bg_card, p.text_secondary, &summary);
+                if avail_w >= 860.0 {
+                    let machine_short = app
+                        .selected_machine_profile
+                        .as_deref()
+                        .map(|s| s.strip_prefix("LayerCraft ").unwrap_or(s))
+                        .unwrap_or("Default Printer");
+                    let summary = format!(
+                        "{machine_short} · {:.2} mm",
+                        app.session.config.process.layer_height_mm
+                    );
+                    badge(ui, p.bg_card, p.text_secondary, &summary);
+                }
 
                 // Right-aligned primary actions & theme/ribbon controls
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    let slicing = app.is_slicing();
 
                     match app.view_mode {
                         ViewMode::Prepare => {
-                            if primary_button(ui, p, Icon::SliceLayers, "Slice Plate").clicked() {
-                                app.run_slice();
-                            }
+                            let label = if slicing {
+                                "Slicing..."
+                            } else if avail_w < 640.0 {
+                                "Slice"
+                            } else {
+                                "Slice Plate"
+                            };
+                            ui.add_enabled_ui(!slicing, |ui| {
+                                if primary_button(ui, p, Icon::SliceLayers, label).clicked() {
+                                    app.start_slice_action(ui.ctx());
+                                }
+                            });
                         }
                         ViewMode::Preview => {
-                            let export_label = if cfg!(target_arch = "wasm32") {
+                            let export_label = if avail_w < 640.0 {
+                                "G-code"
+                            } else if cfg!(target_arch = "wasm32") {
                                 "Download G-code"
                             } else {
                                 "Export G-code"
@@ -91,15 +107,20 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                             {
                                 app.export_gcode_action();
                             }
-                            if secondary_button(ui, p, Some(Icon::SliceLayers), "Re-slice")
-                                .clicked()
-                            {
-                                app.run_slice();
-                            }
+                            let reslice_label = if slicing { "Slicing..." } else { "Re-slice" };
+                            ui.add_enabled_ui(!slicing, |ui| {
+                                if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label)
+                                    .clicked()
+                                {
+                                    app.start_slice_action(ui.ctx());
+                                }
+                            });
                         }
                     }
 
-                    v_divider(ui, p);
+                    if avail_w >= 540.0 {
+                        v_divider(ui, p);
+                    }
 
                     let theme_icon = match app.theme_mode {
                         ThemeMode::Dark => Icon::ThemeDark,
@@ -219,14 +240,19 @@ pub fn draw_ribbon_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                 .inner_margin(Margin::symmetric(12, 5)),
         )
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(26.0);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                match app.view_mode {
-                    ViewMode::Prepare => draw_prepare_ribbon(app, ui, p),
-                    ViewMode::Preview => draw_preview_ribbon(app, ui, p),
-                }
-            });
+            egui::ScrollArea::horizontal()
+                .id_salt("layercraft_ribbon_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(26.0);
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        match app.view_mode {
+                            ViewMode::Prepare => draw_prepare_ribbon(app, ui, p),
+                            ViewMode::Preview => draw_preview_ribbon(app, ui, p),
+                        }
+                    });
+                });
         })
         .response;
 
@@ -241,7 +267,7 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
     #[cfg(not(target_arch = "wasm32"))]
     {
         if ribbon_button(ui, p, Icon::OpenFile, "Open", false)
-            .on_hover_text("Open STL or 3MF model (replaces current plate)")
+            .on_hover_text("Open STL or 3MF model/project (replaces current plate)")
             .clicked()
         {
             app.open_file_dialog(false);
@@ -253,6 +279,43 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
             app.open_file_dialog(true);
         }
     }
+
+    if ribbon_button(ui, p, Icon::SaveProject, "Save .3mf", false)
+        .on_hover_text(
+            "Save full LayerCraft project (.3mf with objects, modifiers & settings) (Ctrl+S)",
+        )
+        .clicked()
+    {
+        app.save_project_action();
+    }
+
+    let hist = app.session.history_status();
+    let undo_tip = match &hist.undo_label {
+        Some(lbl) => format!("Undo `{lbl}` (Ctrl+Z)"),
+        None => "Nothing to undo (Ctrl+Z)".to_owned(),
+    };
+    ui.add_enabled_ui(hist.can_undo, |ui| {
+        if ribbon_button(ui, p, Icon::Undo, "Undo", false)
+            .on_hover_text(undo_tip)
+            .clicked()
+        {
+            app.undo_action();
+        }
+    });
+    let redo_tip = match &hist.redo_label {
+        Some(lbl) => format!("Redo `{lbl}` (Ctrl+Shift+Z)"),
+        None => "Nothing to redo (Ctrl+Shift+Z)".to_owned(),
+    };
+    ui.add_enabled_ui(hist.can_redo, |ui| {
+        if ribbon_button(ui, p, Icon::Redo, "Redo", false)
+            .on_hover_text(redo_tip)
+            .clicked()
+        {
+            app.redo_action();
+        }
+    });
+
+    v_divider(ui, p);
 
     let sample_resp = ribbon_dropdown_button(ui, p, Icon::SampleCube, "Samples")
         .on_hover_text("Load or add built-in calibration meshes");

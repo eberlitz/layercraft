@@ -1,0 +1,26 @@
+{
+  "name": "LayerCraft — Pure-Rust 3D Slicer",
+  "short_name": "LayerCraft",
+  "description": "Clean-room pure-Rust 3D printer slicer running in the browser via WebGPU/WASM.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#15181e",
+  "theme_color": "#15181e",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
