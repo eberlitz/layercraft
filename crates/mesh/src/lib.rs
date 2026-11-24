@@ -1,5 +1,7 @@
 //! Triangle mesh inspection, bed placement, and exact Z-plane slicing.
 
+mod repair;
+
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
@@ -10,6 +12,8 @@ use layercraft_geom::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use repair::{MeshRepairConfig, MeshRepairReport, RepairedMesh, repair_mesh};
 
 /// Errors produced during mesh preparation or slicing.
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -23,6 +27,9 @@ pub enum MeshError {
     /// Invalid layer schedule parameters.
     #[error("invalid slicing parameters: {0}")]
     InvalidSchedule(&'static str),
+    /// Invalid mesh repair configuration.
+    #[error("invalid mesh repair configuration: {0}")]
+    InvalidRepairConfig(&'static str),
 }
 
 /// Summary properties computed from a triangle mesh.
@@ -33,7 +40,23 @@ pub struct MeshInspection {
     pub volume_mm3: f64,
     pub surface_area_mm2: f64,
     pub degenerate_triangles: usize,
+    /// Edges not shared by exactly two triangles (boundary + over-shared edges).
     pub non_manifold_edges: usize,
+    /// Open edges used by exactly one triangle.
+    #[serde(default)]
+    pub boundary_edges: usize,
+    /// Triangles that repeat another triangle's vertex set (either winding).
+    #[serde(default)]
+    pub duplicate_triangles: usize,
+    /// Manifold edges whose two triangles traverse it in the same direction.
+    #[serde(default)]
+    pub inconsistent_winding_edges: usize,
+    /// Closed, consistently wound shells with negative (inward) volume that are not enclosed cavities.
+    #[serde(default)]
+    pub inverted_shells: usize,
+    /// `true` when any topology defect suggests running mesh repair.
+    #[serde(default)]
+    pub needs_repair: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,9 +82,11 @@ fn edge_key(a: QuantPt3, b: QuantPt3) -> (QuantPt3, QuantPt3) {
 pub fn inspect_mesh(mesh: &TriangleMesh) -> MeshInspection {
     let mut degenerate_triangles = 0usize;
     let mut edge_counts: HashMap<(QuantPt3, QuantPt3), usize> = HashMap::new();
+    let mut vert_map: HashMap<QuantPt3, usize> = HashMap::new();
+    let mut ix = repair::Indexed::default();
 
     for tri in &mesh.triangles {
-        if tri.area_mm2() <= 1e-12 {
+        if !tri.is_finite() || tri.area_mm2() <= 1e-12 {
             degenerate_triangles += 1;
             continue;
         }
@@ -76,10 +101,33 @@ pub fn inspect_mesh(mesh: &TriangleMesh) -> MeshInspection {
                     *count += 1;
                 }
             }
+            let mut intern = |q: QuantPt3, p: Point3| -> usize {
+                if let Some(&idx) = vert_map.get(&q) {
+                    idx
+                } else {
+                    let idx = ix.verts.len();
+                    ix.verts.push([p.x, p.y, p.z]);
+                    vert_map.insert(q, idx);
+                    idx
+                }
+            };
+            let ia = intern(qa, tri.a);
+            let ib = intern(qb, tri.b);
+            let ic = intern(qc, tri.c);
+            if ia != ib && ib != ic && ic != ia {
+                ix.tris.push([ia, ib, ic]);
+            }
         }
     }
 
     let non_manifold_edges = edge_counts.values().filter(|&&c| c != 2).count();
+    let boundary_edges = edge_counts.values().filter(|&&c| c == 1).count();
+    let topo = repair::topology_stats(&ix);
+    let needs_repair = degenerate_triangles > 0
+        || non_manifold_edges > 0
+        || topo.duplicate_triangles > 0
+        || topo.inconsistent_winding_edges > 0
+        || topo.inverted_shells > 0;
 
     MeshInspection {
         triangle_count: mesh.triangles.len(),
@@ -88,6 +136,11 @@ pub fn inspect_mesh(mesh: &TriangleMesh) -> MeshInspection {
         surface_area_mm2: mesh.surface_area_mm2(),
         degenerate_triangles,
         non_manifold_edges,
+        boundary_edges,
+        duplicate_triangles: topo.duplicate_triangles,
+        inconsistent_winding_edges: topo.inconsistent_winding_edges,
+        inverted_shells: topo.inverted_shells,
+        needs_repair,
     }
 }
 
@@ -977,6 +1030,8 @@ fn stitch_segments_into_loops(segments: &[(Point2, Point2)]) -> Vec<Polygon> {
 
     let mut used = vec![false; segments.len()];
     let mut loops = Vec::new();
+    let mut open_chains: Vec<Vec<Point2>> = Vec::new();
+    let max_snap_10_sq: i128 = 10_000i128 * 10_000i128;
 
     for start_idx in 0..segments.len() {
         if used.get(start_idx).copied().unwrap_or(true) {
@@ -1012,14 +1067,13 @@ fn stitch_segments_into_loops(segments: &[(Point2, Point2)]) -> Vec<Polygon> {
                 }
             } else {
                 // Tolerance fallback for slightly cracked STL meshes (within 10 um = 10_000 nm).
-                let max_snap_sq: i128 = 10_000i128 * 10_000i128;
                 let mut best: Option<(usize, i128)> = None;
                 for (idx, &(cand_start, _)) in segments.iter().enumerate() {
                     if used.get(idx).copied().unwrap_or(true) {
                         continue;
                     }
                     let d2 = cur_end.distance_sq_nm(cand_start);
-                    if d2 <= max_snap_sq && best.is_none_or(|(_, bd)| d2 < bd) {
+                    if d2 <= max_snap_10_sq && best.is_none_or(|(_, bd)| d2 < bd) {
                         best = Some((idx, d2));
                     }
                 }
@@ -1041,9 +1095,98 @@ fn stitch_segments_into_loops(segments: &[(Point2, Point2)]) -> Vec<Polygon> {
 
         // Only emit closed (or nearly closed) contours with >= 3 distinct vertices.
         if pts.len() >= 3
-            && (cur_end == first_pt || cur_end.distance_sq_nm(first_pt) <= 10_000i128 * 10_000i128)
+            && (cur_end == first_pt || cur_end.distance_sq_nm(first_pt) <= max_snap_10_sq)
         {
             loops.push(Polygon::new(pts));
+        } else if pts.len() >= 2 {
+            open_chains.push(pts);
+        }
+    }
+
+    // Secondary 50 um open-chain fallback (including reversed chains) for slightly cracked/flipped meshes.
+    if !open_chains.is_empty() {
+        let max_snap_50_sq: i128 = 50_000i128 * 50_000i128;
+        let mut chain_used = vec![false; open_chains.len()];
+        for ci in 0..open_chains.len() {
+            if chain_used.get(ci).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(u) = chain_used.get_mut(ci) {
+                *u = true;
+            }
+            let Some(mut chain) = open_chains.get(ci).cloned() else {
+                continue;
+            };
+            let mut flipped = false;
+            let mut guard = 0usize;
+            while guard <= open_chains.len().saturating_mul(2).saturating_add(2) {
+                guard += 1;
+                let (Some(&first_pt), Some(&cur_end)) = (chain.first(), chain.last()) else {
+                    break;
+                };
+                if cur_end == first_pt && chain.len() >= 4 {
+                    break;
+                }
+                let close_d2 = cur_end.distance_sq_nm(first_pt);
+                let mut best: Option<(usize, bool, i128)> = None;
+                for (oj, cand) in open_chains.iter().enumerate() {
+                    if chain_used.get(oj).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let (Some(&cf), Some(&cl)) = (cand.first(), cand.last()) else {
+                        continue;
+                    };
+                    let d2_fwd = cur_end.distance_sq_nm(cf);
+                    if d2_fwd <= max_snap_50_sq && best.is_none_or(|(_, _, bd)| d2_fwd < bd) {
+                        best = Some((oj, false, d2_fwd));
+                    }
+                    let d2_rev = cur_end.distance_sq_nm(cl);
+                    if d2_rev <= max_snap_50_sq && best.is_none_or(|(_, _, bd)| d2_rev < bd) {
+                        best = Some((oj, true, d2_rev));
+                    }
+                }
+                let Some((oj, rev, cand_d2)) = best else {
+                    if !flipped {
+                        chain.reverse();
+                        flipped = true;
+                        continue;
+                    }
+                    break;
+                };
+                if chain.len() >= 3 && close_d2 <= max_snap_50_sq && close_d2 <= cand_d2 {
+                    break;
+                }
+                if let Some(u) = chain_used.get_mut(oj) {
+                    *u = true;
+                }
+                let Some(cand) = open_chains.get(oj) else {
+                    break;
+                };
+                flipped = false;
+                if rev {
+                    for &pt in cand.iter().rev() {
+                        if chain.last().copied() != Some(pt) {
+                            chain.push(pt);
+                        }
+                    }
+                } else {
+                    for &pt in cand {
+                        if chain.last().copied() != Some(pt) {
+                            chain.push(pt);
+                        }
+                    }
+                }
+            }
+            if let (Some(&first_pt), Some(&last_pt)) = (chain.first(), chain.last()) {
+                let closed =
+                    last_pt == first_pt || last_pt.distance_sq_nm(first_pt) <= max_snap_50_sq;
+                if last_pt == first_pt {
+                    chain.pop();
+                }
+                if closed && chain.len() >= 3 {
+                    loops.push(Polygon::new(chain));
+                }
+            }
         }
     }
 
@@ -1466,5 +1609,31 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn stitch_50um_open_chain_and_reversed_chain_fallback() {
+        let p = |x, y| Point2::from_mm(x, y).unwrap();
+        // Watertight loop stays exact.
+        let exact = vec![
+            (p(0.0, 0.0), p(10.0, 0.0)),
+            (p(10.0, 0.0), p(10.0, 10.0)),
+            (p(10.0, 10.0), p(0.0, 10.0)),
+            (p(0.0, 10.0), p(0.0, 0.0)),
+        ];
+        let exact_loops = stitch_segments_into_loops(&exact);
+        assert_eq!(exact_loops.len(), 1);
+        assert!((exact_loops[0].area_mm2() - 100.0).abs() < 1e-6);
+
+        // One reversed edge + 30 um (0.03 mm) crack exceeds 10 um pass -> 50 um open-chain fallback closes it.
+        let cracked_and_flipped = vec![
+            (p(0.0, 0.0), p(10.0, 0.0)),
+            (p(10.03, 10.0), p(10.0, 0.0)), // reversed + 30 um gap
+            (p(10.03, 10.0), p(0.0, 10.0)),
+            (p(0.0, 10.0), p(0.0, 0.0)),
+        ];
+        let repaired_loops = stitch_segments_into_loops(&cracked_and_flipped);
+        assert_eq!(repaired_loops.len(), 1);
+        assert!((repaired_loops[0].area_mm2() - 100.0).abs() < 0.5);
     }
 }

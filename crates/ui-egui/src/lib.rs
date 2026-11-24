@@ -16,8 +16,8 @@ use layercraft_config::{
     ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileKind, ProfileSummary,
 };
 use layercraft_engine::{
-    HistoryActionResult, PrinterAuth, PrinterProfile, ProjectLoadResult, Session, execute,
-    export_project_3mf_bytes,
+    HistoryActionResult, PlateRepairResult, PrinterAuth, PrinterProfile, ProjectLoadResult,
+    Session, execute, export_project_3mf_bytes,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_engine::{
@@ -412,6 +412,11 @@ impl LayerCraftApp {
                 self.view_mode = ViewMode::Prepare;
             }
             self.status_message = format!("Updated session via MCP ({command}).");
+        } else if command == "plate.repair_mesh" {
+            if self.session.sliced.is_none() {
+                self.view_mode = ViewMode::Prepare;
+            }
+            self.status_message = "Repaired mesh via MCP.".to_owned();
         } else if command.starts_with("plate.add_") || command == "plate.auto_arrange" {
             if self.session.sliced.is_none() {
                 self.view_mode = ViewMode::Prepare;
@@ -804,6 +809,7 @@ impl LayerCraftApp {
                             self.session.objects.len()
                         );
                     }
+                    self.append_repair_warning_to_status();
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
@@ -831,6 +837,7 @@ impl LayerCraftApp {
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{name}`.");
+                self.append_repair_warning_to_status();
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
             }
@@ -994,6 +1001,65 @@ impl LayerCraftApp {
             Err(e) => {
                 self.last_error = Some(e.to_string());
             }
+        }
+    }
+
+    pub(crate) fn repair_plate_mesh(&mut self, object_id: Option<u64>) {
+        self.cancel_pending_slice();
+        match execute(
+            &mut self.session,
+            "plate.repair_mesh",
+            serde_json::json!({ "object_id": object_id }),
+        ) {
+            Ok(val) => {
+                let res: Option<PlateRepairResult> = serde_json::from_value(val).ok();
+                self.last_error = None;
+                self.view_mode = ViewMode::Prepare;
+                if let Some(r) = res {
+                    if !r.changed {
+                        self.status_message =
+                            "Mesh already clean (no repairable defects found).".to_owned();
+                    } else {
+                        let welded: usize =
+                            r.objects.iter().map(|o| o.report.welded_vertices).sum();
+                        let flipped: usize =
+                            r.objects.iter().map(|o| o.report.flipped_triangles).sum();
+                        let holes: usize = r.objects.iter().map(|o| o.report.holes_filled).sum();
+                        let rem: usize = r
+                            .objects
+                            .iter()
+                            .map(|o| o.report.removed_degenerate + o.report.removed_duplicate)
+                            .sum();
+                        let still_bad = r.plate_inspection.as_ref().is_some_and(|i| i.needs_repair);
+                        self.status_message = if still_bad {
+                            format!(
+                                "Repaired mesh (welded {welded}, removed {rem}, flipped {flipped}, filled {holes} hole(s)); some non-manifold edges remain."
+                            )
+                        } else {
+                            format!(
+                                "Repaired mesh (welded {welded}, removed {rem}, flipped {flipped}, filled {holes} hole(s))."
+                            )
+                        };
+                    }
+                } else {
+                    self.status_message = "Repaired mesh.".to_owned();
+                }
+                self.rebuild_scene();
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Mesh repair failed: {e}"));
+            }
+        }
+    }
+
+    fn append_repair_warning_to_status(&mut self) {
+        if let Some(insp) = &self.session.plate_inspection
+            && insp.needs_repair
+        {
+            self.status_message.push_str(&format!(
+                " Topology issues detected ({} non-manifold / {} flipped edge(s)) — use Plate -> Mesh Summary -> Repair Mesh.",
+                insp.non_manifold_edges, insp.inconsistent_winding_edges
+            ));
         }
     }
 
@@ -1204,7 +1270,7 @@ impl LayerCraftApp {
                     id: m.id,
                     name: m.name.clone(),
                     role: m.role,
-                    mesh: m.prepared_mesh.clone(),
+                    mesh: layercraft_geom::TriangleMesh::clone(&m.prepared_mesh),
                     overrides: m.overrides.clone(),
                 })
                 .collect();
@@ -1551,6 +1617,7 @@ impl LayerCraftApp {
                             self.session.objects.len()
                         );
                     }
+                    self.append_repair_warning_to_status();
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
@@ -1578,6 +1645,7 @@ impl LayerCraftApp {
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
                 self.status_message = format!("Loaded `{path}`.");
+                self.append_repair_warning_to_status();
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
             }
@@ -2770,5 +2838,37 @@ mod tests {
             app.render_ui(ui);
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn ui_repair_plate_mesh_fixes_defective_stl() {
+        let mut tris = layercraft_mesh::build_sample_shape(SampleShape::Cube20)
+            .unwrap()
+            .triangles;
+        tris.pop();
+        if let Some(first) = tris.first_mut() {
+            *first = first.flipped();
+        }
+        let mut stl = vec![0u8; 80];
+        stl.extend_from_slice(&(tris.len() as u32).to_le_bytes());
+        for t in &tris {
+            stl.extend_from_slice(&[0u8; 12]);
+            for p in [t.a, t.b, t.c] {
+                stl.extend_from_slice(&(p.x as f32).to_le_bytes());
+                stl.extend_from_slice(&(p.y as f32).to_le_bytes());
+                stl.extend_from_slice(&(p.z as f32).to_le_bytes());
+            }
+            stl.extend_from_slice(&0u16.to_le_bytes());
+        }
+
+        let mut app = LayerCraftApp::new(None);
+        app.load_mesh_bytes("broken_cube.stl", stl);
+        assert!(app.session.plate_inspection.as_ref().unwrap().needs_repair);
+        assert!(app.status_message.contains("Topology issues detected"));
+
+        app.repair_plate_mesh(None);
+        assert!(app.last_error.is_none());
+        assert!(!app.session.plate_inspection.as_ref().unwrap().needs_repair);
+        assert!(app.status_message.contains("Repaired mesh"));
     }
 }

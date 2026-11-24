@@ -1,6 +1,7 @@
 //! Stateful slicing session and schema-typed command registry (`everything is a command`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use base64::Engine as _;
 #[cfg(not(target_arch = "wasm32"))]
@@ -31,8 +32,9 @@ pub use layercraft_io::{probe_printer, upload_to_printer};
 use layercraft_mesh::{
     MeshError, MeshInspection, ModifierPrimitive, ModifierTransform, ObjectTransform, SampleShape,
     auto_arrange_footprints, build_modifier_primitive, build_sample_shape, inspect_mesh,
-    prepare_modifier_mesh, prepare_transformed_object,
+    prepare_modifier_mesh, prepare_transformed_object, repair_mesh,
 };
+pub use layercraft_mesh::{MeshRepairConfig, MeshRepairReport};
 use layercraft_slice::{
     ModifierVolume, PrintabilityReport, SliceError, SlicedPlate, analyze_printability,
     slice_prepared_mesh_with_modifiers, slice_single_mesh_with_modifiers,
@@ -100,9 +102,9 @@ pub enum EngineError {
 pub struct PlateObjectEntry {
     pub id: u64,
     pub name: String,
-    pub raw_mesh: TriangleMesh,
+    pub raw_mesh: Arc<TriangleMesh>,
     pub transform: ObjectTransform,
-    pub prepared_mesh: TriangleMesh,
+    pub prepared_mesh: Arc<TriangleMesh>,
 }
 
 impl PlateObjectEntry {
@@ -134,9 +136,9 @@ pub struct PlateModifierEntry {
     pub name: String,
     pub role: ModifierRole,
     pub primitive: Option<ModifierPrimitive>,
-    pub raw_mesh: TriangleMesh,
+    pub raw_mesh: Arc<TriangleMesh>,
     pub transform: ModifierTransform,
-    pub prepared_mesh: TriangleMesh,
+    pub prepared_mesh: Arc<TriangleMesh>,
     pub overrides: ModifierOverrides,
 }
 
@@ -159,7 +161,7 @@ impl PlateModifierEntry {
             id: self.id,
             name: self.name.clone(),
             role: self.role,
-            mesh: self.prepared_mesh.clone(),
+            mesh: TriangleMesh::clone(&self.prepared_mesh),
             overrides: self.overrides.clone(),
         }
     }
@@ -199,8 +201,9 @@ struct StoredPlate {
     name: String,
     objects: Vec<PlateObjectEntry>,
     modifiers: Vec<PlateModifierEntry>,
-    mesh: Option<TriangleMesh>,
-    prepared_mesh: Option<TriangleMesh>,
+    mesh: Option<Arc<TriangleMesh>>,
+    prepared_mesh: Option<Arc<TriangleMesh>>,
+    plate_inspection: Option<MeshInspection>,
     sliced: Option<SlicedPlate>,
     last_gcode: Option<GcodeOutput>,
 }
@@ -214,6 +217,7 @@ impl StoredPlate {
             modifiers: Vec::new(),
             mesh: None,
             prepared_mesh: None,
+            plate_inspection: None,
             sliced: None,
             last_gcode: None,
         }
@@ -226,8 +230,9 @@ struct StoredPlateSnapshot {
     name: String,
     objects: Vec<PlateObjectEntry>,
     modifiers: Vec<PlateModifierEntry>,
-    mesh: Option<TriangleMesh>,
-    prepared_mesh: Option<TriangleMesh>,
+    mesh: Option<Arc<TriangleMesh>>,
+    prepared_mesh: Option<Arc<TriangleMesh>>,
+    plate_inspection: Option<MeshInspection>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,8 +244,9 @@ struct SessionSnapshot {
     next_object_id: u64,
     modifiers: Vec<PlateModifierEntry>,
     next_modifier_id: u64,
-    mesh: Option<TriangleMesh>,
-    prepared_mesh: Option<TriangleMesh>,
+    mesh: Option<Arc<TriangleMesh>>,
+    prepared_mesh: Option<Arc<TriangleMesh>>,
+    plate_inspection: Option<MeshInspection>,
     plate_slots: Vec<StoredPlateSnapshot>,
     active_plate_idx: usize,
     next_plate_id: u32,
@@ -280,8 +286,12 @@ pub struct Session {
     pub next_object_id: u64,
     pub modifiers: Vec<PlateModifierEntry>,
     pub next_modifier_id: u64,
-    pub mesh: Option<TriangleMesh>,
-    pub prepared_mesh: Option<TriangleMesh>,
+    /// Merged raw (untransformed) plate mesh; shares the object's `Arc` for single-object plates.
+    pub mesh: Option<Arc<TriangleMesh>>,
+    /// Merged prepared (world-space) plate mesh; shares the object's `Arc` for single-object plates.
+    pub prepared_mesh: Option<Arc<TriangleMesh>>,
+    /// Cached topology/volume inspection of [`Session::prepared_mesh`] (kept in sync by every mutation).
+    pub plate_inspection: Option<MeshInspection>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
     /// Saved local/LAN printer connection profiles (never persisted inside `.3mf` files).
@@ -306,6 +316,7 @@ impl Default for Session {
             next_modifier_id: 0,
             mesh: None,
             prepared_mesh: None,
+            plate_inspection: None,
             sliced: None,
             last_gcode: None,
             printers: Vec::new(),
@@ -464,6 +475,7 @@ impl Session {
             std::mem::swap(&mut slot.modifiers, &mut self.modifiers);
             std::mem::swap(&mut slot.mesh, &mut self.mesh);
             std::mem::swap(&mut slot.prepared_mesh, &mut self.prepared_mesh);
+            std::mem::swap(&mut slot.plate_inspection, &mut self.plate_inspection);
             std::mem::swap(&mut slot.sliced, &mut self.sliced);
             std::mem::swap(&mut slot.last_gcode, &mut self.last_gcode);
         }
@@ -563,6 +575,7 @@ impl Session {
                 modifiers: p.modifiers.clone(),
                 mesh: p.mesh.clone(),
                 prepared_mesh: p.prepared_mesh.clone(),
+                plate_inspection: p.plate_inspection.clone(),
             })
             .collect();
         SessionSnapshot {
@@ -575,6 +588,7 @@ impl Session {
             next_modifier_id: self.next_modifier_id,
             mesh: self.mesh.clone(),
             prepared_mesh: self.prepared_mesh.clone(),
+            plate_inspection: self.plate_inspection.clone(),
             plate_slots,
             active_plate_idx: self.active_plate_idx,
             next_plate_id: self.next_plate_id,
@@ -590,6 +604,7 @@ impl Session {
         self.next_modifier_id = snap.next_modifier_id;
         self.mesh = snap.mesh;
         self.prepared_mesh = snap.prepared_mesh;
+        self.plate_inspection = snap.plate_inspection;
         self.plate_slots = if snap.plate_slots.is_empty() {
             vec![StoredPlate::empty(1, "Plate 1".to_owned())]
         } else {
@@ -602,6 +617,7 @@ impl Session {
                     modifiers: p.modifiers,
                     mesh: p.mesh,
                     prepared_mesh: p.prepared_mesh,
+                    plate_inspection: p.plate_inspection,
                     sliced: None,
                     last_gcode: None,
                 })
@@ -858,6 +874,36 @@ pub struct UpdateModifierParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RemoveModifierParams {
     pub id: u64,
+}
+
+/// Parameters for `plate.repair_mesh`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RepairMeshParams {
+    /// Plate object to repair; omit to repair every object on the active plate.
+    #[serde(default)]
+    pub object_id: Option<u64>,
+    /// Repair tuning; omit for defaults.
+    #[serde(default)]
+    pub config: Option<MeshRepairConfig>,
+}
+
+/// Repair outcome for one plate object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ObjectRepairResult {
+    pub object_id: u64,
+    pub name: String,
+    pub report: MeshRepairReport,
+}
+
+/// Result of `plate.repair_mesh`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PlateRepairResult {
+    /// Per-object repair reports, in plate order.
+    pub objects: Vec<ObjectRepairResult>,
+    /// `true` when at least one object mesh was modified.
+    pub changed: bool,
+    /// Inspection of the rebuilt plate mesh after repair.
+    pub plate_inspection: Option<MeshInspection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1351,6 +1397,12 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             result_schema: schema_val::<MeshInspection>(),
         },
         CommandDescriptor {
+            name: "plate.repair_mesh",
+            summary: "Repair object meshes (weld, dedupe, T-junctions, winding, inverted shells, hole filling); undoable.",
+            params_schema: schema_val::<RepairMeshParams>(),
+            result_schema: schema_val::<PlateRepairResult>(),
+        },
+        CommandDescriptor {
             name: "plate.list_objects",
             summary: "List individual objects on the build plate with IDs, names, transforms, and bounds.",
             params_schema: schema_val::<EmptyParams>(),
@@ -1643,26 +1695,110 @@ fn schema_val<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null)
 }
 
+/// Merged raw mesh, merged prepared mesh, and cached inspection for one plate's objects.
+type MergedPlateMeshes = (
+    Option<Arc<TriangleMesh>>,
+    Option<Arc<TriangleMesh>>,
+    Option<MeshInspection>,
+);
+
+/// Build the merged plate meshes for `objects`.
+///
+/// Single-object plates share the object's `Arc`s (zero copy); multi-object plates merge
+/// borrowed meshes without cloning each source mesh first.
+fn merge_plate_meshes(objects: &[PlateObjectEntry]) -> Result<MergedPlateMeshes, EngineError> {
+    match objects {
+        [] => Ok((None, None, None)),
+        [only] => {
+            let insp = inspect_mesh(&only.prepared_mesh);
+            Ok((
+                Some(Arc::clone(&only.raw_mesh)),
+                Some(Arc::clone(&only.prepared_mesh)),
+                Some(insp),
+            ))
+        }
+        many => {
+            let merged_raw = TriangleMesh::merge_refs(many.iter().map(|o| o.raw_mesh.as_ref()))?;
+            let merged_prep =
+                TriangleMesh::merge_refs(many.iter().map(|o| o.prepared_mesh.as_ref()))?;
+            let insp = inspect_mesh(&merged_prep);
+            Ok((
+                Some(Arc::new(merged_raw)),
+                Some(Arc::new(merged_prep)),
+                Some(insp),
+            ))
+        }
+    }
+}
+
 fn rebuild_plate_mesh(session: &mut Session) -> Result<Option<MeshInspection>, EngineError> {
     session.sliced = None;
     session.last_gcode = None;
+    let (mesh, prepared_mesh, insp) = merge_plate_meshes(&session.objects)?;
+    session.mesh = mesh;
+    session.prepared_mesh = prepared_mesh;
+    session.plate_inspection = insp.clone();
+    Ok(insp)
+}
+
+/// Repair one (or every) object's raw mesh, re-prepare it with its transform, and rebuild the plate.
+///
+/// Transactional: all repairs are computed before any object is modified, so an error leaves
+/// the session untouched. Unchanged meshes keep their `Arc`s (and cached slices survive a no-op).
+fn repair_plate_objects(
+    session: &mut Session,
+    object_id: Option<u64>,
+    config: MeshRepairConfig,
+) -> Result<PlateRepairResult, EngineError> {
     if session.objects.is_empty() {
-        session.mesh = None;
-        session.prepared_mesh = None;
-        return Ok(None);
+        return Err(EngineError::NoMeshLoaded);
     }
-    let raw_list: Vec<TriangleMesh> = session.objects.iter().map(|o| o.raw_mesh.clone()).collect();
-    let prep_list: Vec<TriangleMesh> = session
-        .objects
-        .iter()
-        .map(|o| o.prepared_mesh.clone())
-        .collect();
-    let merged_raw = TriangleMesh::merge(&raw_list)?;
-    let merged_prep = TriangleMesh::merge(&prep_list)?;
-    let insp = inspect_mesh(&merged_prep);
-    session.mesh = Some(merged_raw);
-    session.prepared_mesh = Some(merged_prep);
-    Ok(Some(insp))
+    if let Some(id) = object_id
+        && !session.objects.iter().any(|o| o.id == id)
+    {
+        return Err(EngineError::ObjectNotFound(id));
+    }
+    type PendingRepair = (usize, Option<(Arc<TriangleMesh>, Arc<TriangleMesh>)>);
+    let mut pending: Vec<PendingRepair> = Vec::new();
+    let mut reports = Vec::new();
+    for (idx, obj) in session.objects.iter().enumerate() {
+        if object_id.is_some_and(|id| id != obj.id) {
+            continue;
+        }
+        let repaired = repair_mesh(&obj.raw_mesh, &config)?;
+        let replacement = if repaired.report.changed {
+            let prepared = prepare_transformed_object(&repaired.mesh, obj.transform)?;
+            Some((Arc::new(repaired.mesh), Arc::new(prepared)))
+        } else {
+            None
+        };
+        pending.push((idx, replacement));
+        reports.push(ObjectRepairResult {
+            object_id: obj.id,
+            name: obj.name.clone(),
+            report: repaired.report,
+        });
+    }
+    let mut changed = false;
+    for (idx, replacement) in pending {
+        if let Some((raw, prepared)) = replacement
+            && let Some(obj) = session.objects.get_mut(idx)
+        {
+            obj.raw_mesh = raw;
+            obj.prepared_mesh = prepared;
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = rebuild_plate_mesh(session)?;
+    } else if session.plate_inspection.is_none() {
+        session.plate_inspection = session.prepared_mesh.as_deref().map(inspect_mesh);
+    }
+    Ok(PlateRepairResult {
+        objects: reports,
+        changed,
+        plate_inspection: session.plate_inspection.clone(),
+    })
 }
 
 fn auto_arrange_session_objects(session: &mut Session, spacing_mm: f64) -> Result<(), EngineError> {
@@ -1686,7 +1822,7 @@ fn auto_arrange_session_objects(session: &mut Session, spacing_mm: f64) -> Resul
     )?;
     for (obj, pos) in session.objects.iter_mut().zip(positions) {
         obj.transform.position_xy_mm = pos;
-        obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
+        obj.prepared_mesh = Arc::new(prepare_transformed_object(&obj.raw_mesh, obj.transform)?);
     }
     Ok(())
 }
@@ -1719,9 +1855,9 @@ fn add_plate_object(
     session.objects.push(PlateObjectEntry {
         id,
         name,
-        raw_mesh: mesh,
+        raw_mesh: Arc::new(mesh),
         transform,
-        prepared_mesh: prepared,
+        prepared_mesh: Arc::new(prepared),
     });
     if append && session.objects.len() > 1 {
         auto_arrange_session_objects(session, 6.0)?;
@@ -1777,11 +1913,11 @@ fn build_centered_plate_objects(
             rotation_deg: [0.0, 0.0, 0.0],
             scale: [1.0, 1.0, 1.0],
         };
-        let prepared_mesh = prepare_transformed_object(&raw_mesh, transform)?;
+        let prepared_mesh = Arc::new(prepare_transformed_object(&raw_mesh, transform)?);
         entries.push(PlateObjectEntry {
             id,
             name,
-            raw_mesh,
+            raw_mesh: Arc::new(raw_mesh),
             transform,
             prepared_mesh,
         });
@@ -1874,17 +2010,7 @@ fn add_3mf_document_objects(
     for ((plate_id, plate_name), bucket) in plate_defs.into_iter().zip(buckets) {
         max_plate_id = max_plate_id.max(plate_id);
         let objs = build_centered_plate_objects(bucket, &mut next_id, bed_w, bed_d)?;
-        let (mesh, prepared_mesh) = if objs.is_empty() {
-            (None, None)
-        } else {
-            let raw_list: Vec<TriangleMesh> = objs.iter().map(|o| o.raw_mesh.clone()).collect();
-            let prep_list: Vec<TriangleMesh> =
-                objs.iter().map(|o| o.prepared_mesh.clone()).collect();
-            (
-                Some(TriangleMesh::merge(&raw_list)?),
-                Some(TriangleMesh::merge(&prep_list)?),
-            )
-        };
+        let (mesh, prepared_mesh, plate_inspection) = merge_plate_meshes(&objs)?;
         new_slots.push(StoredPlate {
             id: plate_id,
             name: plate_name,
@@ -1892,6 +2018,7 @@ fn add_3mf_document_objects(
             modifiers: Vec::new(),
             mesh,
             prepared_mesh,
+            plate_inspection,
             sliced: None,
             last_gcode: None,
         });
@@ -1907,6 +2034,7 @@ fn add_3mf_document_objects(
     session.modifiers.clear();
     session.mesh = None;
     session.prepared_mesh = None;
+    session.plate_inspection = None;
     session.sliced = None;
     session.last_gcode = None;
     session.plate_slots = new_slots;
@@ -1915,10 +2043,8 @@ fn add_3mf_document_objects(
     session.swap_slot_with_live(first_non_empty);
 
     session
-        .prepared_mesh
-        .as_ref()
-        .or(session.mesh.as_ref())
-        .map(inspect_mesh)
+        .plate_inspection
+        .clone()
         .ok_or(EngineError::NoMeshLoaded)
 }
 
@@ -2027,7 +2153,7 @@ pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineErro
                 id: res_id,
                 name: obj.name.clone(),
                 object_type: "model".to_owned(),
-                mesh: obj.raw_mesh.clone(),
+                mesh: TriangleMesh::clone(&obj.raw_mesh),
             });
             let mat = object_transform_3mf_matrix(&obj.raw_mesh, obj.transform)?;
             build_items.push(ThreeMfBuildItem {
@@ -2052,7 +2178,7 @@ pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineErro
                     id: res_id,
                     name: m.name.clone(),
                     object_type: "other".to_owned(),
-                    mesh: m.raw_mesh.clone(),
+                    mesh: TriangleMesh::clone(&m.raw_mesh),
                 });
                 Some(res_id)
             } else {
@@ -2108,7 +2234,7 @@ pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineErro
 fn load_manifest_plate_records(
     objects: Vec<ProjectObjectRecord>,
     modifiers: Vec<ProjectModifierRecord>,
-    resource_map: &HashMap<u32, &ThreeMfResourceMesh>,
+    resource_map: &HashMap<u32, Arc<TriangleMesh>>,
     max_obj_id: &mut u64,
     max_mod_id: &mut u64,
 ) -> Result<(Vec<PlateObjectEntry>, Vec<PlateModifierEntry>), EngineError> {
@@ -2120,12 +2246,12 @@ fn load_manifest_plate_records(
                 rec.resource_id, rec.name
             ))
         })?;
-        let prepared_mesh = prepare_transformed_object(&res.mesh, rec.transform)?;
+        let prepared_mesh = Arc::new(prepare_transformed_object(res, rec.transform)?);
         *max_obj_id = (*max_obj_id).max(rec.id);
         new_objects.push(PlateObjectEntry {
             id: rec.id,
             name: rec.name,
-            raw_mesh: res.mesh.clone(),
+            raw_mesh: Arc::clone(res),
             transform: rec.transform,
             prepared_mesh,
         });
@@ -2135,7 +2261,7 @@ fn load_manifest_plate_records(
     for rec in modifiers {
         rec.overrides.validate()?;
         let raw_mesh = if let Some(prim) = rec.primitive {
-            build_modifier_primitive(prim)?
+            Arc::new(build_modifier_primitive(prim)?)
         } else if let Some(rid) = rec.resource_id {
             let res = resource_map.get(&rid).ok_or_else(|| {
                 EngineError::InvalidProject(format!(
@@ -2143,14 +2269,14 @@ fn load_manifest_plate_records(
                     rec.name
                 ))
             })?;
-            res.mesh.clone()
+            Arc::clone(res)
         } else {
             return Err(EngineError::InvalidProject(format!(
                 "modifier `{}` has neither primitive nor resource_id",
                 rec.name
             )));
         };
-        let prepared_mesh = prepare_modifier_mesh(&raw_mesh, rec.transform)?;
+        let prepared_mesh = Arc::new(prepare_modifier_mesh(&raw_mesh, rec.transform)?);
         *max_mod_id = (*max_mod_id).max(rec.id);
         new_modifiers.push(PlateModifierEntry {
             id: rec.id,
@@ -2207,8 +2333,11 @@ pub fn load_project_3mf_bytes(
     }
     manifest.config.validate()?;
 
-    let resource_map: HashMap<u32, &ThreeMfResourceMesh> =
-        doc.resources.iter().map(|r| (r.id, r)).collect();
+    let resource_map: HashMap<u32, Arc<TriangleMesh>> = doc
+        .resources
+        .into_iter()
+        .map(|r| (r.id, Arc::new(r.mesh)))
+        .collect();
 
     let mut max_obj_id = 0u64;
     let mut max_mod_id = 0u64;
@@ -2243,17 +2372,7 @@ pub fn load_project_3mf_bytes(
                 &mut max_obj_id,
                 &mut max_mod_id,
             )?;
-            let (mesh, prepared_mesh) = if objs.is_empty() {
-                (None, None)
-            } else {
-                let raw_list: Vec<TriangleMesh> = objs.iter().map(|o| o.raw_mesh.clone()).collect();
-                let prep_list: Vec<TriangleMesh> =
-                    objs.iter().map(|o| o.prepared_mesh.clone()).collect();
-                (
-                    Some(TriangleMesh::merge(&raw_list)?),
-                    Some(TriangleMesh::merge(&prep_list)?),
-                )
-            };
+            let (mesh, prepared_mesh, plate_inspection) = merge_plate_meshes(&objs)?;
             let trimmed_name = plate.name.trim();
             let plate_name = if trimmed_name.is_empty() {
                 format!("Plate {}", plate.id)
@@ -2267,6 +2386,7 @@ pub fn load_project_3mf_bytes(
                 modifiers: mods,
                 mesh,
                 prepared_mesh,
+                plate_inspection,
                 sliced: None,
                 last_gcode: None,
             });
@@ -2281,6 +2401,7 @@ pub fn load_project_3mf_bytes(
         session.modifiers.clear();
         session.mesh = None;
         session.prepared_mesh = None;
+        session.plate_inspection = None;
         session.sliced = None;
         session.last_gcode = None;
         session.next_object_id = max_obj_id + 1;
@@ -2346,7 +2467,8 @@ fn add_plate_modifier(
 ) -> Result<PlateModifierInfo, EngineError> {
     overrides.validate()?;
     let transform = transform_opt.unwrap_or_else(|| default_modifier_transform(session, &raw_mesh));
-    let prepared_mesh = prepare_modifier_mesh(&raw_mesh, transform)?;
+    let prepared_mesh = Arc::new(prepare_modifier_mesh(&raw_mesh, transform)?);
+    let raw_mesh = Arc::new(raw_mesh);
     let id = if session.next_modifier_id == 0 {
         1
     } else {
@@ -2385,7 +2507,7 @@ fn apply_session_config(session: &mut Session, new_config: PrintConfig) -> Resul
         && (obj.transform.position_xy_mm[1] - old_cy).abs() < 1e-4
     {
         obj.transform.position_xy_mm = [new_cx, new_cy];
-        obj.prepared_mesh = prepare_transformed_object(&obj.raw_mesh, obj.transform)?;
+        obj.prepared_mesh = Arc::new(prepare_transformed_object(&obj.raw_mesh, obj.transform)?);
         let _ = rebuild_plate_mesh(session)?;
     } else {
         session.sliced = None;
@@ -2470,6 +2592,7 @@ fn undo_label_for_command(name: &str) -> Option<&'static str> {
         "plate.remove_object" => Some("Remove object"),
         "plate.transform_object" => Some("Transform object"),
         "plate.auto_arrange" => Some("Auto-arrange plate"),
+        "plate.repair_mesh" => Some("Repair mesh"),
         "plate.add_modifier_primitive"
         | "plate.add_modifier_stl_bytes"
         | "plate.add_modifier_3mf_bytes"
@@ -2661,7 +2784,14 @@ pub fn execute(session: &mut Session, name: &str, params: Value) -> Result<Value
         let is_noop_profile = name == "profile.apply"
             && session.config == snap.config
             && session.active_profiles == snap.active_profiles;
-        if !is_noop && !is_noop_profile {
+        let is_noop_repair = name == "plate.repair_mesh"
+            && session.objects.len() == snap.objects.len()
+            && session
+                .objects
+                .iter()
+                .zip(&snap.objects)
+                .all(|(a, b)| Arc::ptr_eq(&a.raw_mesh, &b.raw_mesh));
+        if !is_noop && !is_noop_profile && !is_noop_repair {
             session.push_undo_entry(snap);
         }
     }
@@ -2727,12 +2857,27 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             }
         }
         "plate.inspect" => {
+            if let Some(cached) = session.plate_inspection.as_ref() {
+                return Ok(serde_json::to_value(cached)?);
+            }
             let mesh = session
                 .prepared_mesh
-                .as_ref()
-                .or(session.mesh.as_ref())
+                .as_deref()
+                .or(session.mesh.as_deref())
                 .ok_or(EngineError::NoMeshLoaded)?;
-            Ok(serde_json::to_value(inspect_mesh(mesh))?)
+            let insp = inspect_mesh(mesh);
+            let val = serde_json::to_value(&insp)?;
+            session.plate_inspection = Some(insp);
+            Ok(val)
+        }
+        "plate.repair_mesh" => {
+            let p: RepairMeshParams = if params.is_null() {
+                RepairMeshParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            let result = repair_plate_objects(session, p.object_id, p.config.unwrap_or_default())?;
+            Ok(serde_json::to_value(result)?)
         }
         "plate.list_objects" => {
             let _: EmptyParams = if params.is_null() {
@@ -2766,7 +2911,7 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             };
             let next_prep = prepare_transformed_object(&entry.raw_mesh, next_transform)?;
             entry.transform = next_transform;
-            entry.prepared_mesh = next_prep;
+            entry.prepared_mesh = Arc::new(next_prep);
             let info = entry.info();
             let _ = rebuild_plate_mesh(session)?;
             Ok(serde_json::to_value(info)?)
@@ -2866,7 +3011,7 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
                 entry.overrides = ov;
             }
             entry.transform = next_xf;
-            entry.prepared_mesh = next_prep;
+            entry.prepared_mesh = Arc::new(next_prep);
             let info = entry.info();
             session.sliced = None;
             session.last_gcode = None;
@@ -3008,8 +3153,8 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             }
             let mesh = session
                 .prepared_mesh
-                .as_ref()
-                .or(session.mesh.as_ref())
+                .as_deref()
+                .or(session.mesh.as_deref())
                 .ok_or(EngineError::NoMeshLoaded)?;
             let report = analyze_printability(mesh, session.sliced.as_ref(), &session.config);
             Ok(serde_json::to_value(report)?)
@@ -3523,9 +3668,9 @@ mod tests {
     use layercraft_geom::{Point3, Triangle};
     use layercraft_io::write_stl_binary;
 
-    fn sample_cube_bytes() -> Vec<u8> {
+    fn sample_cube_tris() -> Vec<Triangle> {
         let s = 20.0;
-        let tris = [
+        [
             ((0.0, 0.0, 0.0), (0.0, s, 0.0), (s, s, 0.0)),
             ((0.0, 0.0, 0.0), (s, s, 0.0), (s, 0.0, 0.0)),
             ((0.0, 0.0, s), (s, 0.0, s), (s, s, s)),
@@ -3547,8 +3692,11 @@ mod tests {
                 Point3::new(c.0, c.1, c.2),
             )
         })
-        .collect();
-        write_stl_binary(&TriangleMesh::new(tris).unwrap())
+        .collect()
+    }
+
+    fn sample_cube_bytes() -> Vec<u8> {
+        write_stl_binary(&TriangleMesh::new(sample_cube_tris()).unwrap())
     }
 
     #[test]
@@ -4787,5 +4935,179 @@ mod tests {
         assert!(layercraft_gcode::is_bgcode(&bytes));
         let doc = decode_bgcode(&bytes).unwrap();
         assert!(!doc.gcode.is_empty());
+    }
+
+    #[test]
+    fn plate_mesh_arcs_shared_across_undo_redo_and_plate_switch() {
+        let mut sess = Session::default();
+        let insp: MeshInspection = serde_json::from_value(
+            execute(
+                &mut sess,
+                "plate.add_stl_bytes",
+                serde_json::json!({"bytes": sample_cube_bytes()}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Single-object fast path: plate meshes are the object's own Arcs.
+        let obj_prep = Arc::clone(&sess.objects[0].prepared_mesh);
+        let obj_raw = Arc::clone(&sess.objects[0].raw_mesh);
+        assert!(Arc::ptr_eq(sess.prepared_mesh.as_ref().unwrap(), &obj_prep));
+        assert!(Arc::ptr_eq(sess.mesh.as_ref().unwrap(), &obj_raw));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&insp));
+        assert!(!insp.needs_repair);
+        let cached: MeshInspection =
+            serde_json::from_value(execute(&mut sess, "plate.inspect", Value::Null).unwrap())
+                .unwrap();
+        assert_eq!(cached, insp);
+
+        // Second plate with its own object.
+        execute(&mut sess, "plates.add", serde_json::json!({"select": true})).unwrap();
+        assert!(sess.plate_inspection.is_none());
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({"shape": "cylinder"}),
+        )
+        .unwrap();
+        let p2_insp = sess.plate_inspection.clone().unwrap();
+        let p2_prep = Arc::clone(sess.prepared_mesh.as_ref().unwrap());
+
+        // Plate switch swaps Arcs and the cached inspection without copying.
+        sess.select_plate(0).unwrap();
+        assert!(Arc::ptr_eq(&sess.objects[0].prepared_mesh, &obj_prep));
+        assert!(Arc::ptr_eq(sess.prepared_mesh.as_ref().unwrap(), &obj_prep));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&insp));
+        sess.select_plate(1).unwrap();
+        assert!(Arc::ptr_eq(sess.prepared_mesh.as_ref().unwrap(), &p2_prep));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&p2_insp));
+
+        // Undo the cylinder add: plate 2 empties, plate 1 Arcs untouched.
+        assert!(sess.undo().applied);
+        assert!(sess.objects.is_empty());
+        assert!(sess.plate_inspection.is_none());
+        sess.select_plate(0).unwrap();
+        assert!(Arc::ptr_eq(&sess.objects[0].prepared_mesh, &obj_prep));
+        assert!(Arc::ptr_eq(&sess.objects[0].raw_mesh, &obj_raw));
+        assert!(Arc::ptr_eq(sess.prepared_mesh.as_ref().unwrap(), &obj_prep));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&insp));
+
+        // Redo restores the cylinder plate with the very same Arcs.
+        assert!(sess.redo().applied);
+        sess.select_plate(1).unwrap();
+        assert!(Arc::ptr_eq(sess.prepared_mesh.as_ref().unwrap(), &p2_prep));
+        assert!(Arc::ptr_eq(&sess.objects[0].prepared_mesh, &p2_prep));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&p2_insp));
+        sess.select_plate(0).unwrap();
+        assert!(Arc::ptr_eq(&sess.objects[0].prepared_mesh, &obj_prep));
+    }
+
+    #[test]
+    fn multi_object_plate_mesh_merges_and_caches_inspection() {
+        let mut sess = Session::default();
+        let bytes = sample_cube_bytes();
+        execute(
+            &mut sess,
+            "plate.add_stl_bytes",
+            serde_json::json!({"bytes": bytes}),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_stl_bytes",
+            serde_json::json!({"bytes": bytes, "append": true}),
+        )
+        .unwrap();
+        let merged = sess.prepared_mesh.as_ref().unwrap();
+        assert_eq!(merged.triangles.len(), 24);
+        assert!(!Arc::ptr_eq(merged, &sess.objects[0].prepared_mesh));
+        let insp = sess.plate_inspection.clone().unwrap();
+        assert_eq!(insp, inspect_mesh(merged));
+        assert!((insp.volume_mm3 - 16_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn repair_mesh_command_fixes_defects_and_undo_restores_original() {
+        let mut sess = Session::default();
+        // Empty plate and unknown object ids are errors, never panics.
+        assert!(execute(&mut sess, "plate.repair_mesh", Value::Null).is_err());
+
+        let mut tris = sample_cube_tris();
+        tris.pop();
+        if let Some(t) = tris.first_mut() {
+            *t = Triangle::new(t.a, t.c, t.b);
+        }
+        let bytes = write_stl_binary(&TriangleMesh::new(tris).unwrap());
+        let loaded: MeshInspection = serde_json::from_value(
+            execute(
+                &mut sess,
+                "plate.add_stl_bytes",
+                serde_json::json!({"bytes": bytes}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(loaded.needs_repair);
+        assert!(loaded.boundary_edges > 0);
+        let original_raw = Arc::clone(&sess.objects[0].raw_mesh);
+        let original_insp = sess.plate_inspection.clone().unwrap();
+        let depth_before = sess.history_status().undo_depth;
+
+        assert!(
+            execute(
+                &mut sess,
+                "plate.repair_mesh",
+                serde_json::json!({"object_id": 999})
+            )
+            .is_err()
+        );
+        assert_eq!(sess.history_status().undo_depth, depth_before);
+
+        let res: PlateRepairResult = serde_json::from_value(
+            execute(&mut sess, "plate.repair_mesh", serde_json::json!({})).unwrap(),
+        )
+        .unwrap();
+        assert!(res.changed);
+        assert_eq!(res.objects.len(), 1);
+        assert_eq!(res.objects[0].object_id, sess.objects[0].id);
+        assert!(res.objects[0].report.before.needs_repair);
+        let after = res.plate_inspection.clone().unwrap();
+        assert!(!after.needs_repair, "{after:?}");
+        assert_eq!(after.boundary_edges, 0);
+        assert_eq!(after.inconsistent_winding_edges, 0);
+        assert!((after.volume_mm3 - 8000.0).abs() < 8.0, "{after:?}");
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&after));
+        assert!(!Arc::ptr_eq(&sess.objects[0].raw_mesh, &original_raw));
+        assert!(Arc::ptr_eq(
+            sess.prepared_mesh.as_ref().unwrap(),
+            &sess.objects[0].prepared_mesh
+        ));
+        let hist = sess.history_status();
+        assert_eq!(hist.undo_depth, depth_before + 1);
+        assert_eq!(hist.undo_label.as_deref(), Some("Repair mesh"));
+
+        // Re-running on a clean mesh is a no-op without a new undo entry.
+        let repaired_id = sess.objects[0].id;
+        let again: PlateRepairResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "plate.repair_mesh",
+                serde_json::json!({"object_id": repaired_id}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!again.changed);
+        assert_eq!(sess.history_status().undo_depth, depth_before + 1);
+
+        // Undo restores the exact original mesh Arc and cached inspection.
+        assert!(sess.undo().applied);
+        assert!(Arc::ptr_eq(&sess.objects[0].raw_mesh, &original_raw));
+        assert_eq!(sess.plate_inspection.as_ref(), Some(&original_insp));
+        assert!(sess.plate_inspection.as_ref().unwrap().needs_repair);
+
+        assert!(sess.redo().applied);
+        assert!(!sess.plate_inspection.as_ref().unwrap().needs_repair);
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
     }
 }

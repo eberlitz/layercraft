@@ -6,14 +6,17 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use layercraft_config::{PrintConfig, ProfileKind, ProfileLibrary, ProfileSummary};
 use layercraft_engine::{
-    PrinterAuth, PrinterProfile, PrinterProtocol, Session, UploadOptions, command_registry,
-    decode_bgcode, encode_bgcode, execute, is_bgcode, probe_printer, slice_with_config,
-    upload_to_printer,
+    PlateRepairResult, PrinterAuth, PrinterProfile, PrinterProtocol, Session, UploadOptions,
+    command_registry, decode_bgcode, encode_bgcode, execute, is_bgcode, probe_printer,
+    slice_with_config, upload_to_printer,
 };
 use layercraft_gcode::{BgcodeOptions, compare_layer_iou, emit_gcode, evaluate_gcode};
-use layercraft_io::read_mesh_file;
+use layercraft_io::{
+    ThreeMfBuildItem, ThreeMfExportDocument, ThreeMfResourceMesh, read_mesh_file,
+    write_3mf_document_bytes, write_stl_binary,
+};
 use layercraft_mcp::{McpConnectMode, McpServer};
-use layercraft_mesh::prepare_for_plate;
+use layercraft_mesh::{MeshRepairConfig, prepare_for_plate, repair_mesh};
 use layercraft_slice::slice_single_mesh;
 use layercraft_viewport::{CameraPreset, ColorMode, RenderMode, RenderRequest, render_png};
 use serde::{Deserialize, Serialize};
@@ -167,6 +170,18 @@ enum Cmd {
         /// Emit Prusa Binary G-code (`.bgcode`) instead of plain-text `.gcode`.
         #[arg(long)]
         binary: bool,
+        /// Repair non-manifold/cracked/holey meshes automatically before slicing.
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Repair a defective STL or 3MF mesh and save to `.stl` or `.3mf`.
+    Repair {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Print full JSON repair report instead of a summary line.
+        #[arg(long)]
+        json: bool,
     },
     /// List available machine, filament, and process JSON profiles.
     Profiles {
@@ -330,6 +345,7 @@ fn slice_cli_input(
     filament: Option<String>,
     process: Option<String>,
     plate: Option<&str>,
+    repair_first: bool,
 ) -> Result<(layercraft_gcode::GcodeOutput, PrintConfig), String> {
     let is_3mf = input
         .extension()
@@ -393,6 +409,27 @@ fn slice_cli_input(
             )
             .map_err(|e| e.to_string())?;
         }
+        if repair_first {
+            let rep_val = execute(&mut session, "plate.repair_mesh", serde_json::json!({}))
+                .map_err(|e| format!("{}: {e}", input.display()))?;
+            if let Ok(rep) = serde_json::from_value::<PlateRepairResult>(rep_val)
+                && rep.changed
+            {
+                let welded: usize = rep.objects.iter().map(|o| o.report.welded_vertices).sum();
+                let flipped: usize = rep.objects.iter().map(|o| o.report.flipped_triangles).sum();
+                let holes: usize = rep.objects.iter().map(|o| o.report.holes_filled).sum();
+                let rem: usize = rep
+                    .objects
+                    .iter()
+                    .map(|o| o.report.removed_degenerate + o.report.removed_duplicate)
+                    .sum();
+                eprintln!(
+                    "repaired {} ({} object(s)): welded {welded}, removed {rem}, flipped {flipped}, filled {holes} hole(s)",
+                    input.display(),
+                    rep.objects.len()
+                );
+            }
+        }
         let sliced = slice_with_config(&session, &session.config).map_err(|e| e.to_string())?;
         (sliced, session.config)
     } else {
@@ -423,7 +460,24 @@ fn slice_cli_input(
             }
             cfg = res.config;
         }
-        let mesh = read_mesh_file(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        let mut mesh = read_mesh_file(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        if repair_first {
+            let repaired =
+                repair_mesh(&mesh, &MeshRepairConfig::default()).map_err(|e| e.to_string())?;
+            if repaired.report.changed {
+                eprintln!(
+                    "repaired {}: {} -> {} tris (welded {}, removed {}, flipped {}, filled {} hole(s))",
+                    input.display(),
+                    repaired.report.input_triangles,
+                    repaired.report.output_triangles,
+                    repaired.report.welded_vertices,
+                    repaired.report.removed_degenerate + repaired.report.removed_duplicate,
+                    repaired.report.flipped_triangles,
+                    repaired.report.holes_filled
+                );
+                mesh = repaired.mesh;
+            }
+        }
         let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
         (sliced, cfg)
     };
@@ -498,6 +552,7 @@ fn run(cli: Cli) -> Result<(), String> {
             process,
             plate,
             binary,
+            repair,
         } => {
             let (gcode_out, effective_cfg) = slice_cli_input(
                 &input,
@@ -508,6 +563,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 filament,
                 process,
                 plate.as_deref(),
+                repair,
             )?;
             let out_ext = output
                 .extension()
@@ -620,7 +676,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 };
                 let prepared = session
                     .prepared_mesh
-                    .or(session.mesh)
+                    .as_deref()
+                    .or(session.mesh.as_deref())
+                    .cloned()
                     .ok_or_else(|| format!("{}: no mesh on selected plate", input.display()))?;
                 (prepared, session.config, sliced)
             } else {
@@ -671,6 +729,67 @@ fn run(cli: Cli) -> Result<(), String> {
                 output.display(),
                 png.len()
             );
+            Ok(())
+        }
+        Cmd::Repair {
+            input,
+            output,
+            json,
+        } => {
+            let raw = read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let repaired =
+                repair_mesh(&raw, &MeshRepairConfig::default()).map_err(|e| e.to_string())?;
+            let out_ext = output
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let bytes = if out_ext == "3mf" {
+                let stem = input
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("repaired")
+                    .to_owned();
+                let doc = ThreeMfExportDocument {
+                    resources: vec![ThreeMfResourceMesh {
+                        id: 1,
+                        name: stem,
+                        object_type: "model".to_owned(),
+                        mesh: repaired.mesh,
+                    }],
+                    build_items: vec![ThreeMfBuildItem {
+                        object_id: 1,
+                        transform: None,
+                    }],
+                    plates: Vec::new(),
+                    project_json: None,
+                };
+                write_3mf_document_bytes(&doc).map_err(|e| e.to_string())?
+            } else {
+                write_stl_binary(&repaired.mesh)
+            };
+            std::fs::write(&output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+            if json {
+                let out_json =
+                    serde_json::to_string_pretty(&repaired.report).map_err(|e| e.to_string())?;
+                println!("{out_json}");
+            } else {
+                let r = &repaired.report;
+                println!(
+                    "repaired {} -> {} ({} -> {} tris, welded {}, removed {}, split {} T-junc, snapped {}, flipped {}, filled {} hole(s), needs_repair={})",
+                    input.display(),
+                    output.display(),
+                    r.input_triangles,
+                    r.output_triangles,
+                    r.welded_vertices,
+                    r.removed_degenerate + r.removed_duplicate,
+                    r.t_junctions_split,
+                    r.cracks_snapped,
+                    r.flipped_triangles,
+                    r.holes_filled,
+                    r.after.needs_repair
+                );
+            }
             Ok(())
         }
         Cmd::Mcp {
@@ -778,6 +897,7 @@ fn run(cli: Cli) -> Result<(), String> {
                             filament,
                             process,
                             plate.as_deref(),
+                            false,
                         )?;
                         let (rep, _) = evaluate_gcode(
                             &gcode_out.gcode,

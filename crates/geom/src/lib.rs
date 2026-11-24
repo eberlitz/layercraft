@@ -342,6 +342,17 @@ impl Triangle {
     pub fn area_mm2(&self) -> f64 {
         0.5 * self.double_area_vec().length()
     }
+
+    /// Return the same triangle with reversed winding (`a, c, b`), flipping its normal.
+    #[inline]
+    #[must_use]
+    pub const fn flipped(self) -> Self {
+        Self {
+            a: self.a,
+            b: self.c,
+            c: self.b,
+        }
+    }
 }
 
 /// 3D axis-aligned bounding box in millimeters.
@@ -544,9 +555,18 @@ impl TriangleMesh {
 
     /// Combine triangles from multiple meshes into a single mesh.
     pub fn merge(meshes: &[TriangleMesh]) -> Result<TriangleMesh, GeomError> {
-        let total: usize = meshes.iter().map(|m| m.triangles.len()).sum();
+        Self::merge_refs(meshes)
+    }
+
+    /// Combine triangles from borrowed meshes (e.g. behind `Arc`) into a single mesh
+    /// without cloning the source meshes first.
+    pub fn merge_refs<'a>(
+        meshes: impl IntoIterator<Item = &'a TriangleMesh>,
+    ) -> Result<TriangleMesh, GeomError> {
+        let refs: Vec<&TriangleMesh> = meshes.into_iter().collect();
+        let total: usize = refs.iter().map(|m| m.triangles.len()).sum();
         let mut all = Vec::with_capacity(total);
-        for m in meshes {
+        for m in refs {
             all.extend_from_slice(&m.triangles);
         }
         TriangleMesh::new(all)
@@ -660,6 +680,18 @@ mod tests {
         let merged = TriangleMesh::merge(&[m.clone(), b2]).unwrap();
         assert_eq!(merged.triangles.len(), 24);
         assert!(TriangleMesh::merge(&[]).is_err());
+        let by_ref = TriangleMesh::merge_refs([&m, &m]).unwrap();
+        assert_eq!(by_ref.triangles.len(), 24);
+        assert!((by_ref.signed_volume_mm3() - 2.0 * m.signed_volume_mm3()).abs() < 1e-6);
+        assert!(TriangleMesh::merge_refs(std::iter::empty()).is_err());
+
+        let tri = m.triangles[0];
+        let f = tri.flipped();
+        assert_eq!(f.a, tri.a);
+        assert_eq!(f.b, tri.c);
+        assert_eq!(f.c, tri.b);
+        assert!((f.double_area_vec() + tri.double_area_vec()).length() < 1e-9);
+        assert_eq!(f.flipped(), tri);
 
         assert!(m.scale(0.0, 1.0, 1.0).is_err());
         assert!(m.scale(-1.0, 1.0, 1.0).is_err());

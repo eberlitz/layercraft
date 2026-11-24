@@ -7,7 +7,7 @@ use layercraft_config::{
     WallOrder,
 };
 use layercraft_engine::{PrinterAuth, PrinterProtocol};
-use layercraft_mesh::{ModifierPrimitive, ModifierTransform, inspect_mesh};
+use layercraft_mesh::{ModifierPrimitive, ModifierTransform};
 
 use crate::LayerCraftApp;
 use crate::icons::{Icon, paint_icon};
@@ -853,9 +853,9 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
     });
 
     // 5. Mesh Summary Card
-    if let Some(mesh) = &app.session.prepared_mesh {
+    if let Some(insp) = app.session.plate_inspection.clone() {
         ui.add_space(6.0);
-        let insp = inspect_mesh(mesh);
+        let mut repair_clicked = false;
         card(ui, p, Some("Mesh Summary"), |ui| {
             setting_row(ui, p, "Triangles", |ui| {
                 ui.label(format!("{}", insp.triangle_count));
@@ -870,8 +870,29 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                 });
             }
             setting_row(ui, p, "Topology", |ui| {
-                if insp.non_manifold_edges == 0 {
+                if !insp.needs_repair {
                     badge(ui, p.bg_panel, p.success, "Watertight");
+                } else if insp.inverted_shells > 0 {
+                    badge(
+                        ui,
+                        p.bg_panel,
+                        p.warning,
+                        &format!("{} inverted shell(s)", insp.inverted_shells),
+                    );
+                } else if insp.inconsistent_winding_edges > 0 {
+                    badge(
+                        ui,
+                        p.bg_panel,
+                        p.warning,
+                        &format!("{} flipped edge(s)", insp.inconsistent_winding_edges),
+                    );
+                } else if insp.boundary_edges > 0 {
+                    badge(
+                        ui,
+                        p.bg_panel,
+                        p.warning,
+                        &format!("{} open edge(s)", insp.boundary_edges),
+                    );
                 } else {
                     badge(
                         ui,
@@ -881,7 +902,51 @@ fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
                     );
                 }
             });
+            if insp.needs_repair {
+                let mut details = Vec::new();
+                if insp.boundary_edges > 0 {
+                    details.push(format!("{} open", insp.boundary_edges));
+                }
+                if insp.inconsistent_winding_edges > 0 {
+                    details.push(format!("{} flipped", insp.inconsistent_winding_edges));
+                }
+                if insp.inverted_shells > 0 {
+                    details.push(format!("{} inverted", insp.inverted_shells));
+                }
+                if insp.duplicate_triangles > 0 {
+                    details.push(format!("{} dup", insp.duplicate_triangles));
+                }
+                if insp.degenerate_triangles > 0 {
+                    details.push(format!("{} deg", insp.degenerate_triangles));
+                }
+                if insp.non_manifold_edges > insp.boundary_edges {
+                    details.push(format!(
+                        "{} over-shared",
+                        insp.non_manifold_edges - insp.boundary_edges
+                    ));
+                }
+                if !details.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("Defects: {}", details.join(", ")))
+                            .size(11.0)
+                            .color(p.text_muted),
+                    );
+                }
+                ui.add_space(3.0);
+                if secondary_button(ui, p, None, "Repair Mesh")
+                    .on_hover_text(
+                        "Weld close vertices, remove duplicates, orient shells outward, and fill holes",
+                    )
+                    .clicked()
+                {
+                    repair_clicked = true;
+                }
+            }
         });
+        if repair_clicked {
+            app.repair_plate_mesh(None);
+        }
     }
 }
 

@@ -491,7 +491,7 @@ fn render_screenshot_bytes(
         color_mode,
     };
     let bytes = render_png_with_camera(
-        session.prepared_mesh.as_ref(),
+        session.prepared_mesh.as_deref(),
         session.sliced.as_ref(),
         &session.config,
         &req,
@@ -924,7 +924,7 @@ pub fn dispatch_tool_on_session(
                     color_mode: parsed.color_mode,
                 };
                 let bytes_a = render_png_with_camera(
-                    session.prepared_mesh.as_ref(),
+                    session.prepared_mesh.as_deref(),
                     plate_a.as_ref(),
                     &cfg_a,
                     &req,
@@ -932,7 +932,7 @@ pub fn dispatch_tool_on_session(
                 )
                 .map_err(|e| e.to_string())?;
                 let bytes_b = render_png_with_camera(
-                    session.prepared_mesh.as_ref(),
+                    session.prepared_mesh.as_deref(),
                     plate_b.as_ref(),
                     &cfg_b,
                     &req,
