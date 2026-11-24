@@ -9,7 +9,7 @@ use glam::{Mat4, Vec3, Vec4};
 use layercraft_config::PrintConfig;
 use layercraft_gcode::combing::CombingLayer;
 use layercraft_geom::{Aabb3, Point3, TriangleMesh};
-use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate};
+use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate, bead_area_mm2};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,8 +55,37 @@ pub enum ColorMode {
     #[default]
     Feature,
     Speed,
+    VolumetricFlow,
+    FanSpeed,
+    LineWidth,
     Layer,
     LayerHeight,
+}
+
+impl ColorMode {
+    /// All preview color modes in Studio ribbon display order.
+    pub const ALL: [Self; 7] = [
+        Self::Feature,
+        Self::Speed,
+        Self::VolumetricFlow,
+        Self::FanSpeed,
+        Self::LineWidth,
+        Self::LayerHeight,
+        Self::Layer,
+    ];
+
+    /// Short human-readable label for ribbon buttons and HUD.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Feature => "Feature",
+            Self::Speed => "Speed",
+            Self::VolumetricFlow => "Flow",
+            Self::FanSpeed => "Fan",
+            Self::LineWidth => "Width",
+            Self::LayerHeight => "Layer Height",
+            Self::Layer => "Layer Z",
+        }
+    }
 }
 
 /// Interactive Z-up orbit camera looking at a target point on the build plate.
@@ -372,6 +401,133 @@ fn lerp_color(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 4] {
     ]
 }
 
+fn lerp3_color(a: [f32; 3], mid: [f32; 3], b: [f32; 3], t: f32) -> [f32; 4] {
+    let u = t.clamp(0.0, 1.0);
+    if u <= 0.5 {
+        lerp_color(a, mid, u * 2.0)
+    } else {
+        lerp_color(mid, b, (u - 0.5) * 2.0)
+    }
+}
+
+/// Sample the normalized `[0..=1]` RGBA gradient ramp used for `mode` in both 3D toolpaths and HUD legends.
+pub fn color_ramp_sample(mode: ColorMode, t: f32) -> [f32; 4] {
+    match mode {
+        ColorMode::Feature | ColorMode::Layer | ColorMode::LayerHeight => {
+            lerp_color([0.16, 0.74, 0.86], [0.95, 0.38, 0.22], t)
+        }
+        ColorMode::Speed => lerp3_color(
+            [0.18, 0.42, 0.94],
+            [0.16, 0.78, 0.56],
+            [0.96, 0.30, 0.18],
+            t,
+        ),
+        ColorMode::VolumetricFlow => lerp3_color(
+            [0.20, 0.36, 0.92],
+            [0.96, 0.72, 0.16],
+            [0.95, 0.18, 0.16],
+            t,
+        ),
+        ColorMode::FanSpeed => lerp3_color(
+            [0.42, 0.44, 0.50],
+            [0.12, 0.68, 0.76],
+            [0.14, 0.88, 1.00],
+            t,
+        ),
+        ColorMode::LineWidth => lerp3_color(
+            [0.32, 0.38, 0.92],
+            [0.14, 0.80, 0.70],
+            [0.98, 0.54, 0.14],
+            t,
+        ),
+    }
+}
+
+/// Compute numeric `(min, max)` legend bounds for a preview [`ColorMode`] over `plate`.
+pub fn compute_color_mode_range(
+    plate: &SlicedPlate,
+    mode: ColorMode,
+    config: Option<&PrintConfig>,
+) -> (f64, f64) {
+    match mode {
+        ColorMode::Feature => (0.0, 1.0),
+        ColorMode::FanSpeed => (0.0, 100.0),
+        ColorMode::Layer => {
+            let max_z = plate
+                .layers
+                .iter()
+                .map(|l| l.z_top_mm)
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            (0.0, max_z)
+        }
+        ColorMode::LayerHeight => {
+            let mut min_h = f64::INFINITY;
+            let mut max_h = 0.0_f64;
+            for l in &plate.layers {
+                min_h = min_h.min(l.height_mm);
+                max_h = max_h.max(l.height_mm);
+            }
+            if min_h.is_finite() && max_h - min_h > 1e-4 {
+                (min_h, max_h)
+            } else {
+                (0.04, 0.32)
+            }
+        }
+        ColorMode::Speed => {
+            let mut min_s = f64::INFINITY;
+            let mut max_s = 0.0_f64;
+            for l in &plate.layers {
+                for p in &l.paths {
+                    min_s = min_s.min(p.speed_mm_s);
+                    max_s = max_s.max(p.speed_mm_s);
+                }
+            }
+            if min_s.is_finite() && max_s - min_s > 1e-4 {
+                (min_s, max_s)
+            } else {
+                (15.0, 125.0)
+            }
+        }
+        ColorMode::VolumetricFlow => {
+            let fil_flow = config
+                .map(|c| c.filament.flow_ratio.max(0.001))
+                .unwrap_or(1.0);
+            let mut max_q = 0.0_f64;
+            for l in &plate.layers {
+                for p in &l.paths {
+                    let q = bead_area_mm2(p.max_width_mm(), p.height_mm)
+                        * p.flow_ratio.max(0.001)
+                        * fil_flow
+                        * p.speed_mm_s;
+                    if q.is_finite() {
+                        max_q = max_q.max(q);
+                    }
+                }
+            }
+            let cfg_cap = config
+                .map(|c| c.filament.max_volumetric_speed_mm3_s)
+                .unwrap_or(15.0);
+            (0.0, max_q.max(cfg_cap).max(1.0))
+        }
+        ColorMode::LineWidth => {
+            let mut min_w = f64::INFINITY;
+            let mut max_w = 0.0_f64;
+            for l in &plate.layers {
+                for p in &l.paths {
+                    min_w = min_w.min(p.min_width_mm());
+                    max_w = max_w.max(p.max_width_mm());
+                }
+            }
+            if min_w.is_finite() && max_w - min_w > 1e-4 {
+                (min_w, max_w)
+            } else {
+                (0.20, 0.85)
+            }
+        }
+    }
+}
+
 /// Compute RGBA color for an extrusion path according to `mode`.
 pub fn path_color(
     path: &ExtrusionPath,
@@ -379,32 +535,67 @@ pub fn path_color(
     layer_idx: usize,
     total_layers: usize,
 ) -> [f32; 4] {
-    path_color_with_height_range(path, mode, layer_idx, total_layers, (0.04, 0.32))
+    let default_range = match mode {
+        ColorMode::Speed => (15.0, 125.0),
+        ColorMode::VolumetricFlow => (0.0, 15.0),
+        ColorMode::FanSpeed => (0.0, 100.0),
+        ColorMode::LineWidth => (0.20, 0.85),
+        ColorMode::LayerHeight => (0.04, 0.32),
+        ColorMode::Layer | ColorMode::Feature => (0.0, 1.0),
+    };
+    let area = bead_area_mm2(path.width_mm, path.height_mm);
+    let flow = area * path.flow_ratio.max(0.001) * path.speed_mm_s;
+    segment_color(
+        path,
+        mode,
+        layer_idx,
+        total_layers,
+        path.width_mm,
+        flow,
+        path.fan_percent.unwrap_or(0),
+        default_range,
+    )
 }
 
-fn path_color_with_height_range(
+#[allow(clippy::too_many_arguments)]
+fn segment_color(
     path: &ExtrusionPath,
     mode: ColorMode,
     layer_idx: usize,
     total_layers: usize,
-    height_range_mm: (f64, f64),
+    seg_width_mm: f64,
+    flow_mm3_s: f64,
+    fan_percent: u8,
+    scale_range: (f64, f64),
 ) -> [f32; 4] {
+    let (lo, hi) = scale_range;
+    let span = (hi - lo).max(1e-4);
     match mode {
         ColorMode::Feature => role_color(path.role),
         ColorMode::Speed => {
-            let t = ((path.speed_mm_s as f32) - 15.0) / 110.0;
-            lerp_color([0.18, 0.42, 0.94], [0.96, 0.30, 0.18], t)
+            let t = ((path.speed_mm_s - lo) / span) as f32;
+            color_ramp_sample(mode, t)
+        }
+        ColorMode::VolumetricFlow => {
+            let t = ((flow_mm3_s - lo) / span) as f32;
+            color_ramp_sample(mode, t)
+        }
+        ColorMode::FanSpeed => {
+            let t = ((f64::from(fan_percent) - lo) / span) as f32;
+            color_ramp_sample(mode, t)
+        }
+        ColorMode::LineWidth => {
+            let t = ((seg_width_mm - lo) / span) as f32;
+            color_ramp_sample(mode, t)
         }
         ColorMode::Layer => {
             let denom = total_layers.saturating_sub(1).max(1) as f32;
             let t = (layer_idx as f32) / denom;
-            lerp_color([0.16, 0.76, 0.78], [0.95, 0.42, 0.24], t)
+            color_ramp_sample(mode, t)
         }
         ColorMode::LayerHeight => {
-            let (min_h, max_h) = height_range_mm;
-            let span = (max_h - min_h).max(1e-4);
-            let t = ((path.height_mm - min_h) / span) as f32;
-            lerp_color([0.16, 0.72, 0.94], [0.95, 0.36, 0.22], t)
+            let t = ((path.height_mm - lo) / span) as f32;
+            color_ramp_sample(mode, t)
         }
     }
 }
@@ -787,6 +978,8 @@ pub struct LayerMoveStep {
     pub kind: MoveKind,
     pub speed_mm_s: f32,
     pub width_mm: f32,
+    pub fan_percent: u8,
+    pub flow_mm3_s: f32,
 }
 
 /// Compact GPU-instanced toolpath data indexed by layer and intra-layer move step.
@@ -844,6 +1037,8 @@ fn push_travel_segment(
         kind,
         speed_mm_s,
         width_mm: 0.0,
+        fan_percent: 0,
+        flow_mm3_s: 0.0,
     });
 }
 
@@ -1225,21 +1420,10 @@ pub fn build_toolpath_instances_with_config(
     config: Option<&PrintConfig>,
 ) -> ToolpathInstances {
     let total_layers = plate.layers.len();
-    let height_range_mm = if mode == ColorMode::LayerHeight && !plate.layers.is_empty() {
-        let mut min_h = f64::INFINITY;
-        let mut max_h = 0.0_f64;
-        for l in &plate.layers {
-            min_h = min_h.min(l.height_mm);
-            max_h = max_h.max(l.height_mm);
-        }
-        if max_h - min_h > 1e-4 {
-            (min_h, max_h)
-        } else {
-            (0.04, 0.32)
-        }
-    } else {
-        (0.04, 0.32)
-    };
+    let scale_range = compute_color_mode_range(plate, mode, config);
+    let fil_flow = config
+        .map(|c| c.filament.flow_ratio.max(0.001))
+        .unwrap_or(1.0);
 
     let travel_speed = config
         .map(|c| c.machine.travel_speed_mm_s as f32)
@@ -1447,19 +1631,28 @@ pub fn build_toolpath_instances_with_config(
                     z_bias += angle_norm * 0.0025;
                 }
                 let z_mid = z_center_base + z_bias;
-                let color = path_color_with_height_range(
-                    path,
-                    mode,
-                    layer_idx,
-                    total_layers,
-                    height_range_mm,
-                );
+                let eff_fan = path.fan_percent.unwrap_or(layer.fan_percent).min(100);
                 let num_segs = segs.len();
 
                 for s_idx in 0..num_segs {
                     let Some(&cur) = segs.get(s_idx) else {
                         continue;
                     };
+                    let seg_w = f64::from(cur.seg_width_mm);
+                    let flow_mm3_s = bead_area_mm2(seg_w, path.height_mm)
+                        * path.flow_ratio.max(0.001)
+                        * fil_flow
+                        * path.speed_mm_s;
+                    let color = segment_color(
+                        path,
+                        mode,
+                        layer_idx,
+                        total_layers,
+                        seg_w,
+                        flow_mm3_s,
+                        eff_fan,
+                        scale_range,
+                    );
                     let prev_opt = if s_idx > 0 {
                         segs.get(s_idx - 1)
                     } else if path.closed && num_segs > 1 {
@@ -1519,6 +1712,8 @@ pub fn build_toolpath_instances_with_config(
                         kind: MoveKind::Extrusion(path.role),
                         speed_mm_s: path.speed_mm_s as f32,
                         width_mm: cur.seg_width_mm,
+                        fan_percent: eff_fan,
+                        flow_mm3_s: flow_mm3_s as f32,
                     });
                 }
             }
@@ -1966,5 +2161,81 @@ mod tests {
         assert_eq!((rgb >> 16) & 0xFF, (0.95_f32 * 255.0).round() as u32);
         assert_eq!((rgb >> 8) & 0xFF, (0.52_f32 * 255.0).round() as u32);
         assert_eq!(rgb & 0xFF, (0.14_f32 * 255.0).round() as u32);
+    }
+
+    #[test]
+    fn color_modes_volumetric_flow_fan_and_width_differentiate_segments() {
+        let mut cfg = PrintConfig::default();
+        cfg.filament.max_volumetric_speed_mm3_s = 20.0;
+
+        let plate = SlicedPlate {
+            layers: vec![layercraft_slice::SlicedLayer {
+                index: 1,
+                z_top_mm: 0.4,
+                height_mm: 0.2,
+                fan_percent: 30,
+                estimated_time_s: 1.0,
+                object_id: None,
+                slice_regions: Vec::new(),
+                paths: vec![
+                    ExtrusionPath {
+                        role: ExtrusionRole::OuterWall,
+                        width_mm: 0.30,
+                        point_widths_mm: vec![0.30, 0.80, 0.80],
+                        height_mm: 0.2,
+                        speed_mm_s: 40.0,
+                        flow_ratio: 1.0,
+                        points: vec![
+                            layercraft_geom::Point2::from_mm(10.0, 10.0).unwrap(),
+                            layercraft_geom::Point2::from_mm(30.0, 10.0).unwrap(),
+                            layercraft_geom::Point2::from_mm(50.0, 10.0).unwrap(),
+                        ],
+                        closed: false,
+                        object_id: None,
+                        fan_percent: None,
+                    },
+                    ExtrusionPath {
+                        role: ExtrusionRole::Bridge,
+                        width_mm: 0.45,
+                        point_widths_mm: Vec::new(),
+                        height_mm: 0.2,
+                        speed_mm_s: 120.0,
+                        flow_ratio: 1.0,
+                        points: vec![
+                            layercraft_geom::Point2::from_mm(50.0, 20.0).unwrap(),
+                            layercraft_geom::Point2::from_mm(80.0, 20.0).unwrap(),
+                        ],
+                        closed: false,
+                        object_id: None,
+                        fan_percent: Some(100),
+                    },
+                ],
+            }],
+            objects: Vec::new(),
+            print_sequence: Default::default(),
+        };
+
+        let flow_inst =
+            build_toolpath_instances_with_config(&plate, ColorMode::VolumetricFlow, Some(&cfg));
+        assert_eq!(flow_inst.beads.len(), 3);
+        assert_ne!(flow_inst.beads[0].color, flow_inst.beads[2].color);
+
+        let fan_inst =
+            build_toolpath_instances_with_config(&plate, ColorMode::FanSpeed, Some(&cfg));
+        assert_ne!(fan_inst.beads[0].color, fan_inst.beads[2].color);
+        let ext_steps: Vec<_> = fan_inst.layer_steps[0]
+            .iter()
+            .filter(|s| matches!(s.kind, MoveKind::Extrusion(_)))
+            .collect();
+        assert_eq!(ext_steps[0].fan_percent, 30);
+        assert_eq!(ext_steps[2].fan_percent, 100);
+        assert!(ext_steps[2].flow_mm3_s > ext_steps[0].flow_mm3_s);
+
+        let width_inst =
+            build_toolpath_instances_with_config(&plate, ColorMode::LineWidth, Some(&cfg));
+        assert_ne!(width_inst.beads[0].color, width_inst.beads[1].color);
+
+        let (lo, hi) = compute_color_mode_range(&plate, ColorMode::VolumetricFlow, Some(&cfg));
+        assert!(lo == 0.0 && hi >= 20.0);
     }
 }

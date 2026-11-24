@@ -41,11 +41,11 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
    - Use `compare_slices` (`patch_b` vs baseline or `patch_a`) to measure filament volume, print time, travel distance, arc count, and per-layer 2D raster IoU without modifying the active session.
    - Use `compare_screenshot` to get a side-by-side 3-panel `A | B | Diff` PNG (`image/png`).
 5. **Inspect visually:**
-   - Call `screenshot` in `preview` mode (`isometric`) and `layer_top_down` on critical overhang, bridge, thin-wall, or top-ironing layers (`inspect_layer` gives exact numeric lengths).
+   - Call `screenshot` in `preview` mode (`isometric`) and `layer_top_down` on critical overhang, bridge, thin-wall, or top-ironing layers (`inspect_layer` gives exact numeric lengths). Pass `color_mode` (`feature`, `speed`, `volumetric_flow`, `fan_speed`, `line_width`, `layer_height`, `layer`) to diagnose speed/flow bottlenecks, cooling modulation, or Arachne bead width changes.
 6. **Export verified G-code or `.bgcode`:**
    - Call `save_gcode` with `{ "path": "/abs/path/part.gcode", "evaluate": true }` (or `.bgcode` / `"format": "bgcode"` for compressed Binary G-code with CRC32 and thumbnails) and check `evaluation.safety` (`non_finite_values == 0`, `out_of_bounds_moves == 0`, `z_regressions == 0`).
 7. **Direct Printer Status & LAN Upload (optional):**
-   - Check saved printers via `layercraft://printers` (credentials redacted) or query live telemetry/temperatures/storages via `printer_status`.
+   - Check saved printers via `layercraft://printers` (credentials redacted; stored via OS keychain / `0600` ACL-protected `printers.json`) or query live telemetry/temperatures/storages via `printer_status`.
    - Call `upload_to_printer` (`printer_id` or inline `profile`) to slice (if needed), run safety verification, encode `.bgcode`/`.gcode`, and upload directly over LAN (`PrusaLink`, `Prusa Connect Local`, `OctoPrint`, or `Moonraker`). Keep `start_print: false` (default) unless explicitly asked to start printing immediately.
 
 ## Printability & DFM Heuristics

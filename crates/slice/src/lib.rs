@@ -57,6 +57,61 @@ pub enum SliceError {
         height_mm: f64,
         max_clearance_height_mm: f64,
     },
+    #[error("slicing cancelled")]
+    Cancelled,
+}
+
+/// Cooperative cancellation flag and per-layer progress counters shared with slicing workers.
+#[derive(Debug, Default)]
+pub struct SliceProgress {
+    completed_layers: std::sync::atomic::AtomicUsize,
+    total_layers: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl SliceProgress {
+    /// Construct a fresh zeroed progress/cancellation handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cooperative cancellation at the next layer or stage boundary.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return `true` if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the total expected layer work count.
+    pub fn set_total_layers(&self, total: usize) {
+        self.total_layers
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment the total expected layer work count.
+    pub fn add_total_layers(&self, delta: usize) {
+        self.total_layers
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment completed layer count by 1.
+    pub fn inc_completed_layers(&self) {
+        self.completed_layers
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read `(completed_layers, total_layers)`.
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.completed_layers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.total_layers.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 /// Classification of an extruded toolpath segment.
@@ -287,11 +342,43 @@ pub fn slice_prepared_mesh_with_modifiers(
     config: &PrintConfig,
     modifiers: &[ModifierVolume],
 ) -> Result<SlicedPlate, SliceError> {
+    slice_prepared_mesh_with_progress(prepared, config, modifiers, None)
+}
+
+/// Run the full slicing pipeline on a prepared plate mesh with cooperative progress & cancellation.
+pub fn slice_prepared_mesh_with_progress(
+    prepared: &TriangleMesh,
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+    progress: Option<&SliceProgress>,
+) -> Result<SlicedPlate, SliceError> {
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     config.validate()?;
     for m in modifiers {
         m.overrides.validate()?;
     }
 
+    let raw_layers = slice_mesh_with_config_schedule(prepared, config)?;
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
+    if let Some(p) = progress {
+        p.set_total_layers(raw_layers.len());
+    }
+    let layers = slice_raw_layers_internal(&raw_layers, config, modifiers, true, None, progress)?;
+    Ok(SlicedPlate {
+        layers,
+        objects: Vec::new(),
+        print_sequence: PrintSequence::ByLayer,
+    })
+}
+
+fn slice_mesh_with_config_schedule(
+    prepared: &TriangleMesh,
+    config: &PrintConfig,
+) -> Result<Vec<RawSliceLayer>, SliceError> {
     let al = &config.process.adaptive_layer_height;
     let explicit_ranges: Vec<ExplicitHeightRange> = config
         .process
@@ -306,7 +393,7 @@ pub fn slice_prepared_mesh_with_modifiers(
         })
         .collect();
 
-    let raw_layers = if al.enabled || !explicit_ranges.is_empty() {
+    if al.enabled || !explicit_ranges.is_empty() {
         let nozzle_d = config.machine.nozzle_diameter_mm;
         let nom_h = config.process.layer_height_mm;
         let sched_params = VariableScheduleParams {
@@ -321,15 +408,14 @@ pub fn slice_prepared_mesh_with_modifiers(
             explicit_ranges,
         };
         let schedule = build_variable_layer_schedule(prepared, &sched_params)?;
-        slice_mesh_with_schedule(prepared, &schedule)?
+        Ok(slice_mesh_with_schedule(prepared, &schedule)?)
     } else {
-        slice_mesh(
+        Ok(slice_mesh(
             prepared,
             config.process.first_layer_height_mm,
             config.process.layer_height_mm,
-        )?
-    };
-    slice_from_raw_layers_with_modifiers(&raw_layers, config, modifiers)
+        )?)
+    }
 }
 
 /// Merge multiple prepared plate meshes and slice them together while preserving their transforms.
@@ -453,6 +539,19 @@ pub fn slice_plate_objects(
     config: &PrintConfig,
     modifiers: &[ModifierVolume],
 ) -> Result<SlicedPlate, SliceError> {
+    slice_plate_objects_with_progress(objects, config, modifiers, None)
+}
+
+/// Slice a collection of distinct build-plate objects with cooperative layer progress and cancellation.
+pub fn slice_plate_objects_with_progress(
+    objects: &[PlateSliceObject<'_>],
+    config: &PrintConfig,
+    modifiers: &[ModifierVolume],
+    progress: Option<&SliceProgress>,
+) -> Result<SlicedPlate, SliceError> {
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     if objects.is_empty() {
         return Err(SliceError::Geom(GeomError::EmptyMesh));
     }
@@ -490,18 +589,35 @@ pub fn slice_plate_objects(
             });
             validate_sequential_clearances(&ranked, config)?;
 
-            let mut all_layers = Vec::new();
+            let mut prepared_objs = Vec::with_capacity(ranked.len());
+            let mut total_layers = 0_usize;
             for (obj, _) in ranked {
+                if progress.is_some_and(SliceProgress::is_cancelled) {
+                    return Err(SliceError::Cancelled);
+                }
                 let obj_cfg = effective_object_config(config, obj.overrides);
-                let mut sub_plate =
-                    slice_prepared_mesh_with_modifiers(obj.prepared_mesh, &obj_cfg, modifiers)?;
-                for layer in &mut sub_plate.layers {
+                let raw = slice_mesh_with_config_schedule(obj.prepared_mesh, &obj_cfg)?;
+                total_layers = total_layers.saturating_add(raw.len());
+                prepared_objs.push((obj, obj_cfg, raw));
+            }
+            if let Some(p) = progress {
+                p.set_total_layers(total_layers);
+            }
+
+            let mut all_layers = Vec::with_capacity(total_layers);
+            for (obj, obj_cfg, raw) in prepared_objs {
+                if progress.is_some_and(SliceProgress::is_cancelled) {
+                    return Err(SliceError::Cancelled);
+                }
+                let mut layers =
+                    slice_raw_layers_internal(&raw, &obj_cfg, modifiers, true, None, progress)?;
+                for layer in &mut layers {
                     layer.object_id = Some(obj.id);
                     for path in &mut layer.paths {
                         path.object_id = Some(obj.id);
                     }
                 }
-                all_layers.extend(sub_plate.layers);
+                all_layers.extend(layers);
             }
             Ok(SlicedPlate {
                 layers: all_layers,
@@ -514,8 +630,12 @@ pub fn slice_plate_objects(
                 && let Some(obj) = objects.first()
             {
                 let obj_cfg = effective_object_config(config, obj.overrides);
-                let mut plate =
-                    slice_prepared_mesh_with_modifiers(obj.prepared_mesh, &obj_cfg, modifiers)?;
+                let mut plate = slice_prepared_mesh_with_progress(
+                    obj.prepared_mesh,
+                    &obj_cfg,
+                    modifiers,
+                    progress,
+                )?;
                 for layer in &mut plate.layers {
                     for path in &mut layer.paths {
                         if !matches!(path.role, ExtrusionRole::Skirt | ExtrusionRole::Brim) {
@@ -572,9 +692,12 @@ pub fn slice_plate_objects(
             };
 
             let n_layers = schedule.len();
-            let mut per_obj_layers: Vec<(u64, Vec<SlicedLayer>)> =
-                Vec::with_capacity(objects.len());
+            let mut raw_per_obj = Vec::with_capacity(objects.len());
+            let mut total_layers = 0_usize;
             for obj in objects {
+                if progress.is_some_and(SliceProgress::is_cancelled) {
+                    return Err(SliceError::Cancelled);
+                }
                 let obj_cfg = effective_object_config(config, obj.overrides);
                 let mut raw = slice_mesh_with_schedule(obj.prepared_mesh, &schedule)?;
                 while raw.last().is_some_and(|l| l.regions.is_empty()) {
@@ -583,13 +706,35 @@ pub fn slice_plate_objects(
                 if raw.is_empty() {
                     continue;
                 }
-                let sliced_layers =
-                    slice_raw_layers_internal(&raw, &obj_cfg, modifiers, false, Some(obj.id))?;
-                per_obj_layers.push((obj.id, sliced_layers));
+                total_layers = total_layers.saturating_add(raw.len());
+                raw_per_obj.push((obj.id, obj_cfg, raw));
+            }
+            if let Some(p) = progress {
+                p.set_total_layers(total_layers);
+            }
+
+            let mut per_obj_layers: Vec<(u64, Vec<SlicedLayer>)> =
+                Vec::with_capacity(raw_per_obj.len());
+            for (obj_id, obj_cfg, raw) in raw_per_obj {
+                if progress.is_some_and(SliceProgress::is_cancelled) {
+                    return Err(SliceError::Cancelled);
+                }
+                let sliced_layers = slice_raw_layers_internal(
+                    &raw,
+                    &obj_cfg,
+                    modifiers,
+                    false,
+                    Some(obj_id),
+                    progress,
+                )?;
+                per_obj_layers.push((obj_id, sliced_layers));
             }
 
             let mut combined_layers = Vec::with_capacity(n_layers);
             for idx in 0..n_layers {
+                if progress.is_some_and(SliceProgress::is_cancelled) {
+                    return Err(SliceError::Cancelled);
+                }
                 let Some(plane) = schedule.get(idx) else {
                     continue;
                 };
@@ -636,13 +781,21 @@ pub fn slice_plate_objects(
     }
 }
 
-fn parallel_try_map<T, R, E, F>(items: Vec<T>, f: &F) -> Result<Vec<R>, E>
+fn parallel_try_map_slice<T, R, F>(
+    items: Vec<T>,
+    progress: Option<&SliceProgress>,
+    count_progress: bool,
+    f: &F,
+) -> Result<Vec<R>, SliceError>
 where
     T: Send,
     R: Send,
-    E: Send,
-    F: Fn(T) -> Result<R, E> + Sync,
+    F: Fn(T) -> Result<R, SliceError> + Sync,
 {
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     {
         let n = items.len();
@@ -653,19 +806,27 @@ where
             .min(n);
         if workers > 1 && n >= 4 {
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
             let slots: Vec<std::sync::Mutex<Option<T>>> = items
                 .into_iter()
                 .map(|v| std::sync::Mutex::new(Some(v)))
                 .collect();
-            let results: Vec<std::sync::Mutex<Option<Result<R, E>>>> =
+            let results: Vec<std::sync::Mutex<Option<Result<R, SliceError>>>> =
                 (0..n).map(|_| std::sync::Mutex::new(None)).collect();
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     let next_ref = &next_idx;
+                    let cancel_ref = &cancelled;
                     let slots_ref = &slots;
                     let results_ref = &results;
                     scope.spawn(move || {
                         loop {
+                            if cancel_ref.load(std::sync::atomic::Ordering::Relaxed)
+                                || progress.is_some_and(SliceProgress::is_cancelled)
+                            {
+                                cancel_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
                             let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if idx >= n {
                                 break;
@@ -677,6 +838,12 @@ where
                                 continue;
                             };
                             let res = f(val);
+                            if res.is_ok()
+                                && count_progress
+                                && let Some(p) = progress
+                            {
+                                p.inc_completed_layers();
+                            }
                             if let Some(rm) = results_ref.get(idx)
                                 && let Ok(mut g) = rm.lock()
                             {
@@ -686,6 +853,11 @@ where
                     });
                 }
             });
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                || progress.is_some_and(SliceProgress::is_cancelled)
+            {
+                return Err(SliceError::Cancelled);
+            }
             let mut out = Vec::with_capacity(n);
             for rm in results {
                 if let Ok(mut g) = rm.into_inner()
@@ -697,7 +869,19 @@ where
             return Ok(out);
         }
     }
-    items.into_iter().map(f).collect()
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if progress.is_some_and(SliceProgress::is_cancelled) {
+            return Err(SliceError::Cancelled);
+        }
+        let val = f(item)?;
+        if count_progress && let Some(p) = progress {
+            p.inc_completed_layers();
+        }
+        out.push(val);
+    }
+    Ok(out)
 }
 
 /// Execute perimeters, skin detection, infill, supports, and adhesion from pre-sliced Z layers.
@@ -872,7 +1056,7 @@ pub fn slice_from_raw_layers_with_modifiers(
     config: &PrintConfig,
     modifiers: &[ModifierVolume],
 ) -> Result<SlicedPlate, SliceError> {
-    let layers = slice_raw_layers_internal(raw_layers, config, modifiers, true, None)?;
+    let layers = slice_raw_layers_internal(raw_layers, config, modifiers, true, None, None)?;
     Ok(SlicedPlate {
         layers,
         objects: Vec::new(),
@@ -886,7 +1070,11 @@ fn slice_raw_layers_internal(
     modifiers: &[ModifierVolume],
     emit_adhesion: bool,
     object_id: Option<u64>,
+    progress: Option<&SliceProgress>,
 ) -> Result<Vec<SlicedLayer>, SliceError> {
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     config.validate()?;
     for m in modifiers {
         m.overrides.validate()?;
@@ -899,7 +1087,10 @@ fn slice_raw_layers_internal(
     let has_uniform_xy = contour_comp.abs() > 1e-6 || hole_comp.abs() > 1e-6;
     let comp_raw_holder: Option<Vec<RawSliceLayer>> = if has_uniform_xy {
         let indices: Vec<usize> = (0..n).collect();
-        let layers_vec = parallel_try_map(indices, &|idx| -> Result<RawSliceLayer, SliceError> {
+        let layers_vec = parallel_try_map_slice(indices, progress, false, &|idx| -> Result<
+            RawSliceLayer,
+            SliceError,
+        > {
             let Some(raw) = raw_layers.get(idx) else {
                 return Err(SliceError::Geom(GeomError::EmptyMesh));
             };
@@ -924,11 +1115,17 @@ fn slice_raw_layers_internal(
         None
     };
 
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     let sliced_mods = slice_modifier_volumes(modifiers, base_comp_layers)?;
     let has_negatives = sliced_mods.negative_masks.iter().any(|m| !m.is_empty());
     let cut_layers_holder: Option<Vec<RawSliceLayer>> = if has_negatives {
         let indices: Vec<usize> = (0..n).collect();
-        let cut_vec = parallel_try_map(indices, &|idx| -> Result<RawSliceLayer, SliceError> {
+        let cut_vec = parallel_try_map_slice(indices, progress, false, &|idx| -> Result<
+            RawSliceLayer,
+            SliceError,
+        > {
             let Some(raw) = base_comp_layers.get(idx) else {
                 return Err(SliceError::Geom(GeomError::EmptyMesh));
             };
@@ -960,6 +1157,9 @@ fn slice_raw_layers_internal(
     };
     let comp_layers: &[RawSliceLayer] = cut_layers_holder.as_deref().unwrap_or(base_comp_layers);
 
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     let support_paths_per_layer = generate_support_paths(
         comp_layers,
         config,
@@ -990,7 +1190,7 @@ fn slice_raw_layers_internal(
     };
 
     // Stage 2: Perimeters & infill boundary extraction (per-layer independent).
-    let stage2_results = parallel_try_map(layer_indices.clone(), &|idx| {
+    let stage2_results = parallel_try_map_slice(layer_indices.clone(), progress, false, &|idx| {
         let Some(raw) = comp_layers.get(idx) else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -1035,27 +1235,28 @@ fn slice_raw_layers_internal(
     }
 
     // Stage 3: Top / bottom exposed surface detection & shell propagation (per-layer independent).
-    let stage3_results = parallel_try_map(layer_indices.clone(), &|idx| -> Result<
-        (Vec<ExPolygon>, Vec<ExPolygon>),
-        SliceError,
-    > {
-        let Some(infill_here) = per_layer_infill_areas.get(idx) else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let below = idx
-            .checked_sub(1)
-            .and_then(|j| comp_layers.get(j))
-            .map(|l| l.regions.as_slice())
-            .unwrap_or(&[]);
-        let above = comp_layers
-            .get(idx + 1)
-            .map(|l| l.regions.as_slice())
-            .unwrap_or(&[]);
-        Ok((
-            difference(infill_here, below)?,
-            difference(infill_here, above)?,
-        ))
-    })?;
+    let stage3_results =
+        parallel_try_map_slice(layer_indices.clone(), progress, false, &|idx| -> Result<
+            (Vec<ExPolygon>, Vec<ExPolygon>),
+            SliceError,
+        > {
+            let Some(infill_here) = per_layer_infill_areas.get(idx) else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+            let below = idx
+                .checked_sub(1)
+                .and_then(|j| comp_layers.get(j))
+                .map(|l| l.regions.as_slice())
+                .unwrap_or(&[]);
+            let above = comp_layers
+                .get(idx + 1)
+                .map(|l| l.regions.as_slice())
+                .unwrap_or(&[]);
+            Ok((
+                difference(infill_here, below)?,
+                difference(infill_here, above)?,
+            ))
+        })?;
     let mut bottom_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
     let mut top_exposed: Vec<Vec<ExPolygon>> = Vec::with_capacity(n);
     for (b, t) in stage3_results {
@@ -1074,94 +1275,33 @@ fn slice_raw_layers_internal(
         next_prev_sparse: Vec<ExPolygon>,
     }
 
-    let stage4a = parallel_try_map(layer_indices.clone(), &|idx| -> Result<
-        LayerShellPrep,
-        SliceError,
-    > {
-        let Some(raw) = comp_layers.get(idx) else {
-            return Err(SliceError::Geom(GeomError::EmptyMesh));
-        };
-        let Some(infill_here) = per_layer_infill_areas.get(idx) else {
-            return Err(SliceError::Geom(GeomError::EmptyMesh));
-        };
-        let Some(base_p) = per_layer_base_params.get(idx) else {
-            return Err(SliceError::Geom(GeomError::EmptyMesh));
-        };
-        let h = raw.plane.height_mm;
-        let active_shells = sliced_mods.active_param_mods(idx, |ov| ov.affects_shells());
-        let (top_here, mut bottom_here, mut internal_solid, mut sparse_region) =
-            if active_shells.is_empty() {
-                let bottom_shells = base_p.bottom_shell_layers as usize;
-                let top_shells = base_p.top_shell_layers as usize;
-
-                let mut shell_sources: Vec<ExPolygon> = Vec::new();
-                if bottom_shells > 0 {
-                    let min_j = bottom_shell_start_idx(
-                        comp_layers,
-                        idx,
-                        bottom_shells,
-                        config.process.bottom_shell_thickness_mm,
-                    );
-                    for j in min_j..=idx {
-                        if let Some(exp) = bottom_exposed.get(j) {
-                            shell_sources.extend(exp.iter().cloned());
-                        }
-                    }
-                }
-                if top_shells > 0 {
-                    let max_j = top_shell_end_idx(
-                        comp_layers,
-                        idx,
-                        top_shells,
-                        config.process.top_shell_thickness_mm,
-                    );
-                    for j in idx..=max_j {
-                        if let Some(exp) = top_exposed.get(j) {
-                            shell_sources.extend(exp.iter().cloned());
-                        }
-                    }
-                }
-
-                let solid_union = if shell_sources.is_empty() {
-                    Vec::new()
-                } else {
-                    intersection(infill_here, &union(&shell_sources)?)?
-                };
-
-                let top_h = if top_shells > 0 {
-                    top_exposed.get(idx).cloned().unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let bot_h = if bottom_shells > 0 {
-                    let b = bottom_exposed.get(idx).cloned().unwrap_or_default();
-                    difference(&b, &top_h)?
-                } else {
-                    Vec::new()
-                };
-                let exposed_h = union(&[top_h.as_slice(), bot_h.as_slice()].concat())?;
-                let internal_h = difference(&solid_union, &exposed_h)?;
-                let sparse_h = difference(infill_here, &solid_union)?;
-                (top_h, bot_h, internal_h, sparse_h)
-            } else {
-                let shell_buckets = partition_regions(infill_here, base_p, &active_shells)?;
-                let top_exp_here = top_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                let bot_exp_here = bottom_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                let mut acc_top = Vec::new();
-                let mut acc_bot = Vec::new();
-                let mut acc_int = Vec::new();
-                let mut acc_spr = Vec::new();
-
-                for (sub_infill, b_params) in shell_buckets {
-                    let b_bottom_n = b_params.bottom_shell_layers as usize;
-                    let b_top_n = b_params.top_shell_layers as usize;
+    let stage4a =
+        parallel_try_map_slice(layer_indices.clone(), progress, false, &|idx| -> Result<
+            LayerShellPrep,
+            SliceError,
+        > {
+            let Some(raw) = comp_layers.get(idx) else {
+                return Err(SliceError::Geom(GeomError::EmptyMesh));
+            };
+            let Some(infill_here) = per_layer_infill_areas.get(idx) else {
+                return Err(SliceError::Geom(GeomError::EmptyMesh));
+            };
+            let Some(base_p) = per_layer_base_params.get(idx) else {
+                return Err(SliceError::Geom(GeomError::EmptyMesh));
+            };
+            let h = raw.plane.height_mm;
+            let active_shells = sliced_mods.active_param_mods(idx, |ov| ov.affects_shells());
+            let (top_here, mut bottom_here, mut internal_solid, mut sparse_region) =
+                if active_shells.is_empty() {
+                    let bottom_shells = base_p.bottom_shell_layers as usize;
+                    let top_shells = base_p.top_shell_layers as usize;
 
                     let mut shell_sources: Vec<ExPolygon> = Vec::new();
-                    if b_bottom_n > 0 {
+                    if bottom_shells > 0 {
                         let min_j = bottom_shell_start_idx(
                             comp_layers,
                             idx,
-                            b_bottom_n,
+                            bottom_shells,
                             config.process.bottom_shell_thickness_mm,
                         );
                         for j in min_j..=idx {
@@ -1170,11 +1310,11 @@ fn slice_raw_layers_internal(
                             }
                         }
                     }
-                    if b_top_n > 0 {
+                    if top_shells > 0 {
                         let max_j = top_shell_end_idx(
                             comp_layers,
                             idx,
-                            b_top_n,
+                            top_shells,
                             config.process.top_shell_thickness_mm,
                         );
                         for j in idx..=max_j {
@@ -1187,114 +1327,176 @@ fn slice_raw_layers_internal(
                     let solid_union = if shell_sources.is_empty() {
                         Vec::new()
                     } else {
-                        intersection(&sub_infill, &union(&shell_sources)?)?
+                        intersection(infill_here, &union(&shell_sources)?)?
                     };
-                    let b_top = if b_top_n > 0 && !top_exp_here.is_empty() {
-                        intersection(&sub_infill, top_exp_here)?
-                    } else {
-                        Vec::new()
-                    };
-                    let b_bot = if b_bottom_n > 0 && !bot_exp_here.is_empty() {
-                        let raw_b = intersection(&sub_infill, bot_exp_here)?;
-                        difference(&raw_b, &b_top)?
-                    } else {
-                        Vec::new()
-                    };
-                    let b_exposed = union(&[b_top.as_slice(), b_bot.as_slice()].concat())?;
-                    let b_internal = difference(&solid_union, &b_exposed)?;
-                    let b_sparse = difference(&sub_infill, &solid_union)?;
 
-                    acc_top.extend(b_top);
-                    acc_bot.extend(b_bot);
-                    acc_int.extend(b_internal);
-                    acc_spr.extend(b_sparse);
+                    let top_h = if top_shells > 0 {
+                        top_exposed.get(idx).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let bot_h = if bottom_shells > 0 {
+                        let b = bottom_exposed.get(idx).cloned().unwrap_or_default();
+                        difference(&b, &top_h)?
+                    } else {
+                        Vec::new()
+                    };
+                    let exposed_h = union(&[top_h.as_slice(), bot_h.as_slice()].concat())?;
+                    let internal_h = difference(&solid_union, &exposed_h)?;
+                    let sparse_h = difference(infill_here, &solid_union)?;
+                    (top_h, bot_h, internal_h, sparse_h)
+                } else {
+                    let shell_buckets = partition_regions(infill_here, base_p, &active_shells)?;
+                    let top_exp_here = top_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                    let bot_exp_here = bottom_exposed.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+                    let mut acc_top = Vec::new();
+                    let mut acc_bot = Vec::new();
+                    let mut acc_int = Vec::new();
+                    let mut acc_spr = Vec::new();
+
+                    for (sub_infill, b_params) in shell_buckets {
+                        let b_bottom_n = b_params.bottom_shell_layers as usize;
+                        let b_top_n = b_params.top_shell_layers as usize;
+
+                        let mut shell_sources: Vec<ExPolygon> = Vec::new();
+                        if b_bottom_n > 0 {
+                            let min_j = bottom_shell_start_idx(
+                                comp_layers,
+                                idx,
+                                b_bottom_n,
+                                config.process.bottom_shell_thickness_mm,
+                            );
+                            for j in min_j..=idx {
+                                if let Some(exp) = bottom_exposed.get(j) {
+                                    shell_sources.extend(exp.iter().cloned());
+                                }
+                            }
+                        }
+                        if b_top_n > 0 {
+                            let max_j = top_shell_end_idx(
+                                comp_layers,
+                                idx,
+                                b_top_n,
+                                config.process.top_shell_thickness_mm,
+                            );
+                            for j in idx..=max_j {
+                                if let Some(exp) = top_exposed.get(j) {
+                                    shell_sources.extend(exp.iter().cloned());
+                                }
+                            }
+                        }
+
+                        let solid_union = if shell_sources.is_empty() {
+                            Vec::new()
+                        } else {
+                            intersection(&sub_infill, &union(&shell_sources)?)?
+                        };
+                        let b_top = if b_top_n > 0 && !top_exp_here.is_empty() {
+                            intersection(&sub_infill, top_exp_here)?
+                        } else {
+                            Vec::new()
+                        };
+                        let b_bot = if b_bottom_n > 0 && !bot_exp_here.is_empty() {
+                            let raw_b = intersection(&sub_infill, bot_exp_here)?;
+                            difference(&raw_b, &b_top)?
+                        } else {
+                            Vec::new()
+                        };
+                        let b_exposed = union(&[b_top.as_slice(), b_bot.as_slice()].concat())?;
+                        let b_internal = difference(&solid_union, &b_exposed)?;
+                        let b_sparse = difference(&sub_infill, &solid_union)?;
+
+                        acc_top.extend(b_top);
+                        acc_bot.extend(b_bot);
+                        acc_int.extend(b_internal);
+                        acc_spr.extend(b_sparse);
+                    }
+
+                    (
+                        union_if_multi(acc_top)?,
+                        union_if_multi(acc_bot)?,
+                        union_if_multi(acc_int)?,
+                        union_if_multi(acc_spr)?,
+                    )
+                };
+
+            let solid_w = config.process.solid_infill_width_mm;
+            let solid_spacing = stadium_spacing_mm(solid_w, h);
+
+            let mut bridge_paths = Vec::new();
+            if idx > 0 && config.process.detect_bridges && !bottom_here.is_empty() {
+                let below = comp_layers
+                    .get(idx - 1)
+                    .map(|l| l.regions.as_slice())
+                    .unwrap_or(&[]);
+                let bridge_raw = std::mem::take(&mut bottom_here);
+                let anchor_mm = 2.0 * solid_w;
+                let expanded = offset(
+                    &bridge_raw,
+                    mm_to_nm(anchor_mm)?,
+                    JoinType::Miter { limit: 2.0 },
+                )?;
+                let anchor_ext = intersection(&expanded, below)?;
+                let bridge_union = union(&[bridge_raw.as_slice(), anchor_ext.as_slice()].concat())?;
+                let anchored_bridges = intersection(infill_here, &bridge_union)?;
+
+                internal_solid = difference(&internal_solid, &anchored_bridges)?;
+                sparse_region = difference(&sparse_region, &anchored_bridges)?;
+
+                for bridge_poly in &anchored_bridges {
+                    let bridge_angle = compute_bridge_angle(bridge_poly, below)?;
+                    let hatched = generate_rectilinear_hatch(
+                        std::slice::from_ref(bridge_poly),
+                        bridge_angle,
+                        solid_spacing,
+                        0.0,
+                        false,
+                        ExtrusionRole::Bridge,
+                        solid_w,
+                        h,
+                        config.process.bridge_speed_mm_s,
+                        config.process.bridge_flow_ratio,
+                    )?;
+                    bridge_paths.extend(hatched);
                 }
+            }
 
-                (
-                    union_if_multi(acc_top)?,
-                    union_if_multi(acc_bot)?,
-                    union_if_multi(acc_int)?,
-                    union_if_multi(acc_spr)?,
-                )
+            let mut next_prev_sparse_src = Vec::new();
+            let sparse_buckets = if !sparse_region.is_empty() {
+                let active_infill = sliced_mods.active_param_mods(idx, |ov| {
+                    ov.sparse_infill_density.is_some()
+                        || ov.sparse_infill_pattern.is_some()
+                        || ov.infill_speed_mm_s.is_some()
+                });
+                let buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
+                for (sub_sparse, b_params) in &buckets {
+                    if !sub_sparse.is_empty() && b_params.sparse_infill_density < 0.99 {
+                        next_prev_sparse_src.extend(sub_sparse.iter().cloned());
+                    }
+                }
+                buckets
+            } else {
+                Vec::new()
+            };
+            let next_prev_sparse = if next_prev_sparse_src.is_empty() {
+                Vec::new()
+            } else {
+                union_if_multi(next_prev_sparse_src)?
             };
 
-        let solid_w = config.process.solid_infill_width_mm;
-        let solid_spacing = stadium_spacing_mm(solid_w, h);
-
-        let mut bridge_paths = Vec::new();
-        if idx > 0 && config.process.detect_bridges && !bottom_here.is_empty() {
-            let below = comp_layers
-                .get(idx - 1)
-                .map(|l| l.regions.as_slice())
-                .unwrap_or(&[]);
-            let bridge_raw = std::mem::take(&mut bottom_here);
-            let anchor_mm = 2.0 * solid_w;
-            let expanded = offset(
-                &bridge_raw,
-                mm_to_nm(anchor_mm)?,
-                JoinType::Miter { limit: 2.0 },
-            )?;
-            let anchor_ext = intersection(&expanded, below)?;
-            let bridge_union = union(&[bridge_raw.as_slice(), anchor_ext.as_slice()].concat())?;
-            let anchored_bridges = intersection(infill_here, &bridge_union)?;
-
-            internal_solid = difference(&internal_solid, &anchored_bridges)?;
-            sparse_region = difference(&sparse_region, &anchored_bridges)?;
-
-            for bridge_poly in &anchored_bridges {
-                let bridge_angle = compute_bridge_angle(bridge_poly, below)?;
-                let hatched = generate_rectilinear_hatch(
-                    std::slice::from_ref(bridge_poly),
-                    bridge_angle,
-                    solid_spacing,
-                    0.0,
-                    false,
-                    ExtrusionRole::Bridge,
-                    solid_w,
-                    h,
-                    config.process.bridge_speed_mm_s,
-                    config.process.bridge_flow_ratio,
-                )?;
-                bridge_paths.extend(hatched);
-            }
-        }
-
-        let mut next_prev_sparse_src = Vec::new();
-        let sparse_buckets = if !sparse_region.is_empty() {
-            let active_infill = sliced_mods.active_param_mods(idx, |ov| {
-                ov.sparse_infill_density.is_some()
-                    || ov.sparse_infill_pattern.is_some()
-                    || ov.infill_speed_mm_s.is_some()
-            });
-            let buckets = partition_regions(&sparse_region, base_p, &active_infill)?;
-            for (sub_sparse, b_params) in &buckets {
-                if !sub_sparse.is_empty() && b_params.sparse_infill_density < 0.99 {
-                    next_prev_sparse_src.extend(sub_sparse.iter().cloned());
-                }
-            }
-            buckets
-        } else {
-            Vec::new()
-        };
-        let next_prev_sparse = if next_prev_sparse_src.is_empty() {
-            Vec::new()
-        } else {
-            union_if_multi(next_prev_sparse_src)?
-        };
-
-        Ok(LayerShellPrep {
-            top_here,
-            bottom_here,
-            internal_solid,
-            sparse_region,
-            bridge_paths,
-            sparse_buckets,
-            next_prev_sparse,
-        })
-    })?;
+            Ok(LayerShellPrep {
+                top_here,
+                bottom_here,
+                internal_solid,
+                sparse_region,
+                bridge_paths,
+                sparse_buckets,
+                next_prev_sparse,
+            })
+        })?;
 
     // Stage 4B: Overhang splitting, internal bridges, solid/sparse hatching, and ironing (per-layer parallel).
-    let stage4b_paths = parallel_try_map(layer_indices, &|idx| -> Result<
+    let stage4b_paths = parallel_try_map_slice(layer_indices, progress, true, &|idx| -> Result<
         Vec<ExtrusionPath>,
         SliceError,
     > {
@@ -1544,6 +1746,9 @@ fn slice_raw_layers_internal(
     })?;
 
     // Stage 4C: Deterministic sequential island travel ordering & cooling flow/speed calculation.
+    if progress.is_some_and(SliceProgress::is_cancelled) {
+        return Err(SliceError::Cancelled);
+    }
     let mut cursor_xy = (0.0_f64, 0.0_f64);
     let mut layers = Vec::with_capacity(n);
     for (idx, raw_paths) in stage4b_paths.into_iter().enumerate() {
@@ -6381,6 +6586,40 @@ mod tests {
         assert!(matches!(
             slice_plate_objects(&objs_close, &cfg, &[]),
             Err(SliceError::SequentialClearanceViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn slice_progress_reports_layers_and_respects_cancellation() {
+        let mesh = make_box_mesh(16.0, 16.0, 4.0);
+        let prepared = prepare_for_plate(&mesh, 250.0, 250.0).unwrap();
+        let cfg = PrintConfig::default();
+
+        let progress = SliceProgress::new();
+        let plate =
+            slice_prepared_mesh_with_progress(&prepared, &cfg, &[], Some(&progress)).unwrap();
+        let (done, total) = progress.snapshot();
+        assert!(done > 0);
+        assert_eq!(done, plate.layers.len());
+        assert_eq!(total, plate.layers.len());
+
+        let cancelled = SliceProgress::new();
+        cancelled.cancel();
+        assert!(matches!(
+            slice_prepared_mesh_with_progress(&prepared, &cfg, &[], Some(&cancelled)),
+            Err(SliceError::Cancelled)
+        ));
+
+        let ov = ModifierOverrides::default();
+        let obj = PlateSliceObject {
+            id: 1,
+            name: "Part",
+            prepared_mesh: &prepared,
+            overrides: &ov,
+        };
+        assert!(matches!(
+            slice_plate_objects_with_progress(&[obj], &cfg, &[], Some(&cancelled)),
+            Err(SliceError::Cancelled)
         ));
     }
 }

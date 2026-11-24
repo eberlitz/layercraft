@@ -23,7 +23,8 @@ use layercraft_engine::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_engine::{
-    PrinterStatusReport, UploadOptions, UploadResult, probe_printer, upload_to_printer,
+    PrinterError, PrinterStatusReport, UploadOptions, UploadProgress, UploadResult, probe_printer,
+    upload_to_printer_with_progress,
 };
 use layercraft_gcode::{BgcodeOptions, encode_bgcode};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
@@ -47,27 +48,138 @@ pub enum ViewMode {
     Preview,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GcodeLayerIndex {
+    source_ptr: usize,
+    source_len: usize,
+    line_ranges: Vec<(usize, usize)>,
+    layer_ranges: Vec<(usize, usize)>,
+    layer_move_lines: Vec<Vec<usize>>,
+}
+
+impl GcodeLayerIndex {
+    pub fn build(gcode: &str) -> Self {
+        let mut line_ranges = Vec::new();
+        let mut layer_ranges = Vec::new();
+        let mut layer_move_lines = Vec::new();
+        let mut current_start: Option<usize> = None;
+        let mut current_moves: Vec<usize> = Vec::new();
+
+        let mut pos = 0_usize;
+        for raw_line in gcode.split('\n') {
+            let trimmed_cr = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            let is_trailing_empty = trimmed_cr.is_empty() && pos == gcode.len();
+            if !is_trailing_empty {
+                let start = pos;
+                let end = start + trimmed_cr.len();
+                let line_idx = line_ranges.len();
+                line_ranges.push((start, end));
+
+                let trimmed = trimmed_cr.trim_start();
+                if trimmed == ";LAYER_CHANGE" {
+                    if let Some(prev_start) = current_start.take() {
+                        layer_ranges.push((prev_start, line_idx));
+                        layer_move_lines.push(std::mem::take(&mut current_moves));
+                    }
+                    current_start = Some(line_idx);
+                } else if current_start.is_some()
+                    && (trimmed.starts_with("G0 ")
+                        || trimmed.starts_with("G1 ")
+                        || trimmed.starts_with("G2 ")
+                        || trimmed.starts_with("G3 "))
+                {
+                    current_moves.push(line_idx);
+                }
+            }
+            pos = pos.saturating_add(raw_line.len()).saturating_add(1);
+        }
+
+        if let Some(start) = current_start {
+            layer_ranges.push((start, line_ranges.len()));
+            layer_move_lines.push(current_moves);
+        }
+
+        Self {
+            source_ptr: gcode.as_ptr() as usize,
+            source_len: gcode.len(),
+            line_ranges,
+            layer_ranges,
+            layer_move_lines,
+        }
+    }
+
+    pub fn matches(&self, gcode: &str) -> bool {
+        self.source_ptr == gcode.as_ptr() as usize && self.source_len == gcode.len()
+    }
+
+    pub fn total_lines(&self) -> usize {
+        self.line_ranges.len()
+    }
+
+    pub fn line_str<'a>(&self, gcode: &'a str, idx: usize) -> &'a str {
+        self.line_ranges
+            .get(idx)
+            .and_then(|&(s, e)| gcode.get(s..e))
+            .unwrap_or("")
+    }
+
+    pub fn layer_line_range(&self, layer_idx: usize) -> Option<(usize, usize)> {
+        self.layer_ranges.get(layer_idx).copied()
+    }
+
+    pub fn active_move_line(
+        &self,
+        layer_idx: usize,
+        cur_step: usize,
+        step_count: usize,
+    ) -> Option<usize> {
+        let moves = self.layer_move_lines.get(layer_idx)?;
+        if moves.is_empty() || cur_step == 0 || step_count == 0 {
+            return None;
+        }
+        let max_idx = moves.len().saturating_sub(1);
+        let denom = step_count.saturating_sub(1).max(1);
+        let step0 = cur_step.saturating_sub(1).min(denom);
+        let mapped = (step0.saturating_mul(max_idx)) / denom;
+        moves.get(mapped).copied()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum SliceJobError {
+    Cancelled,
+    Failed(String),
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingSliceOutcome {
     job_id: u64,
     elapsed_ms: f64,
-    result: Result<(layercraft_slice::SlicedPlate, layercraft_gcode::GcodeOutput), String>,
+    result: Result<(layercraft_slice::SlicedPlate, layercraft_gcode::GcodeOutput), SliceJobError>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingSliceJob {
     rx: mpsc::Receiver<PendingSliceOutcome>,
+    progress: Arc<layercraft_slice::SliceProgress>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 enum PendingPrinterOutcome {
-    Probe(Result<PrinterStatusReport, String>),
-    Upload(Result<UploadResult, String>),
+    Probe {
+        job_id: u64,
+        result: Result<PrinterStatusReport, String>,
+    },
+    Upload {
+        job_id: u64,
+        result: Result<UploadResult, PrinterError>,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingPrinterJob {
     rx: mpsc::Receiver<PendingPrinterOutcome>,
+    upload_progress: Option<Arc<UploadProgress>>,
 }
 
 /// Frame callback invoked before UI layout to pump external controllers (e.g. Live MCP bridge).
@@ -165,6 +277,9 @@ pub struct LayerCraftApp {
     pub(crate) sidebar_tab: SidebarTab,
     pub(crate) ribbon_collapsed: bool,
     pub(crate) show_legend_hud: bool,
+    pub show_gcode_viewer: bool,
+    pub gcode_viewer_all_layers: bool,
+    pub(crate) gcode_index: GcodeLayerIndex,
     pub(crate) last_scene_dark: bool,
     pub(crate) external_poller: Option<ExternalPoller>,
     pub(crate) bridge_endpoint: Option<String>,
@@ -201,6 +316,8 @@ pub struct LayerCraftApp {
     next_slice_job_id: u64,
     #[cfg(not(target_arch = "wasm32"))]
     pending_printer_job: Option<PendingPrinterJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    next_printer_job_id: u64,
     #[cfg(target_arch = "wasm32")]
     pending_drops: std::rc::Rc<std::cell::RefCell<Vec<(String, Result<Vec<u8>, String>)>>>,
 }
@@ -329,6 +446,9 @@ impl LayerCraftApp {
             sidebar_tab: SidebarTab::Plate,
             ribbon_collapsed: false,
             show_legend_hud: true,
+            show_gcode_viewer: false,
+            gcode_viewer_all_layers: false,
+            gcode_index: GcodeLayerIndex::default(),
             last_scene_dark: initial_scene_dark,
             external_poller: None,
             bridge_endpoint: None,
@@ -365,6 +485,8 @@ impl LayerCraftApp {
             next_slice_job_id: 0,
             #[cfg(not(target_arch = "wasm32"))]
             pending_printer_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            next_printer_job_id: 0,
             #[cfg(target_arch = "wasm32")]
             pending_drops: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         };
@@ -1392,6 +1514,16 @@ impl LayerCraftApp {
         }
     }
 
+    pub(crate) fn sync_gcode_index(&mut self) {
+        if let Some(out) = self.session.last_gcode.as_ref() {
+            if !self.gcode_index.matches(&out.gcode) {
+                self.gcode_index = GcodeLayerIndex::build(&out.gcode);
+            }
+        } else if self.gcode_index.total_lines() > 0 {
+            self.gcode_index = GcodeLayerIndex::default();
+        }
+    }
+
     /// Return `true` while a native background slice job is active.
     pub(crate) fn is_slicing(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
@@ -1404,12 +1536,31 @@ impl LayerCraftApp {
         }
     }
 
+    pub(crate) fn slice_progress_snapshot(&self) -> Option<(usize, usize)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_slice.as_ref().map(|j| j.progress.snapshot())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
     pub(crate) fn cancel_pending_slice(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.next_slice_job_id = self.next_slice_job_id.wrapping_add(1);
-            self.pending_slice = None;
+            if let Some(job) = self.pending_slice.take() {
+                job.progress.cancel();
+            }
         }
+    }
+
+    pub(crate) fn cancel_slice_action(&mut self) {
+        self.cancel_pending_slice();
+        self.last_error = None;
+        self.status_message = "Slicing cancelled.".to_owned();
     }
 
     /// Trigger slicing from interactive UI controls (async background thread on native, sync on WASM).
@@ -1424,7 +1575,10 @@ impl LayerCraftApp {
             if self.pending_slice.is_some() {
                 return;
             }
-            if self.session.prepared_mesh.is_none() && self.session.mesh.is_none() {
+            if self.session.objects.is_empty()
+                && self.session.prepared_mesh.is_none()
+                && self.session.mesh.is_none()
+            {
                 self.last_error = Some("No mesh loaded on build plate.".to_owned());
                 return;
             }
@@ -1442,6 +1596,24 @@ impl LayerCraftApp {
             let job_id = self.next_slice_job_id.wrapping_add(1);
             self.next_slice_job_id = job_id;
             let cfg = self.session.config.clone();
+            let objs_owned: Vec<(
+                u64,
+                String,
+                Arc<layercraft_geom::TriangleMesh>,
+                ModifierOverrides,
+            )> = self
+                .session
+                .objects
+                .iter()
+                .map(|o| {
+                    (
+                        o.id,
+                        o.name.clone(),
+                        Arc::clone(&o.prepared_mesh),
+                        o.overrides.clone(),
+                    )
+                })
+                .collect();
             let prepared = self.session.prepared_mesh.clone();
             let raw = self.session.mesh.clone();
             let mod_vols: Vec<layercraft_slice::ModifierVolume> = self
@@ -1457,29 +1629,66 @@ impl LayerCraftApp {
                 })
                 .collect();
 
+            let progress = Arc::new(layercraft_slice::SliceProgress::new());
+            let progress_bg = Arc::clone(&progress);
             let (tx, rx) = mpsc::channel();
             let ctx_clone = ctx.clone();
             let spawned = std::thread::Builder::new()
                 .name("layercraft-slice".to_owned())
                 .spawn(move || {
                     let t0 = web_time::Instant::now();
+                    let map_slice_err = |e: layercraft_slice::SliceError| match e {
+                        layercraft_slice::SliceError::Cancelled => SliceJobError::Cancelled,
+                        other => SliceJobError::Failed(other.to_string()),
+                    };
                     let res = (|| -> Result<
                         (layercraft_slice::SlicedPlate, layercraft_gcode::GcodeOutput),
-                        String,
+                        SliceJobError,
                     > {
-                        let plate = if let Some(prep) = prepared.as_ref() {
-                            layercraft_slice::slice_prepared_mesh_with_modifiers(
-                                prep, &cfg, &mod_vols,
+                        let plate = if !objs_owned.is_empty() {
+                            let plate_objs: Vec<layercraft_slice::PlateSliceObject<'_>> =
+                                objs_owned
+                                    .iter()
+                                    .map(|(id, name, mesh, ov)| {
+                                        layercraft_slice::PlateSliceObject {
+                                            id: *id,
+                                            name: name.as_str(),
+                                            prepared_mesh: mesh.as_ref(),
+                                            overrides: ov,
+                                        }
+                                    })
+                                    .collect();
+                            layercraft_slice::slice_plate_objects_with_progress(
+                                &plate_objs,
+                                &cfg,
+                                &mod_vols,
+                                Some(progress_bg.as_ref()),
                             )
-                            .map_err(|e| e.to_string())?
+                            .map_err(map_slice_err)?
+                        } else if let Some(prep) = prepared.as_ref() {
+                            layercraft_slice::slice_prepared_mesh_with_progress(
+                                prep,
+                                &cfg,
+                                &mod_vols,
+                                Some(progress_bg.as_ref()),
+                            )
+                            .map_err(map_slice_err)?
                         } else if let Some(r) = raw.as_ref() {
                             layercraft_slice::slice_single_mesh_with_modifiers(r, &cfg, &mod_vols)
-                                .map_err(|e| e.to_string())?
+                                .map_err(map_slice_err)?
                         } else {
-                            return Err("no mesh loaded on build plate".to_owned());
+                            return Err(SliceJobError::Failed(
+                                "no mesh loaded on build plate".to_owned(),
+                            ));
                         };
-                        let gcode_out =
-                            layercraft_gcode::emit_gcode(&plate, &cfg).map_err(|e| e.to_string())?;
+                        if progress_bg.is_cancelled() {
+                            return Err(SliceJobError::Cancelled);
+                        }
+                        let gcode_out = layercraft_gcode::emit_gcode(&plate, &cfg)
+                            .map_err(|e| SliceJobError::Failed(e.to_string()))?;
+                        if progress_bg.is_cancelled() {
+                            return Err(SliceJobError::Cancelled);
+                        }
                         Ok((plate, gcode_out))
                     })();
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1495,7 +1704,7 @@ impl LayerCraftApp {
                 Ok(_) => {
                     self.last_error = None;
                     self.status_message = "Slicing in background...".to_owned();
-                    self.pending_slice = Some(PendingSliceJob { rx });
+                    self.pending_slice = Some(PendingSliceJob { rx, progress });
                 }
                 Err(_) => {
                     self.run_slice();
@@ -1532,6 +1741,7 @@ impl LayerCraftApp {
                 let layers = plate.layers.len();
                 self.session.sliced = Some(plate);
                 self.session.last_gcode = Some(gcode_out);
+                self.gcode_index = GcodeLayerIndex::default();
                 self.last_slice_ms = Some(out.elapsed_ms);
                 self.view_mode = ViewMode::Preview;
                 self.last_error = None;
@@ -1541,7 +1751,11 @@ impl LayerCraftApp {
                 self.rebuild_scene();
                 self.set_active_layer(layers.saturating_sub(1));
             }
-            Err(err_msg) => {
+            Err(SliceJobError::Cancelled) => {
+                self.last_error = None;
+                self.status_message = "Slicing cancelled.".to_owned();
+            }
+            Err(SliceJobError::Failed(err_msg)) => {
                 self.last_error = Some(err_msg);
             }
         }
@@ -1578,6 +1792,7 @@ impl LayerCraftApp {
             .as_ref()
             .map(|s| s.layers.len())
             .unwrap_or(0);
+        self.gcode_index = GcodeLayerIndex::default();
         self.view_mode = ViewMode::Preview;
         self.last_error = None;
         self.status_message = format!("Sliced {layers} layers in {elapsed_ms:.1} ms.");
@@ -1726,6 +1941,7 @@ impl LayerCraftApp {
         ));
         let max_steps = self.active_layer_step_count();
         self.layer_move_step = self.layer_move_step.min(max_steps);
+        self.sync_gcode_index();
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -2102,6 +2318,26 @@ impl LayerCraftApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn upload_progress_snapshot(&self) -> Option<(usize, usize)> {
+        self.pending_printer_job
+            .as_ref()
+            .and_then(|j| j.upload_progress.as_ref())
+            .map(|p| p.snapshot())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cancel_printer_upload_action(&mut self) {
+        self.next_printer_job_id = self.next_printer_job_id.wrapping_add(1);
+        if let Some(job) = self.pending_printer_job.take()
+            && let Some(p) = job.upload_progress
+        {
+            p.cancel();
+        }
+        self.last_error = None;
+        self.status_message = "Printer upload cancelled.".to_owned();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_upload_dialog(&mut self) {
         let supports_bg = self.printer_draft.protocol.supports_bgcode();
         let binary = supports_bg
@@ -2118,6 +2354,8 @@ impl LayerCraftApp {
         if self.pending_printer_job.is_some() {
             return;
         }
+        let job_id = self.next_printer_job_id.wrapping_add(1);
+        self.next_printer_job_id = job_id;
         let prof = self.printer_draft.clone();
         let (tx, rx) = mpsc::channel();
         let ctx_clone = ctx.clone();
@@ -2125,14 +2363,20 @@ impl LayerCraftApp {
             .name("layercraft-printer-probe".to_owned())
             .spawn(move || {
                 let res = probe_printer(&prof).map_err(|e| e.to_string());
-                let _ = tx.send(PendingPrinterOutcome::Probe(res));
+                let _ = tx.send(PendingPrinterOutcome::Probe {
+                    job_id,
+                    result: res,
+                });
                 ctx_clone.request_repaint();
             });
         match spawned {
             Ok(_) => {
                 self.last_error = None;
                 self.status_message = format!("Connecting to `{}`...", self.printer_draft.base_url);
-                self.pending_printer_job = Some(PendingPrinterJob { rx });
+                self.pending_printer_job = Some(PendingPrinterJob {
+                    rx,
+                    upload_progress: None,
+                });
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed spawning printer probe: {e}"));
@@ -2149,6 +2393,8 @@ impl LayerCraftApp {
             self.last_error = Some("Slice the plate before uploading to a printer.".to_owned());
             return;
         };
+        let job_id = self.next_printer_job_id.wrapping_add(1);
+        self.next_printer_job_id = job_id;
         let prof = self.printer_draft.clone();
         let cfg = self.session.config.clone();
         let binary = self.upload_binary;
@@ -2158,21 +2404,37 @@ impl LayerCraftApp {
             start_print: self.upload_start_print,
             overwrite: self.upload_overwrite,
         };
+        let upload_progress = Arc::new(UploadProgress::new());
+        let progress_bg = Arc::clone(&upload_progress);
         let (tx, rx) = mpsc::channel();
         let ctx_clone = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("layercraft-printer-upload".to_owned())
             .spawn(move || {
-                let res = (|| -> Result<UploadResult, String> {
+                let res = (|| -> Result<UploadResult, PrinterError> {
+                    if progress_bg.is_cancelled() {
+                        return Err(PrinterError::Cancelled);
+                    }
                     let payload = if binary {
                         encode_bgcode(&gcode_out, &cfg, &BgcodeOptions::default())
-                            .map_err(|e| e.to_string())?
+                            .map_err(|e| PrinterError::Transport(e.to_string()))?
                     } else {
                         gcode_out.gcode.into_bytes()
                     };
-                    upload_to_printer(&prof, &payload, &opts).map_err(|e| e.to_string())
+                    if progress_bg.is_cancelled() {
+                        return Err(PrinterError::Cancelled);
+                    }
+                    upload_to_printer_with_progress(
+                        &prof,
+                        &payload,
+                        &opts,
+                        Some(progress_bg.as_ref()),
+                    )
                 })();
-                let _ = tx.send(PendingPrinterOutcome::Upload(res));
+                let _ = tx.send(PendingPrinterOutcome::Upload {
+                    job_id,
+                    result: res,
+                });
                 ctx_clone.request_repaint();
             });
         match spawned {
@@ -2182,7 +2444,10 @@ impl LayerCraftApp {
                     "Uploading `{}` to `{}`...",
                     self.upload_filename, self.printer_draft.name
                 );
-                self.pending_printer_job = Some(PendingPrinterJob { rx });
+                self.pending_printer_job = Some(PendingPrinterJob {
+                    rx,
+                    upload_progress: Some(upload_progress),
+                });
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed starting upload thread: {e}"));
@@ -2211,7 +2476,12 @@ impl LayerCraftApp {
         };
         self.pending_printer_job = None;
         match outcome {
-            PendingPrinterOutcome::Probe(Ok(report)) => {
+            PendingPrinterOutcome::Probe { job_id, .. }
+            | PendingPrinterOutcome::Upload { job_id, .. }
+                if job_id != self.next_printer_job_id => {}
+            PendingPrinterOutcome::Probe {
+                result: Ok(report), ..
+            } => {
                 self.last_error = None;
                 self.status_message = format!(
                     "Connected to `{}` ({}{}{}).",
@@ -2230,11 +2500,15 @@ impl LayerCraftApp {
                 );
                 self.printer_status_report = Some(report);
             }
-            PendingPrinterOutcome::Probe(Err(err)) => {
+            PendingPrinterOutcome::Probe {
+                result: Err(err), ..
+            } => {
                 self.printer_status_report = None;
                 self.last_error = Some(format!("Printer probe failed: {err}"));
             }
-            PendingPrinterOutcome::Upload(Ok(res)) => {
+            PendingPrinterOutcome::Upload {
+                result: Ok(res), ..
+            } => {
                 self.last_error = None;
                 self.show_upload_dialog = false;
                 self.status_message = format!(
@@ -2242,7 +2516,16 @@ impl LayerCraftApp {
                     res.message, res.storage, res.remote_path, res.bytes_uploaded, res.http_status
                 );
             }
-            PendingPrinterOutcome::Upload(Err(err)) => {
+            PendingPrinterOutcome::Upload {
+                result: Err(PrinterError::Cancelled),
+                ..
+            } => {
+                self.last_error = None;
+                self.status_message = "Printer upload cancelled.".to_owned();
+            }
+            PendingPrinterOutcome::Upload {
+                result: Err(err), ..
+            } => {
                 self.last_error = Some(format!("Printer upload failed: {err}"));
             }
         }
@@ -2372,17 +2655,40 @@ impl LayerCraftApp {
                     );
                 }
 
+                if let Some((sent, total)) = self.upload_progress_snapshot() {
+                    let (frac, text) = if total > 0 {
+                        let f = ((sent.min(total)) as f32) / (total as f32);
+                        let sent_kib = (sent as f64) / 1024.0;
+                        let total_kib = (total as f64) / 1024.0;
+                        (
+                            f,
+                            format!("{sent_kib:.1} / {total_kib:.1} KiB ({:.0}%)", f * 100.0),
+                        )
+                    } else {
+                        (0.0, "Encoding / connecting...".to_owned())
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(text).animate(total == 0));
+                }
+
                 if let Some(err) = &self.last_error {
                     ui.label(RichText::new(err).size(11.5).color(p.danger));
                 }
 
                 ui.separator();
+                let mut cancel_upload_clicked = false;
+                let uploading = busy && self.upload_progress_snapshot().is_some();
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        if ui_kit::secondary_button(ui, p, None, "Cancel").clicked() {
-                            cancel_clicked = true;
+                    if uploading {
+                        if ui_kit::secondary_button(ui, p, None, "Cancel Upload").clicked() {
+                            cancel_upload_clicked = true;
                         }
-                    });
+                    } else {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui_kit::secondary_button(ui, p, None, "Cancel").clicked() {
+                                cancel_clicked = true;
+                            }
+                        });
+                    }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         let ready = !busy && !self.printer_draft.base_url.trim().is_empty();
                         ui.add_enabled_ui(ready, |ui| {
@@ -2395,6 +2701,9 @@ impl LayerCraftApp {
                         });
                     });
                 });
+                if cancel_upload_clicked {
+                    self.cancel_printer_upload_action();
+                }
             });
 
         self.show_upload_dialog = open && !cancel_clicked;
@@ -3656,5 +3965,36 @@ mod tests {
         assert_eq!(app.session.modifiers.len(), 1);
         assert_eq!(app.session.modifiers[0].role, ModifierRole::NegativePart);
         assert!(!app.scene.modifier_verts.is_empty());
+    }
+
+    #[test]
+    fn ui_preview_color_modes_and_gcode_viewer_render_cleanly() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        app.run_slice();
+        assert_eq!(app.view_mode, ViewMode::Preview);
+
+        let plate = app.session.sliced.as_ref().unwrap().clone();
+        for mode in ColorMode::ALL {
+            app.color_mode = mode;
+            app.rebuild_scene();
+            assert!(!app.scene.toolpath_beads.is_empty());
+            let (lo, hi) = layercraft_viewport::compute_color_mode_range(
+                &plate,
+                mode,
+                Some(&app.session.config),
+            );
+            assert!(lo.is_finite() && hi.is_finite() && hi >= lo);
+        }
+
+        app.show_gcode_viewer = true;
+        assert!(app.gcode_index.total_lines() > 10);
+        let r0 = app.gcode_index.layer_line_range(0).unwrap();
+        assert!(r0.1 > r0.0);
+        let gcode = &app.session.last_gcode.as_ref().unwrap().gcode;
+        assert_eq!(
+            app.gcode_index.line_str(gcode, r0.0).trim(),
+            ";LAYER_CHANGE"
+        );
+        assert!(app.gcode_index.active_move_line(0, 1, 10).is_some());
     }
 }

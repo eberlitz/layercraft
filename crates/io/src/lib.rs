@@ -14,14 +14,14 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 pub mod printer;
 pub use printer::{
     DigestChallenge, PrinterAuth, PrinterError, PrinterProfile, PrinterProfileSummary,
-    PrinterProtocol, PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadResult,
-    build_digest_authorization, build_multipart_upload, normalize_base_url, parse_digest_challenge,
-    sanitize_remote_path,
+    PrinterProtocol, PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadProgress,
+    UploadResult, build_digest_authorization, build_multipart_upload, normalize_base_url,
+    parse_digest_challenge, sanitize_remote_path,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use printer::{
-    default_printers_config_path, load_printer_profiles, probe_printer, save_printer_profiles,
-    upload_to_printer,
+    default_printers_config_path, load_printer_profiles, printer_credential_storage_mode,
+    probe_printer, save_printer_profiles, upload_to_printer, upload_to_printer_with_progress,
 };
 
 /// Archive entry path storing LayerCraft project state inside a `.3mf` package.

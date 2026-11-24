@@ -5,7 +5,9 @@ use egui::{
     Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use layercraft_slice::ExtrusionRole;
-use layercraft_viewport::{CameraPreset, ColorMode, MoveKind, role_color};
+use layercraft_viewport::{
+    CameraPreset, ColorMode, MoveKind, color_ramp_sample, compute_color_mode_range, role_color,
+};
 
 use crate::icons::Icon;
 use crate::theme::ThemePalette;
@@ -31,6 +33,9 @@ pub fn draw_viewport_hud(
     if app.view_mode == ViewMode::Preview {
         if app.show_legend_hud {
             draw_preview_summary_hud(app, ctx, viewport_rect, p);
+        }
+        if app.show_gcode_viewer {
+            draw_gcode_viewer_hud(app, ctx, viewport_rect, p);
         }
         draw_vertical_layer_scrubber(app, ctx, viewport_rect, p);
         draw_horizontal_move_scrubber(app, ctx, viewport_rect, p);
@@ -296,9 +301,17 @@ fn draw_preview_summary_hud(
                             });
                         }
                     }
-                    ColorMode::Speed | ColorMode::LayerHeight | ColorMode::Layer => {
+                    ColorMode::Speed
+                    | ColorMode::VolumetricFlow
+                    | ColorMode::FanSpeed
+                    | ColorMode::LineWidth
+                    | ColorMode::LayerHeight
+                    | ColorMode::Layer => {
                         let caption = match app.color_mode {
-                            ColorMode::Speed => "Speed scale (slow -> fast)",
+                            ColorMode::Speed => "Print speed (slow -> fast)",
+                            ColorMode::VolumetricFlow => "Volumetric flow (low -> peak)",
+                            ColorMode::FanSpeed => "Fan speed (0% -> 100%)",
+                            ColorMode::LineWidth => "Line width (narrow -> wide)",
                             ColorMode::LayerHeight => "Layer height (thin -> thick)",
                             ColorMode::Layer => "Layer height Z (bottom -> top)",
                             ColorMode::Feature => "",
@@ -307,13 +320,11 @@ fn draw_preview_summary_hud(
                         ui.add_space(3.0);
                         let (bar_rect, _) =
                             ui.allocate_exact_size(vec2(190.0, 8.0), Sense::hover());
-                        let segs = 16usize;
+                        let segs = 20usize;
                         let sw = bar_rect.width() / segs as f32;
                         for i in 0..segs {
                             let t = i as f32 / (segs - 1) as f32;
-                            let r_c = ((1.0 - t) * 55.0 + t * 234.0) as u8;
-                            let g_c = ((1.0 - (t - 0.5).abs() * 2.0) * 195.0 + 40.0) as u8;
-                            let b_c = ((1.0 - t) * 235.0 + t * 48.0) as u8;
+                            let rgba = color_ramp_sample(app.color_mode, t);
                             let sr = Rect::from_min_max(
                                 pos2(bar_rect.left() + i as f32 * sw, bar_rect.top()),
                                 pos2(
@@ -324,9 +335,43 @@ fn draw_preview_summary_hud(
                             ui.painter().rect_filled(
                                 sr,
                                 CornerRadius::ZERO,
-                                Color32::from_rgb(r_c, g_c, b_c),
+                                Color32::from_rgb(
+                                    (rgba[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (rgba[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (rgba[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                ),
                             );
                         }
+                        let (lo, hi) = app
+                            .session
+                            .sliced
+                            .as_ref()
+                            .map(|s| {
+                                compute_color_mode_range(
+                                    s,
+                                    app.color_mode,
+                                    Some(&app.session.config),
+                                )
+                            })
+                            .unwrap_or((0.0, 1.0));
+                        let (lo_label, hi_label) = match app.color_mode {
+                            ColorMode::Speed => (format!("{lo:.0}"), format!("{hi:.0} mm/s")),
+                            ColorMode::VolumetricFlow => {
+                                (format!("{lo:.1}"), format!("{hi:.1} mm³/s"))
+                            }
+                            ColorMode::FanSpeed => (format!("{lo:.0}%"), format!("{hi:.0}%")),
+                            ColorMode::LineWidth => (format!("{lo:.2}"), format!("{hi:.2} mm")),
+                            ColorMode::LayerHeight => (format!("{lo:.3}"), format!("{hi:.3} mm")),
+                            ColorMode::Layer => ("0.0".to_owned(), format!("{hi:.1} mm")),
+                            ColorMode::Feature => (String::new(), String::new()),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.set_width(190.0);
+                            ui.label(RichText::new(lo_label).size(10.0).color(p.text_muted));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(hi_label).size(10.0).color(p.text_muted));
+                            });
+                        });
                     }
                 }
 
@@ -759,14 +804,189 @@ fn draw_horizontal_move_scrubber(
 
                             let desc = if cur_step == 0 {
                                 format!("0/{step_count} · Start")
+                            } else if matches!(step.kind, MoveKind::Extrusion(_)) {
+                                format!(
+                                    "{cur_step}/{step_count} · {} · {:.1} mm³/s · Fan {}%",
+                                    step.kind.label(),
+                                    step.flow_mm3_s,
+                                    step.fan_percent
+                                )
                             } else {
-                                format!("{cur_step}/{step_count} · {}", step.kind.label())
+                                format!(
+                                    "{cur_step}/{step_count} · {} · Fan {}%",
+                                    step.kind.label(),
+                                    step.fan_percent
+                                )
                             };
                             ui.label(RichText::new(desc).size(11.0).color(p.text_primary));
                         }
                     });
                 });
         });
+}
+
+fn draw_gcode_viewer_hud(
+    app: &mut LayerCraftApp,
+    ctx: &Context,
+    viewport_rect: Rect,
+    p: &ThemePalette,
+) {
+    app.sync_gcode_index();
+    let Some(gcode_text) = app.session.last_gcode.as_ref().map(|g| g.gcode.as_str()) else {
+        return;
+    };
+    let total_lines = app.gcode_index.total_lines();
+    if total_lines == 0 {
+        return;
+    }
+    let total_layers = app
+        .session
+        .sliced
+        .as_ref()
+        .map(|s| s.layers.len())
+        .unwrap_or(0);
+    let layer_idx = app.max_layer.min(total_layers.saturating_sub(1));
+    let (start_line, end_line) = if app.gcode_viewer_all_layers {
+        (0, total_lines)
+    } else {
+        app.gcode_index
+            .layer_line_range(layer_idx)
+            .unwrap_or((0, total_lines))
+    };
+    let line_count = end_line.saturating_sub(start_line);
+    let step_count = app
+        .scene
+        .layer_steps
+        .get(layer_idx)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let cur_step = app.layer_move_step.min(step_count);
+    let active_line = app
+        .gcode_index
+        .active_move_line(layer_idx, cur_step, step_count);
+
+    let panel_w = (viewport_rect.width() * 0.34).clamp(240.0, 400.0);
+    let max_h = (viewport_rect.height() * 0.36).clamp(130.0, 270.0);
+    let mut close_clicked = false;
+    let mut next_all_layers = app.gcode_viewer_all_layers;
+
+    Area::new(Id::unique("layercraft_hud_gcode_viewer"))
+        .order(Order::Foreground)
+        .pivot(Align2::LEFT_BOTTOM)
+        .fixed_pos(viewport_rect.left_bottom() + vec2(12.0, -54.0))
+        .constrain_to(viewport_rect)
+        .show(ctx, |ui| {
+            hud_frame(p)
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(panel_w);
+                    ui.horizontal(|ui| {
+                        let title = if next_all_layers {
+                            format!("G-CODE ({line_count} lines)")
+                        } else {
+                            format!("G-CODE · LAYER {} ({line_count})", layer_idx + 1)
+                        };
+                        ui.label(RichText::new(title).size(10.5).strong().color(p.text_muted));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if ui
+                                .selectable_label(false, "×")
+                                .on_hover_text("Hide G-code viewer")
+                                .clicked()
+                            {
+                                close_clicked = true;
+                            }
+                            if ui
+                                .selectable_label(false, "Copy")
+                                .on_hover_text("Copy displayed G-code to clipboard")
+                                .clicked()
+                            {
+                                let mut copied = String::new();
+                                for idx in start_line..end_line {
+                                    if !copied.is_empty() {
+                                        copied.push('\n');
+                                    }
+                                    copied.push_str(app.gcode_index.line_str(gcode_text, idx));
+                                }
+                                ctx.copy_text(copied);
+                            }
+                            if ui
+                                .selectable_label(next_all_layers, "All")
+                                .on_hover_text("Show full program")
+                                .clicked()
+                            {
+                                next_all_layers = true;
+                            }
+                            if ui
+                                .selectable_label(!next_all_layers, "Layer")
+                                .on_hover_text("Scope to selected layer")
+                                .clicked()
+                            {
+                                next_all_layers = false;
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let row_h = 15.0_f32;
+                    egui::ScrollArea::vertical()
+                        .id_salt("layercraft_gcode_viewer_scroll")
+                        .max_height(max_h)
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_h, line_count, |ui, row_range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for rel in row_range {
+                                let abs_idx = start_line.saturating_add(rel);
+                                let line = app.gcode_index.line_str(gcode_text, abs_idx);
+                                let is_active = active_line == Some(abs_idx);
+                                let trimmed = line.trim_start();
+                                let text_col = if is_active {
+                                    p.text_primary
+                                } else if trimmed.starts_with(';') {
+                                    p.text_muted
+                                } else if trimmed.starts_with('M') {
+                                    p.warning
+                                } else if trimmed.starts_with('G') {
+                                    p.accent
+                                } else {
+                                    p.text_secondary
+                                };
+                                let mut row_frame =
+                                    egui::Frame::NONE.inner_margin(Margin::symmetric(4, 1));
+                                if is_active {
+                                    row_frame = row_frame
+                                        .fill(p.accent_muted)
+                                        .corner_radius(CornerRadius::same(3));
+                                }
+                                row_frame.show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.set_height(row_h - 2.0);
+                                        ui.label(
+                                            RichText::new(format!("{:>5}", abs_idx + 1))
+                                                .monospace()
+                                                .size(10.5)
+                                                .color(p.text_muted),
+                                        );
+                                        ui.label(
+                                            RichText::new(line)
+                                                .monospace()
+                                                .size(10.5)
+                                                .color(text_col),
+                                        );
+                                    });
+                                });
+                            }
+                        });
+                });
+        });
+
+    app.gcode_viewer_all_layers = next_all_layers;
+    if close_clicked {
+        app.show_gcode_viewer = false;
+    }
 }
 
 fn draw_bottom_view_pill(

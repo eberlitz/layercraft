@@ -2497,6 +2497,16 @@ fn draw_direct_printer_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Them
         );
 
         #[cfg(not(target_arch = "wasm32"))]
+        ui.label(
+            RichText::new(format!(
+                "Credentials: {}",
+                layercraft_engine::printer_credential_storage_mode()
+            ))
+            .size(10.0)
+            .color(p.text_muted),
+        );
+
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(rep) = &app.printer_status_report {
             ui.separator();
             let state = rep.state.as_deref().unwrap_or("Reachable");

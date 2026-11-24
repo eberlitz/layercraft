@@ -28,12 +28,15 @@ use layercraft_io::{
 };
 pub use layercraft_io::{
     PrinterAuth, PrinterError, PrinterProfile, PrinterProfileSummary, PrinterProtocol,
-    PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadResult,
+    PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadProgress, UploadResult,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_io::{default_printers_config_path, load_printer_profiles, save_printer_profiles};
 #[cfg(not(target_arch = "wasm32"))]
-pub use layercraft_io::{probe_printer, upload_to_printer};
+pub use layercraft_io::{
+    printer_credential_storage_mode, probe_printer, upload_to_printer,
+    upload_to_printer_with_progress,
+};
 use layercraft_mesh::{
     MeshError, MeshInspection, ModifierPrimitive, ModifierTransform, ObjectTransform, SampleShape,
     auto_arrange_footprints, build_modifier_primitive, build_sample_shape, inspect_mesh,

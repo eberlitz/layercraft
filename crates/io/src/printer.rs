@@ -253,6 +253,60 @@ pub struct UploadResult {
     pub message: String,
 }
 
+/// Cooperative byte-progress and cancellation handle for direct printer uploads.
+#[derive(Debug, Default)]
+pub struct UploadProgress {
+    sent_bytes: std::sync::atomic::AtomicUsize,
+    total_bytes: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl UploadProgress {
+    /// Create a new upload progress tracker initialized to `0 / 0`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cooperative cancellation of an active upload.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return `true` if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Initialize total byte count and reset sent bytes to zero.
+    pub fn set_total_bytes(&self, total: usize) {
+        self.sent_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total_bytes
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reset sent byte counter to zero (for example before a Digest auth retry).
+    pub fn reset_sent(&self) {
+        self.sent_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record `delta` additional uploaded bytes.
+    pub fn add_sent_bytes(&self, delta: usize) {
+        self.sent_bytes
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Snapshot `(sent_bytes, total_bytes)`.
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.sent_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            self.total_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 /// Errors produced during printer URL/path validation, persistence, auth, or HTTP upload.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PrinterError {
@@ -272,6 +326,8 @@ pub enum PrinterError {
     InvalidResponse(String),
     #[error("failed reading or writing printer store: {0}")]
     StoreIo(String),
+    #[error("printer upload cancelled by user")]
+    Cancelled,
 }
 
 /// Validate and normalize a printer base URL (`http://...` or `https://...`, no trailing `/`).
@@ -672,15 +728,371 @@ pub fn build_multipart_upload(
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::*;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
+    #[cfg(any(
+        all(not(test), any(target_os = "linux", target_os = "macos")),
+        target_os = "windows"
+    ))]
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
     use ureq::Agent;
+    use ureq::SendBody;
     use ureq::http::Response;
     use ureq::tls::{TlsConfig, TlsProvider};
 
     static DIGEST_NC: AtomicU32 = AtomicU32::new(1);
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+    const KEYCHAIN_SENTINEL_PREFIX: &str = "keychain://layercraft/";
+    #[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+    const KEYCHAIN_SERVICE: &str = "layercraft-printer";
+
+    pub(super) trait KeychainBackend {
+        fn store(&self, account: &str, secret: &str) -> Result<(), String>;
+        fn load(&self, account: &str) -> Result<Option<String>, String>;
+    }
+
+    struct OsKeychainBackend;
+
+    impl KeychainBackend for OsKeychainBackend {
+        fn store(&self, account: &str, secret: &str) -> Result<(), String> {
+            #[cfg(test)]
+            {
+                let _ = (account, secret);
+                Err("OS keychain subprocesses are disabled in unit tests".to_owned())
+            }
+            #[cfg(all(not(test), target_os = "linux"))]
+            {
+                let mut child = Command::new("secret-tool")
+                    .args([
+                        "store",
+                        "--label=LayerCraft Printer Credential",
+                        "service",
+                        KEYCHAIN_SERVICE,
+                        "account",
+                        account,
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("spawn secret-tool: {e}"))?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(secret.as_bytes())
+                        .map_err(|e| format!("write secret-tool stdin: {e}"))?;
+                }
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait secret-tool: {e}"))?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "secret-tool exited {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            }
+            #[cfg(all(not(test), target_os = "macos"))]
+            {
+                let escaped_account = escape_security_arg(account);
+                let escaped_secret = escape_security_arg(secret);
+                let script = format!(
+                    "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {escaped_account} -w {escaped_secret}\n"
+                );
+                let mut child = Command::new("/usr/bin/security")
+                    .arg("-i")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("spawn security: {e}"))?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(script.as_bytes())
+                        .map_err(|e| format!("write security stdin: {e}"))?;
+                }
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait security: {e}"))?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "security exited {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            }
+            #[cfg(all(not(test), not(any(target_os = "linux", target_os = "macos"))))]
+            {
+                let _ = (account, secret);
+                Err("OS keyring CLI unavailable on this platform".to_owned())
+            }
+        }
+
+        fn load(&self, account: &str) -> Result<Option<String>, String> {
+            #[cfg(test)]
+            {
+                let _ = account;
+                Ok(None)
+            }
+            #[cfg(all(not(test), target_os = "linux"))]
+            {
+                let output = Command::new("secret-tool")
+                    .args(["lookup", "service", KEYCHAIN_SERVICE, "account", account])
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("spawn secret-tool lookup: {e}"))?;
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    Ok((!s.is_empty()).then_some(s))
+                } else {
+                    Ok(None)
+                }
+            }
+            #[cfg(all(not(test), target_os = "macos"))]
+            {
+                let output = Command::new("/usr/bin/security")
+                    .args([
+                        "find-generic-password",
+                        "-s",
+                        KEYCHAIN_SERVICE,
+                        "-a",
+                        account,
+                        "-w",
+                    ])
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("spawn security lookup: {e}"))?;
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    Ok((!s.is_empty()).then_some(s))
+                } else {
+                    Ok(None)
+                }
+            }
+            #[cfg(all(not(test), not(any(target_os = "linux", target_os = "macos"))))]
+            {
+                let _ = account;
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(all(not(test), target_os = "macos"))]
+    fn escape_security_arg(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len() + 2);
+        out.push('"');
+        for ch in raw.chars() {
+            if matches!(ch, '"' | '\\') {
+                out.push('\\');
+            }
+            if !ch.is_control() {
+                out.push(ch);
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[cfg(all(not(test), target_os = "linux"))]
+    fn find_executable_in_path(name: &str) -> bool {
+        let Some(path_var) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&path_var).any(|dir| dir.join(name).is_file())
+    }
+
+    /// Return a short human-readable summary of how printer credentials are protected on this OS.
+    pub fn printer_credential_storage_mode() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            if Path::new("/usr/bin/security").is_file() {
+                return "macOS Keychain + 0600 printers.json";
+            }
+        }
+        #[cfg(all(not(test), target_os = "linux"))]
+        {
+            if find_executable_in_path("secret-tool") {
+                return "System keyring (secret-tool) + 0600 printers.json";
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return "Restricted Windows ACL (current user) printers.json";
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "Restricted file permissions (0600 printers.json)"
+        }
+    }
+
+    fn keychain_account_key(profile_id: &str, field: &str) -> String {
+        let id = if profile_id.trim().is_empty() {
+            "default"
+        } else {
+            profile_id.trim()
+        };
+        format!("{id}:{field}")
+    }
+
+    fn redact_secret(
+        profile_id: &str,
+        field_name: &str,
+        secret: &mut String,
+        backend: &dyn KeychainBackend,
+    ) {
+        if secret.is_empty() || secret.starts_with(KEYCHAIN_SENTINEL_PREFIX) {
+            return;
+        }
+        let acct = keychain_account_key(profile_id, field_name);
+        if backend.store(&acct, secret).is_ok() {
+            *secret = format!("{KEYCHAIN_SENTINEL_PREFIX}{acct}");
+        }
+    }
+
+    fn hydrate_secret(secret: &mut String, backend: &dyn KeychainBackend) {
+        if let Some(acct) = secret.strip_prefix(KEYCHAIN_SENTINEL_PREFIX)
+            && let Ok(Some(loaded)) = backend.load(acct)
+        {
+            *secret = loaded;
+        }
+    }
+
+    pub(super) fn load_printer_profiles_with_backend(
+        path: &Path,
+        backend: &dyn KeychainBackend,
+    ) -> Result<Vec<PrinterProfile>, PrinterError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| PrinterError::StoreIo(format!("read {}: {e}", path.display())))?;
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut profiles: Vec<PrinterProfile> = serde_json::from_str(&text)
+            .map_err(|e| PrinterError::StoreIo(format!("parse {}: {e}", path.display())))?;
+        for profile in &mut profiles {
+            match &mut profile.auth {
+                PrinterAuth::None => {}
+                PrinterAuth::ApiKey { api_key } => hydrate_secret(api_key, backend),
+                PrinterAuth::Bearer { token } => hydrate_secret(token, backend),
+                PrinterAuth::Digest { password, .. } => hydrate_secret(password, backend),
+            }
+        }
+        Ok(profiles)
+    }
+
+    fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<(), PrinterError> {
+        let Some(parent) = path.parent() else {
+            return Err(PrinterError::StoreIo(format!(
+                "missing parent directory for {}",
+                path.display()
+            )));
+        };
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| PrinterError::StoreIo(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("printers.json");
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+
+        let write_res = (|| -> Result<(), PrinterError> {
+            #[cfg(unix)]
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .map_err(|e| {
+                        PrinterError::StoreIo(format!("open {}: {e}", tmp_path.display()))
+                    })?
+            };
+            #[cfg(not(unix))]
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| PrinterError::StoreIo(format!("open {}: {e}", tmp_path.display())))?;
+            file.write_all(bytes)
+                .map_err(|e| PrinterError::StoreIo(format!("write {}: {e}", tmp_path.display())))?;
+            file.flush()
+                .map_err(|e| PrinterError::StoreIo(format!("flush {}: {e}", tmp_path.display())))?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+                .map_err(|e| PrinterError::StoreIo(format!("rename {}: {e}", path.display())))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, perms)
+                    .map_err(|e| PrinterError::StoreIo(format!("chmod {}: {e}", path.display())))?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(user) = std::env::var_os("USERNAME").and_then(|u| u.into_string().ok())
+                {
+                    let grant = format!("{user}:F");
+                    let _ = Command::new("icacls")
+                        .arg(path)
+                        .args(["/inheritance:r", "/grant:r", &grant])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+            Ok(())
+        })();
+
+        if write_res.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_res
+    }
+
+    pub(super) fn save_printer_profiles_with_backend(
+        path: &Path,
+        profiles: &[PrinterProfile],
+        backend: &dyn KeychainBackend,
+    ) -> Result<(), PrinterError> {
+        let mut sanitized = profiles.to_vec();
+        for profile in &mut sanitized {
+            let pid = profile.id.clone();
+            match &mut profile.auth {
+                PrinterAuth::None => {}
+                PrinterAuth::ApiKey { api_key } => {
+                    redact_secret(&pid, "api_key", api_key, backend);
+                }
+                PrinterAuth::Bearer { token } => {
+                    redact_secret(&pid, "token", token, backend);
+                }
+                PrinterAuth::Digest { password, .. } => {
+                    redact_secret(&pid, "digest_password", password, backend);
+                }
+            }
+        }
+        let json = serde_json::to_string_pretty(&sanitized)
+            .map_err(|e| PrinterError::StoreIo(format!("serialize printers: {e}")))?;
+        write_restricted_file(path, json.as_bytes())
+    }
 
     /// Return the default disk path storing LayerCraft saved printer profiles (`printers.json`).
     pub fn default_printers_config_path() -> Option<PathBuf> {
@@ -702,41 +1114,17 @@ mod native {
         })
     }
 
-    /// Load saved printer profiles from disk (returns an empty `Vec` if file does not exist).
+    /// Load saved printer profiles from disk, hydrating any OS-keychain credentials.
     pub fn load_printer_profiles(path: &Path) -> Result<Vec<PrinterProfile>, PrinterError> {
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| PrinterError::StoreIo(format!("read {}: {e}", path.display())))?;
-        if text.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        serde_json::from_str(&text)
-            .map_err(|e| PrinterError::StoreIo(format!("parse {}: {e}", path.display())))
+        load_printer_profiles_with_backend(path, &OsKeychainBackend)
     }
 
-    /// Persist saved printer profiles to disk (`0o600` permissions on Unix).
+    /// Persist saved printer profiles to disk (`0o600`/ACL protected, offloading secrets to OS keychain when available).
     pub fn save_printer_profiles(
         path: &Path,
         profiles: &[PrinterProfile],
     ) -> Result<(), PrinterError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| PrinterError::StoreIo(format!("mkdir {}: {e}", parent.display())))?;
-        }
-        let json = serde_json::to_string_pretty(profiles)
-            .map_err(|e| PrinterError::StoreIo(format!("serialize printers: {e}")))?;
-        std::fs::write(path, json)
-            .map_err(|e| PrinterError::StoreIo(format!("write {}: {e}", path.display())))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| PrinterError::StoreIo(format!("chmod {}: {e}", path.display())))?;
-        }
-        Ok(())
+        save_printer_profiles_with_backend(path, profiles, &OsKeychainBackend)
     }
 
     fn build_agent(profile: &PrinterProfile) -> Agent {
@@ -888,6 +1276,42 @@ mod native {
         Ok((status, body))
     }
 
+    struct ProgressReader<'a> {
+        data: &'a [u8],
+        offset: usize,
+        progress: Option<&'a UploadProgress>,
+        count_bytes: bool,
+    }
+
+    impl Read for ProgressReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.progress.is_some_and(UploadProgress::is_cancelled) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "printer upload cancelled",
+                ));
+            }
+            if self.offset >= self.data.len() {
+                return Ok(0);
+            }
+            let remaining = self.data.get(self.offset..).unwrap_or(&[]);
+            let n = remaining.len().min(buf.len()).min(64 * 1024);
+            if let (Some(dst), Some(src)) = (buf.get_mut(..n), remaining.get(..n)) {
+                dst.copy_from_slice(src);
+                self.offset += n;
+                if self.count_bytes
+                    && let Some(p) = self.progress
+                {
+                    p.add_sent_bytes(n);
+                }
+                Ok(n)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn send_with_body(
         agent: &Agent,
         profile: &PrinterProfile,
@@ -896,16 +1320,31 @@ mod native {
         extra_headers: &[(&str, &str)],
         payload: &[u8],
         cached_digest: &mut Option<DigestChallenge>,
+        progress: Option<&UploadProgress>,
+        count_progress: bool,
     ) -> Result<(u16, String), PrinterError> {
         let method_str = if is_put { "PUT" } else { "POST" };
         let uri = extract_uri_path_and_query(url);
+        if count_progress && let Some(p) = progress {
+            p.set_total_bytes(payload.len());
+        }
 
         for attempt in 0..2 {
+            if progress.is_some_and(UploadProgress::is_cancelled) {
+                return Err(PrinterError::Cancelled);
+            }
+            if count_progress
+                && attempt > 0
+                && let Some(p) = progress
+            {
+                p.reset_sent();
+            }
             let mut req = if is_put {
                 agent.put(url)
             } else {
                 agent.post(url)
             };
+            req = req.header("Content-Length", &payload.len().to_string());
             for &(k, v) in extra_headers {
                 req = req.header(k, v);
             }
@@ -938,9 +1377,19 @@ mod native {
                 }
             }
 
-            let resp = req
-                .send(payload)
-                .map_err(|e| PrinterError::Transport(e.to_string()))?;
+            let mut reader = ProgressReader {
+                data: payload,
+                offset: 0,
+                progress,
+                count_bytes: count_progress,
+            };
+            let resp = req.send(SendBody::from_reader(&mut reader)).map_err(|e| {
+                if progress.is_some_and(UploadProgress::is_cancelled) {
+                    PrinterError::Cancelled
+                } else {
+                    PrinterError::Transport(e.to_string())
+                }
+            })?;
             let (status, www_auth, body) = read_resp_body(resp)?;
             if status == 401
                 && attempt == 0
@@ -1222,6 +1671,19 @@ mod native {
         payload: &[u8],
         opts: &UploadOptions,
     ) -> Result<UploadResult, PrinterError> {
+        upload_to_printer_with_progress(profile, payload, opts, None)
+    }
+
+    /// Upload a `.gcode` or `.bgcode` payload with cooperative byte-progress and cancellation.
+    pub fn upload_to_printer_with_progress(
+        profile: &PrinterProfile,
+        payload: &[u8],
+        opts: &UploadOptions,
+        progress: Option<&UploadProgress>,
+    ) -> Result<UploadResult, PrinterError> {
+        if progress.is_some_and(UploadProgress::is_cancelled) {
+            return Err(PrinterError::Cancelled);
+        }
         if payload.is_empty() {
             return Err(PrinterError::InvalidConfig("upload payload is empty"));
         }
@@ -1281,6 +1743,8 @@ mod native {
                     ],
                     payload,
                     &mut digest_cache,
+                    progress,
+                    true,
                 )?;
                 if !(200..300).contains(&status) {
                     return Err(PrinterError::HttpStatus {
@@ -1316,6 +1780,8 @@ mod native {
                     &[("Content-Type", "application/octet-stream")],
                     payload,
                     &mut digest_cache,
+                    progress,
+                    true,
                 )?;
                 if !(200..300).contains(&status) {
                     return Err(PrinterError::HttpStatus {
@@ -1344,6 +1810,8 @@ mod native {
                         &[("Content-Type", "application/json")],
                         &json_bytes,
                         &mut digest_cache,
+                        progress,
+                        false,
                     )?;
                     if !(200..300).contains(&st_p) {
                         return Err(PrinterError::HttpStatus {
@@ -1396,6 +1864,8 @@ mod native {
                     &[("Content-Type", &ct)],
                     &mp,
                     &mut digest_cache,
+                    progress,
+                    true,
                 )?;
                 if !(200..300).contains(&status) {
                     return Err(PrinterError::HttpStatus {
@@ -1447,6 +1917,8 @@ mod native {
                     &[("Content-Type", &ct)],
                     &mp,
                     &mut digest_cache,
+                    progress,
+                    true,
                 )?;
                 if !(200..300).contains(&status) {
                     return Err(PrinterError::HttpStatus {
@@ -1486,8 +1958,8 @@ mod native {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    default_printers_config_path, load_printer_profiles, probe_printer, save_printer_profiles,
-    upload_to_printer,
+    default_printers_config_path, load_printer_profiles, printer_credential_storage_mode,
+    probe_printer, save_printer_profiles, upload_to_printer, upload_to_printer_with_progress,
 };
 
 #[cfg(test)]
@@ -1932,6 +2404,117 @@ mod tests {
                 let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600);
             }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn upload_progress_tracks_bytes_and_honors_cancellation() {
+            let payload = vec![b'G'; 140 * 1024];
+            let (url, rec, h) = spawn_mock_server(1, |_idx, req| {
+                assert_eq!(req.method, "PUT");
+                (201, vec![], String::new())
+            });
+            let prof = PrinterProfile {
+                protocol: PrinterProtocol::PrusaLink,
+                base_url: url,
+                ..PrinterProfile::default()
+            };
+            let progress = UploadProgress::new();
+            let res = upload_to_printer_with_progress(
+                &prof,
+                &payload,
+                &UploadOptions {
+                    remote_path: "big.bgcode".to_owned(),
+                    storage: None,
+                    start_print: false,
+                    overwrite: true,
+                },
+                Some(&progress),
+            )
+            .unwrap();
+            assert_eq!(res.bytes_uploaded, payload.len());
+            assert_eq!(progress.snapshot(), (payload.len(), payload.len()));
+            h.join().unwrap();
+            assert_eq!(rec.lock().unwrap()[0].body.len(), payload.len());
+
+            // Pre-cancelled upload returns Cancelled before touching transport.
+            let cancelled = UploadProgress::new();
+            cancelled.cancel();
+            let err = upload_to_printer_with_progress(
+                &prof,
+                &payload,
+                &UploadOptions::default(),
+                Some(&cancelled),
+            )
+            .unwrap_err();
+            assert_eq!(err, PrinterError::Cancelled);
+        }
+
+        #[test]
+        fn keychain_backend_redacts_secrets_on_disk_and_hydrates_on_load() {
+            use std::collections::HashMap;
+            use std::sync::Mutex;
+
+            #[derive(Default)]
+            struct MockKeychain(Mutex<HashMap<String, String>>);
+            impl native::KeychainBackend for MockKeychain {
+                fn store(&self, account: &str, secret: &str) -> Result<(), String> {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .insert(account.to_owned(), secret.to_owned());
+                    Ok(())
+                }
+                fn load(&self, account: &str) -> Result<Option<String>, String> {
+                    Ok(self.0.lock().unwrap().get(account).cloned())
+                }
+            }
+
+            let dir = std::env::temp_dir()
+                .join(format!("layercraft_keychain_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let path = dir.join("printers.json");
+            let backend = MockKeychain::default();
+
+            let profiles = vec![
+                PrinterProfile {
+                    id: "p1".to_owned(),
+                    name: "CoreOne".to_owned(),
+                    base_url: "http://192.168.1.50".to_owned(),
+                    auth: PrinterAuth::ApiKey {
+                        api_key: "super-secret-api-key".to_owned(),
+                    },
+                    ..PrinterProfile::default()
+                },
+                PrinterProfile {
+                    id: "p2".to_owned(),
+                    name: "CoreOneDigest".to_owned(),
+                    base_url: "http://192.168.1.51".to_owned(),
+                    auth: PrinterAuth::Digest {
+                        username: "maker".to_owned(),
+                        password: "digest-password".to_owned(),
+                    },
+                    ..PrinterProfile::default()
+                },
+            ];
+
+            native::save_printer_profiles_with_backend(&path, &profiles, &backend).unwrap();
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(!on_disk.contains("super-secret-api-key"));
+            assert!(!on_disk.contains("digest-password"));
+            assert!(on_disk.contains("keychain://layercraft/p1:api_key"));
+            assert!(on_disk.contains("keychain://layercraft/p2:digest_password"));
+
+            let hydrated = native::load_printer_profiles_with_backend(&path, &backend).unwrap();
+            assert_eq!(hydrated, profiles);
+
+            // Idempotent re-save of already-redacted sentinel values preserves secrets.
+            let raw_disk_profiles: Vec<PrinterProfile> = serde_json::from_str(&on_disk).unwrap();
+            native::save_printer_profiles_with_backend(&path, &raw_disk_profiles, &backend)
+                .unwrap();
+            let hydrated_again =
+                native::load_printer_profiles_with_backend(&path, &backend).unwrap();
+            assert_eq!(hydrated_again, profiles);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

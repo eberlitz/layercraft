@@ -77,11 +77,19 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let slicing = app.is_slicing();
+                    let slicing_label = if slicing {
+                        match app.slice_progress_snapshot() {
+                            Some((done, total)) if total > 0 => format!("Slicing {done}/{total}..."),
+                            _ => "Slicing...".to_owned(),
+                        }
+                    } else {
+                        String::new()
+                    };
 
                     match app.view_mode {
                         ViewMode::Prepare => {
                             let label = if slicing {
-                                "Slicing..."
+                                slicing_label.as_str()
                             } else if avail_w < 640.0 {
                                 "Slice"
                             } else {
@@ -92,6 +100,9 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                                     app.start_slice_action(ui.ctx());
                                 }
                             });
+                            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
+                                app.cancel_slice_action();
+                            }
                         }
                         ViewMode::Preview => {
                             let binary_mode = app.session.config.machine.binary_gcode;
@@ -132,7 +143,11 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                                     }
                                 });
                             }
-                            let reslice_label = if slicing { "Slicing..." } else { "Re-slice" };
+                            let reslice_label = if slicing {
+                                slicing_label.as_str()
+                            } else {
+                                "Re-slice"
+                            };
                             ui.add_enabled_ui(!slicing, |ui| {
                                 if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label)
                                     .clicked()
@@ -140,6 +155,9 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                                     app.start_slice_action(ui.ctx());
                                 }
                             });
+                            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
+                                app.cancel_slice_action();
+                            }
                         }
                     }
 
@@ -625,14 +643,9 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
 fn draw_preview_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
     ui.label(RichText::new("Color by:").size(11.0).color(p.text_muted));
     let mut mode_changed = false;
-    for (mode, label) in [
-        (ColorMode::Feature, "Feature"),
-        (ColorMode::Speed, "Speed"),
-        (ColorMode::LayerHeight, "Layer Height"),
-        (ColorMode::Layer, "Layer Z"),
-    ] {
+    for mode in ColorMode::ALL {
         let active = app.color_mode == mode;
-        if ribbon_button(ui, p, Icon::Layers, label, active).clicked() && !active {
+        if ribbon_button(ui, p, Icon::Layers, mode.label(), active).clicked() && !active {
             app.color_mode = mode;
             mode_changed = true;
         }
@@ -655,6 +668,9 @@ fn draw_preview_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
     }
     if ribbon_button(ui, p, Icon::Legend, "Summary & Legend", app.show_legend_hud).clicked() {
         app.show_legend_hud = !app.show_legend_hud;
+    }
+    if ribbon_button(ui, p, Icon::Legend, "G-code", app.show_gcode_viewer).clicked() {
+        app.show_gcode_viewer = !app.show_gcode_viewer;
     }
 
     if app.session.last_gcode.is_some() {
