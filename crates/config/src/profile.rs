@@ -1344,6 +1344,13 @@ fn apply_machine_settings(
         ctx.mark_applied(k);
     }
 
+    if let Some((k, v)) = ctx.get_primary(s, &["binary_gcode"])
+        && !is_nil_value(v)
+    {
+        cfg.machine.binary_gcode = parse_bool_val(k, v)?;
+        ctx.mark_applied(k);
+    }
+
     if let Some((k, v)) = ctx.get_primary(s, &["retraction_length"])
         && !is_nil_value(v)
     {
@@ -3827,5 +3834,28 @@ mod tests {
         );
         assert!((res.config.filament.flow_ratio - 0.96).abs() < 1e-9);
         assert!(!res.config.process.reduce_infill_retraction);
+    }
+
+    #[test]
+    fn binary_gcode_profile_key_maps_cleanly() {
+        let mut lib = ProfileLibrary::new();
+        lib.load_json_str(
+            r#"[
+              {
+                "type": "machine",
+                "name": "bgcode_machine",
+                "binary_gcode": "1"
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        let res = lib
+            .build_print_config(&PrintConfig::default(), Some("bgcode_machine"), None, None)
+            .unwrap();
+        assert!(res.config.validate().is_ok());
+        assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+        assert!(res.unmapped_keys.is_empty(), "{:?}", res.unmapped_keys);
+        assert!(res.config.machine.binary_gcode);
     }
 }

@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 base64.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
 layercraft-clip.workspace = true
 layercraft-config.workspace = true
 layercraft-geom.workspace = true

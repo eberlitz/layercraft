@@ -8,8 +8,9 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use layercraft_engine::{
-    BatchStep, Session, apply_config_patch_value, command_registry, describe_command, execute,
-    execute_batch, list_command_summaries, slice_with_config,
+    BatchStep, BgcodeCompression, GcodeExportFormat, PrinterProfile, Session,
+    apply_config_patch_value, command_registry, describe_command, execute, execute_batch,
+    list_command_summaries, slice_with_config,
 };
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, RenderMode, RenderRequest, compare_png,
@@ -179,6 +180,50 @@ struct SaveGcodeArgs {
     path: String,
     #[serde(default = "default_true")]
     evaluate: bool,
+    #[serde(default)]
+    format: GcodeExportFormat,
+    #[serde(default)]
+    compression: Option<BgcodeCompression>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct PrinterStatusArgs {
+    /// Saved printer ID or name (optional if `profile` is given, or omit to list/probe default).
+    printer_id: Option<String>,
+    /// Optional inline printer connection profile override (not saved to `.3mf`).
+    profile: Option<PrinterProfile>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct UploadToPrinterArgs {
+    /// Saved printer ID or name (optional when one printer is saved or `profile` is provided).
+    printer_id: Option<String>,
+    /// Optional inline printer connection profile (URL, protocol, auth).
+    profile: Option<PrinterProfile>,
+    /// Remote filename or relative path on printer storage (e.g. `"gears.bgcode"`).
+    filename: Option<String>,
+    /// Storage target override (`"usb"`, `"local"`, `"gcodes"`).
+    storage: Option<String>,
+    /// Output format (`"auto"`, `"gcode"`, `"bgcode"`).
+    format: GcodeExportFormat,
+    /// Optional `.bgcode` compression override (`"heatshrink11_4"`, `"heatshrink12_4"`, `"deflate"`, `"none"`).
+    compression: Option<BgcodeCompression>,
+    /// Automatically start printing after upload completes (defaults `false` for safety).
+    start_print: bool,
+    /// Overwrite existing file with same remote path (default `true`).
+    #[serde(default = "default_true")]
+    overwrite: bool,
+    /// Slice automatically before upload if not sliced yet (default `true`).
+    #[serde(default = "default_true")]
+    auto_slice: bool,
+    /// Evaluate G-code safety invariants prior to upload (default `true`).
+    #[serde(default = "default_true")]
+    evaluate: bool,
+    /// Abort upload if any safety violation is detected (default `true`).
+    #[serde(default = "default_true")]
+    require_clean_safety: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
@@ -325,8 +370,18 @@ fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "save_gcode",
-            description: "Emit G-code if needed, write directly to a file on disk, and optionally run physical safety evaluation.",
+            description: "Emit G-code or .bgcode if needed, write directly to a file on disk, and optionally run physical safety evaluation.",
             input_schema: schema_val::<SaveGcodeArgs>(),
+        },
+        ToolDef {
+            name: "printer_status",
+            description: "Query live firmware info, nozzle/bed temperatures, state, and storage list from a configured or inline printer (or list redacted saved printers).",
+            input_schema: schema_val::<PrinterStatusArgs>(),
+        },
+        ToolDef {
+            name: "upload_to_printer",
+            description: "Slice if needed, verify physical safety invariants, encode .bgcode or .gcode, and upload directly to a printer over LAN (PrusaLink, Prusa Connect Local, OctoPrint, Moonraker).",
+            input_schema: schema_val::<UploadToPrinterArgs>(),
         },
         ToolDef {
             name: "screenshot",
@@ -646,13 +701,83 @@ pub fn dispatch_tool_on_session(
             let res = execute(
                 session,
                 "gcode.save_file",
-                json!({ "path": parsed.path, "evaluate": parsed.evaluate }),
+                json!({
+                    "path": parsed.path,
+                    "evaluate": parsed.evaluate,
+                    "format": parsed.format,
+                    "compression": parsed.compression,
+                }),
             )
             .map_err(|e| e.to_string())?;
             Ok(LocalDispatchOutput {
                 mcp_result: text_content(res)?,
                 activity_label: Some("save_gcode".to_owned()),
                 executed_command: Some("gcode.save_file".to_owned()),
+                view_sync: None,
+            })
+        }
+        "printer_status" => {
+            let parsed: PrinterStatusArgs = if args.is_null() {
+                PrinterStatusArgs::default()
+            } else {
+                serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?
+            };
+            let res = if parsed.printer_id.is_none()
+                && parsed.profile.is_none()
+                && session.printers.len() != 1
+            {
+                let saved =
+                    execute(session, "printer.list", Value::Null).map_err(|e| e.to_string())?;
+                json!({
+                    "saved_printers": saved,
+                    "note": "Specify `printer_id` or `profile` to query live printer telemetry."
+                })
+            } else {
+                execute(
+                    session,
+                    "printer.status",
+                    json!({
+                        "printer_id": parsed.printer_id,
+                        "profile": parsed.profile,
+                    }),
+                )
+                .map_err(|e| e.to_string())?
+            };
+            Ok(LocalDispatchOutput {
+                mcp_result: text_content(res)?,
+                activity_label: Some("printer_status".to_owned()),
+                executed_command: None,
+                view_sync: None,
+            })
+        }
+        "upload_to_printer" => {
+            let parsed: UploadToPrinterArgs = if args.is_null() {
+                UploadToPrinterArgs::default()
+            } else {
+                serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?
+            };
+            let res = execute(
+                session,
+                "printer.upload",
+                json!({
+                    "printer_id": parsed.printer_id,
+                    "profile": parsed.profile,
+                    "filename": parsed.filename,
+                    "storage": parsed.storage,
+                    "format": parsed.format,
+                    "compression": parsed.compression,
+                    "start_print": parsed.start_print,
+                    "overwrite": parsed.overwrite,
+                    "auto_slice": parsed.auto_slice,
+                    "evaluate": parsed.evaluate,
+                    "require_clean_safety": parsed.require_clean_safety,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(LocalDispatchOutput {
+                mcp_result: text_content(res)?,
+                activity_label: Some("upload_to_printer".to_owned()),
+                executed_command: Some("printer.upload".to_owned()),
                 view_sync: None,
             })
         }
@@ -917,6 +1042,17 @@ pub fn read_resource_on_session(
                 }]
             }))
         }
+        "layercraft://printers" => {
+            let saved = execute(session, "printer.list", Value::Null).map_err(|e| e.to_string())?;
+            let text = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": text,
+                }]
+            }))
+        }
         "layercraft://plate/summary" => {
             let mesh_info = execute(session, "plate.inspect", Value::Null).ok();
             let payload = json!({
@@ -1035,8 +1171,14 @@ impl McpServer {
             McpConnectMode::Connect => SessionAffinity::Studio,
             McpConnectMode::Auto => SessionAffinity::Undecided,
         };
+        #[allow(unused_mut)]
+        let mut session = Session::default();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = session.load_printers_from_disk();
+        }
         Self {
-            session: Session::default(),
+            session,
             last_screenshot_png: None,
             mode,
             socket_override,
@@ -1144,6 +1286,12 @@ impl McpServer {
                             "uri": "layercraft://commands",
                             "name": "Command Summaries",
                             "description": "Compact list of all LayerCraft engine commands.",
+                            "mimeType": "application/json"
+                        },
+                        {
+                            "uri": "layercraft://printers",
+                            "name": "Saved Printers",
+                            "description": "Redacted list of configured LAN/local printer profiles.",
                             "mimeType": "application/json"
                         }
                     ]
@@ -1330,7 +1478,12 @@ impl McpServer {
 
             let is_mutating = matches!(
                 name,
-                "execute" | "batch" | "config_patch" | "analyze_printability" | "save_gcode"
+                "execute"
+                    | "batch"
+                    | "config_patch"
+                    | "analyze_printability"
+                    | "save_gcode"
+                    | "upload_to_printer"
             );
             if self.should_route_studio(is_mutating)? {
                 let endpoint = self.target_endpoint();
@@ -1418,7 +1571,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 16);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 18);
 
         let load_resp = call_tool(
             &mut srv,
@@ -1531,7 +1684,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 3);
+        assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 4);
 
         let res_skill: Value = serde_json::from_str(
             &srv.handle_line(
@@ -1674,5 +1827,163 @@ mod tests {
 
         stop_ui.store(true, Ordering::Relaxed);
         ui_thread.join().unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mcp_bgcode_save_printers_resource_and_upload_work() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                    }
+                }
+                let h_end = header_end.unwrap();
+                let head = String::from_utf8_lossy(&buf[..h_end]).into_owned();
+                let req_line = head.lines().next().unwrap_or("");
+                let content_len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while buf.len() < h_end + content_len {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let (st, resp_json) = if req_line.starts_with("GET /api/v1/info ") {
+                    ("200 OK", r#"{"firmware":"6.2.0","type":"COREONE"}"#)
+                } else if req_line.starts_with("GET /api/v1/status ") {
+                    ("200 OK", r#"{"printer":{"state":"IDLE"}}"#)
+                } else if req_line.starts_with("GET /api/v1/storage ") {
+                    (
+                        "200 OK",
+                        r#"{"storage_list":[{"name":"usb","ready":true}]}"#,
+                    )
+                } else {
+                    assert!(req_line.starts_with("PUT /api/v1/files/usb/"));
+                    assert!(layercraft_engine::is_bgcode(
+                        &buf[h_end..h_end + content_len]
+                    ));
+                    ("201 Created", r#"{"ok":true}"#)
+                };
+                let raw = format!(
+                    "HTTP/1.1 {st}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{resp_json}",
+                    resp_json.len()
+                );
+                stream.write_all(raw.as_bytes()).unwrap();
+            }
+        });
+
+        let mut mcp = McpServer::new(McpConnectMode::Standalone, None);
+        mcp.session.printers.clear();
+        call_tool(
+            &mut mcp,
+            1,
+            "execute",
+            json!({
+                "command": "plate.add_sample_shape",
+                "params": { "shape": "cube20" }
+            }),
+        );
+        call_tool(&mut mcp, 2, "execute", json!({ "command": "slice.run" }));
+
+        let bg_path =
+            std::env::temp_dir().join(format!("layercraft_mcp_test_{}.bgcode", std::process::id()));
+        let saved = call_tool(
+            &mut mcp,
+            3,
+            "save_gcode",
+            json!({ "path": bg_path.to_string_lossy(), "evaluate": true }),
+        );
+        assert!(saved["result"]["isError"].is_null());
+        assert!(
+            saved["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"format\": \"bgcode\"")
+        );
+        assert!(layercraft_engine::is_bgcode(
+            &std::fs::read(&bg_path).unwrap()
+        ));
+        let _ = std::fs::remove_file(&bg_path);
+
+        call_tool(
+            &mut mcp,
+            4,
+            "execute",
+            json!({
+                "command": "printer.upsert",
+                "params": {
+                    "profile": {
+                        "id": "coreone-test",
+                        "name": "CORE One Test",
+                        "protocol": "prusa_link",
+                        "base_url": format!("http://{addr}"),
+                        "auth": { "kind": "api_key", "api_key": "super-secret-api-key" }
+                    }
+                }
+            }),
+        );
+
+        let res_raw = mcp
+            .handle_line(r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"layercraft://printers"}}"#)
+            .unwrap();
+        let res_val: Value = serde_json::from_str(&res_raw).unwrap();
+        let text = res_val["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("coreone-test"));
+        assert!(!text.contains("super-secret-api-key"));
+
+        let st_resp = call_tool(
+            &mut mcp,
+            6,
+            "printer_status",
+            json!({ "printer_id": "coreone-test" }),
+        );
+        assert!(st_resp["result"]["isError"].is_null());
+        assert!(
+            st_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("COREONE")
+        );
+
+        let up_resp = call_tool(
+            &mut mcp,
+            7,
+            "upload_to_printer",
+            json!({ "printer_id": "coreone-test", "filename": "cube.bgcode" }),
+        );
+        assert!(up_resp["result"]["isError"].is_null());
+        assert!(
+            up_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"start_print_requested\": false")
+        );
+        srv_handle.join().unwrap();
     }
 }

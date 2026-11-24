@@ -42,6 +42,8 @@ pub enum Icon {
     Play,
     Pause,
     #[cfg(not(target_arch = "wasm32"))]
+    SendPrinter,
+    #[cfg(not(target_arch = "wasm32"))]
     Import,
 }
 
@@ -386,6 +388,17 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             let right = Rect::from_min_max(pt(0.60, 0.18), pt(0.78, 0.82));
             painter.rect_filled(left, CornerRadius::same(1), color);
             painter.rect_filled(right, CornerRadius::same(1), color);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Icon::SendPrinter => {
+            let outline = vec![
+                pt(0.10, 0.48),
+                pt(0.88, 0.14),
+                pt(0.56, 0.88),
+                pt(0.42, 0.58),
+            ];
+            painter.add(egui::Shape::closed_line(outline, stroke));
+            painter.line_segment([pt(0.42, 0.58), pt(0.88, 0.14)], stroke);
         }
     }
 }

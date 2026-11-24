@@ -94,10 +94,17 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                             });
                         }
                         ViewMode::Preview => {
+                            let binary_mode = app.session.config.machine.binary_gcode;
                             let export_label = if avail_w < 640.0 {
-                                "G-code"
+                                if binary_mode { ".bgcode" } else { "G-code" }
                             } else if cfg!(target_arch = "wasm32") {
-                                "Download G-code"
+                                if binary_mode {
+                                    "Download .bgcode"
+                                } else {
+                                    "Download G-code"
+                                }
+                            } else if binary_mode {
+                                "Export .bgcode"
                             } else {
                                 "Export G-code"
                             };
@@ -106,6 +113,24 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
                                 && primary_button(ui, p, Icon::Export, export_label).clicked()
                             {
                                 app.export_gcode_action();
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if has_gcode {
+                                let send_lbl = if avail_w < 720.0 {
+                                    "Send"
+                                } else {
+                                    "Send to Printer"
+                                };
+                                ui.add_enabled_ui(!app.is_printer_busy(), |ui| {
+                                    if secondary_button(ui, p, Some(Icon::SendPrinter), send_lbl)
+                                        .on_hover_text(
+                                            "Upload .bgcode or G-code directly to a printer over LAN",
+                                        )
+                                        .clicked()
+                                    {
+                                        app.open_upload_dialog();
+                                    }
+                                });
                             }
                             let reslice_label = if slicing { "Slicing..." } else { "Re-slice" };
                             ui.add_enabled_ui(!slicing, |ui| {
@@ -574,5 +599,21 @@ fn draw_preview_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
     }
     if ribbon_button(ui, p, Icon::Legend, "Summary & Legend", app.show_legend_hud).clicked() {
         app.show_legend_hud = !app.show_legend_hud;
+    }
+
+    if app.session.last_gcode.is_some() {
+        v_divider(ui, p);
+        if ribbon_button(ui, p, Icon::Export, ".bgcode", false)
+            .on_hover_text("Export or download Prusa Binary G-code (.bgcode)")
+            .clicked()
+        {
+            app.export_gcode_with_format(true);
+        }
+        if ribbon_button(ui, p, Icon::Export, ".gcode", false)
+            .on_hover_text("Export or download plain-text G-code (.gcode)")
+            .clicked()
+        {
+            app.export_gcode_with_format(false);
+        }
     }
 }

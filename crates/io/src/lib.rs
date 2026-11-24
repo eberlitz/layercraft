@@ -11,6 +11,19 @@ use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+pub mod printer;
+pub use printer::{
+    DigestChallenge, PrinterAuth, PrinterError, PrinterProfile, PrinterProfileSummary,
+    PrinterProtocol, PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadResult,
+    build_digest_authorization, build_multipart_upload, normalize_base_url, parse_digest_challenge,
+    sanitize_remote_path,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use printer::{
+    default_printers_config_path, load_printer_profiles, probe_printer, save_printer_profiles,
+    upload_to_printer,
+};
+
 /// Archive entry path storing LayerCraft project state inside a `.3mf` package.
 pub const LAYERCRAFT_PROJECT_PATH: &str = "Metadata/layercraft_project.json";
 

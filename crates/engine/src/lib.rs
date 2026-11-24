@@ -2,22 +2,32 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use base64::Engine as _;
 #[cfg(not(target_arch = "wasm32"))]
 use layercraft_config::ProfileDirLoadReport;
 use layercraft_config::{
     ActiveProfiles, ConfigError, ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult,
     ProfileError, ProfileKind, ProfileLibrary, ProfileSummary, ResolvedProfile,
 };
+pub use layercraft_gcode::{BgcodeCompression, decode_bgcode, encode_bgcode, is_bgcode};
 use layercraft_gcode::{
-    GcodeError, GcodeOutput, GcodeReport, PrintStatistics, RasterComparison, compare_layer_iou,
-    emit_gcode, evaluate_gcode,
+    BgcodeError, BgcodeOptions, GcodeError, GcodeOutput, GcodeReport, PrintStatistics,
+    RasterComparison, compare_layer_iou, emit_gcode, evaluate_gcode,
 };
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{
     IoError, ThreeMfBuildItem, ThreeMfDocument, ThreeMfExportDocument, ThreeMfExportPlate,
-    ThreeMfPart, ThreeMfResourceMesh, read_3mf_document_bytes, read_stl_bytes,
+    ThreeMfPart, ThreeMfResourceMesh, normalize_base_url, read_3mf_document_bytes, read_stl_bytes,
     write_3mf_document_bytes,
 };
+pub use layercraft_io::{
+    PrinterAuth, PrinterError, PrinterProfile, PrinterProfileSummary, PrinterProtocol,
+    PrinterStatusReport, PrinterStorageInfo, UploadOptions, UploadResult,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use layercraft_io::{default_printers_config_path, load_printer_profiles, save_printer_profiles};
+#[cfg(not(target_arch = "wasm32"))]
+pub use layercraft_io::{probe_printer, upload_to_printer};
 use layercraft_mesh::{
     MeshError, MeshInspection, ModifierPrimitive, ModifierTransform, ObjectTransform, SampleShape,
     auto_arrange_footprints, build_modifier_primitive, build_sample_shape, inspect_mesh,
@@ -59,8 +69,14 @@ pub enum EngineError {
     #[cfg(not(target_arch = "wasm32"))]
     #[error("file error: {0}")]
     FileWrite(String),
+    #[error("printer profile `{0}` not found")]
+    PrinterNotFound(String),
+    #[error("safety invariant check failed before upload: {0}")]
+    SafetyCheckFailed(String),
     #[error("invalid LayerCraft project archive: {0}")]
     InvalidProject(String),
+    #[error(transparent)]
+    Printer(#[from] PrinterError),
     #[error(transparent)]
     Geom(#[from] GeomError),
     #[error(transparent)]
@@ -73,6 +89,8 @@ pub enum EngineError {
     Slice(#[from] SliceError),
     #[error(transparent)]
     Gcode(#[from] GcodeError),
+    #[error(transparent)]
+    Bgcode(#[from] BgcodeError),
     #[error(transparent)]
     Io(#[from] IoError),
 }
@@ -266,6 +284,8 @@ pub struct Session {
     pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
+    /// Saved local/LAN printer connection profiles (never persisted inside `.3mf` files).
+    pub printers: Vec<PrinterProfile>,
     plate_slots: Vec<StoredPlate>,
     active_plate_idx: usize,
     next_plate_id: u32,
@@ -288,6 +308,7 @@ impl Default for Session {
             prepared_mesh: None,
             sliced: None,
             last_gcode: None,
+            printers: Vec::new(),
             plate_slots: vec![StoredPlate::empty(1, "Plate 1".to_owned())],
             active_plate_idx: 0,
             next_plate_id: 2,
@@ -323,6 +344,84 @@ impl Session {
             .get(self.active_plate_idx)
             .map(|p| p.name.as_str())
             .unwrap_or("Plate 1")
+    }
+
+    /// Resolve a printer profile from an inline override, saved `printer_id`, or single saved printer.
+    pub fn resolve_printer_profile(
+        &self,
+        printer_id: Option<&str>,
+        inline: Option<PrinterProfile>,
+    ) -> Result<PrinterProfile, EngineError> {
+        if let Some(mut prof) = inline {
+            prof.base_url = normalize_base_url(&prof.base_url)?;
+            return Ok(prof);
+        }
+        if let Some(id) = printer_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let found = self
+                .printers
+                .iter()
+                .find(|p| p.id == id || p.name == id)
+                .cloned()
+                .ok_or_else(|| EngineError::PrinterNotFound(id.to_owned()))?;
+            return Ok(found);
+        }
+        if let Some(first) = self.printers.first()
+            && self.printers.len() == 1
+        {
+            return Ok(first.clone());
+        }
+        Err(EngineError::InvalidArgument {
+            field: "printer_id",
+            reason: "specify `printer_id` or `profile` (or configure exactly one saved printer)",
+        })
+    }
+
+    /// Derive a safe filename for the active build plate with `.gcode` or `.bgcode` extension.
+    pub fn default_export_filename(&self, binary: bool) -> String {
+        let ext = if binary { "bgcode" } else { "gcode" };
+        if self.plate_count() <= 1 && self.active_plate_name() == "Plate 1" {
+            return format!("layercraft_out.{ext}");
+        }
+        let mut slug: String = self
+            .active_plate_name()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        while slug.contains("__") {
+            slug = slug.replace("__", "_");
+        }
+        let trimmed = slug.trim_matches('_');
+        if trimmed.is_empty() {
+            format!("plate_{}.{ext}", self.active_plate_id())
+        } else {
+            format!("{trimmed}.{ext}")
+        }
+    }
+
+    /// Load saved printer profiles from the default user config path on native platforms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_printers_from_disk(&mut self) -> Result<usize, PrinterError> {
+        let Some(path) = default_printers_config_path() else {
+            return Ok(0);
+        };
+        let loaded = load_printer_profiles(&path)?;
+        self.printers = loaded;
+        Ok(self.printers.len())
+    }
+
+    /// Save current printer profiles to the default user config path on native platforms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_printers_to_disk(&self) -> Result<(), PrinterError> {
+        let Some(path) = default_printers_config_path() else {
+            return Ok(());
+        };
+        save_printer_profiles(&path, &self.printers)
     }
 
     fn plate_summary_at(&self, index: usize) -> Option<PlateSummary> {
@@ -921,19 +1020,110 @@ pub struct SliceComparisonReport {
     pub raster: RasterComparison,
 }
 
+/// Output file encoding format for G-code export and printer upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GcodeExportFormat {
+    #[default]
+    Auto,
+    Gcode,
+    Bgcode,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ExportBgcodeParams {
+    #[serde(default)]
+    pub compression: Option<BgcodeCompression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExportBgcodeResult {
+    pub bytes_base64: String,
+    pub byte_len: usize,
+    pub ascii_byte_len: usize,
+    pub compression_ratio: f64,
+    pub compression: BgcodeCompression,
+    pub stats: PrintStatistics,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SaveGcodeFileParams {
     pub path: String,
     #[serde(default = "default_true")]
     pub evaluate: bool,
+    #[serde(default)]
+    pub format: GcodeExportFormat,
+    #[serde(default)]
+    pub compression: Option<BgcodeCompression>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SaveGcodeFileResult {
     pub path: String,
+    pub format: String,
     pub bytes_written: usize,
+    pub stats: PrintStatistics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<GcodeReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UpsertPrinterParams {
+    pub profile: PrinterProfile,
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RemovePrinterParams {
+    pub id: String,
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PrinterStatusParams {
+    #[serde(default)]
+    pub printer_id: Option<String>,
+    #[serde(default)]
+    pub profile: Option<PrinterProfile>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PrinterUploadParams {
+    #[serde(default)]
+    pub printer_id: Option<String>,
+    #[serde(default)]
+    pub profile: Option<PrinterProfile>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub storage: Option<String>,
+    #[serde(default)]
+    pub format: GcodeExportFormat,
+    #[serde(default)]
+    pub compression: Option<BgcodeCompression>,
+    #[serde(default)]
+    pub start_print: bool,
+    #[serde(default = "default_true")]
+    pub overwrite: bool,
+    #[serde(default = "default_true")]
+    pub auto_slice: bool,
+    #[serde(default = "default_true")]
+    pub evaluate: bool,
+    #[serde(default = "default_true")]
+    pub require_clean_safety: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PrinterUploadResult {
+    pub format: String,
+    pub upload: UploadResult,
     pub stats: PrintStatistics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<GcodeReport>,
@@ -1275,10 +1465,34 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             result_schema: schema_val::<GcodeOutput>(),
         },
         CommandDescriptor {
+            name: "gcode.export_bgcode",
+            summary: "Encode the sliced plate into Prusa Binary G-code (.bgcode) with Heatshrink/Deflate compression and CRC32.",
+            params_schema: schema_val::<ExportBgcodeParams>(),
+            result_schema: schema_val::<ExportBgcodeResult>(),
+        },
+        CommandDescriptor {
             name: "gcode.evaluate",
             summary: "Evaluate physical invariants and safety metrics on a G-code string.",
             params_schema: schema_val::<EvaluateGcodeParams>(),
             result_schema: schema_val::<GcodeReport>(),
+        },
+        CommandDescriptor {
+            name: "printer.list",
+            summary: "List configured saved printers with secret credentials redacted.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<Vec<PrinterProfileSummary>>(),
+        },
+        CommandDescriptor {
+            name: "printer.upsert",
+            summary: "Create or update a saved printer profile by ID (optionally persisting to disk).",
+            params_schema: schema_val::<UpsertPrinterParams>(),
+            result_schema: schema_val::<PrinterProfileSummary>(),
+        },
+        CommandDescriptor {
+            name: "printer.remove",
+            summary: "Remove a saved printer profile by ID.",
+            params_schema: schema_val::<RemovePrinterParams>(),
+            result_schema: schema_val::<OkResult>(),
         },
         CommandDescriptor {
             name: "config.patch",
@@ -1376,9 +1590,23 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
     #[cfg(not(target_arch = "wasm32"))]
     cmds.push(CommandDescriptor {
         name: "gcode.save_file",
-        summary: "Emit G-code if needed, write directly to a file on disk, and optionally run physical evaluation.",
+        summary: "Emit G-code or .bgcode if needed, write directly to a file on disk, and optionally run physical evaluation.",
         params_schema: schema_val::<SaveGcodeFileParams>(),
         result_schema: schema_val::<SaveGcodeFileResult>(),
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "printer.status",
+        summary: "Query live firmware info, temperatures, operational state, and storage list from a configured printer.",
+        params_schema: schema_val::<PrinterStatusParams>(),
+        result_schema: schema_val::<PrinterStatusReport>(),
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    cmds.push(CommandDescriptor {
+        name: "printer.upload",
+        summary: "Slice if needed, validate safety invariants, and upload .bgcode or .gcode directly to a printer.",
+        params_schema: schema_val::<PrinterUploadParams>(),
+        result_schema: schema_val::<PrinterUploadResult>(),
     });
     #[cfg(not(target_arch = "wasm32"))]
     cmds.push(CommandDescriptor {
@@ -2870,6 +3098,40 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             session.last_gcode = Some(out);
             Ok(val)
         }
+        "gcode.export_bgcode" => {
+            let p: ExportBgcodeParams = if params.is_null() {
+                ExportBgcodeParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            if session.last_gcode.is_none() {
+                let plate = session.sliced.as_ref().ok_or(EngineError::NotSliced)?;
+                let out = emit_gcode(plate, &session.config)?;
+                session.last_gcode = Some(out);
+            }
+            let gcode_out = session.last_gcode.as_ref().ok_or(EngineError::NotSliced)?;
+            let compression = p.compression.unwrap_or_default();
+            let opts = BgcodeOptions {
+                compression,
+                ..BgcodeOptions::default()
+            };
+            let bgcode_bytes = encode_bgcode(gcode_out, &session.config, &opts)?;
+            let ascii_len = gcode_out.gcode.len();
+            let ratio = if ascii_len > 0 {
+                (bgcode_bytes.len() as f64) / (ascii_len as f64)
+            } else {
+                1.0
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bgcode_bytes);
+            Ok(serde_json::to_value(ExportBgcodeResult {
+                bytes_base64: b64,
+                byte_len: bgcode_bytes.len(),
+                ascii_byte_len: ascii_len,
+                compression_ratio: ratio,
+                compression,
+                stats: gcode_out.stats.clone(),
+            })?)
+        }
         "gcode.evaluate" => {
             let p: EvaluateGcodeParams = serde_json::from_value(params)?;
             let d = p
@@ -2900,6 +3162,25 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
                 session.last_gcode = Some(out);
             }
             let gcode_out = session.last_gcode.as_ref().ok_or(EngineError::NotSliced)?;
+            let use_bgcode = match p.format {
+                GcodeExportFormat::Bgcode => true,
+                GcodeExportFormat::Gcode => false,
+                GcodeExportFormat::Auto => trimmed_path.to_ascii_lowercase().ends_with(".bgcode"),
+            };
+
+            let (raw_bytes, format_str): (Vec<u8>, String) = if use_bgcode {
+                let opts = BgcodeOptions {
+                    compression: p.compression.unwrap_or_default(),
+                    ..BgcodeOptions::default()
+                };
+                (
+                    encode_bgcode(gcode_out, &session.config, &opts)?,
+                    "bgcode".to_owned(),
+                )
+            } else {
+                (gcode_out.gcode.as_bytes().to_vec(), "gcode".to_owned())
+            };
+
             let out_path = std::path::Path::new(trimmed_path);
             if let Some(parent) = out_path.parent()
                 && !parent.as_os_str().is_empty()
@@ -2907,11 +3188,16 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
                 std::fs::create_dir_all(parent)
                     .map_err(|e| EngineError::FileWrite(format!("{}: {e}", parent.display())))?;
             }
-            std::fs::write(out_path, gcode_out.gcode.as_bytes())
+            std::fs::write(out_path, &raw_bytes)
                 .map_err(|e| EngineError::FileWrite(format!("{}: {e}", out_path.display())))?;
             let evaluation = if p.evaluate {
+                let eval_text = if use_bgcode {
+                    decode_bgcode(&raw_bytes)?.gcode
+                } else {
+                    gcode_out.gcode.clone()
+                };
                 let (rep, _) = evaluate_gcode(
-                    &gcode_out.gcode,
+                    &eval_text,
                     session.config.filament.diameter_mm,
                     session.config.machine.bed_width_mm,
                     session.config.machine.bed_depth_mm,
@@ -2922,7 +3208,177 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             };
             Ok(serde_json::to_value(SaveGcodeFileResult {
                 path: trimmed_path.to_owned(),
-                bytes_written: gcode_out.gcode.len(),
+                format: format_str,
+                bytes_written: raw_bytes.len(),
+                stats: gcode_out.stats.clone(),
+                evaluation,
+            })?)
+        }
+        "printer.list" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            let summaries: Vec<PrinterProfileSummary> = session
+                .printers
+                .iter()
+                .map(PrinterProfile::summary)
+                .collect();
+            Ok(serde_json::to_value(summaries)?)
+        }
+        "printer.upsert" => {
+            let mut p: UpsertPrinterParams = serde_json::from_value(params)?;
+            let trimmed_id = p.profile.id.trim().to_owned();
+            if trimmed_id.is_empty() {
+                return Err(EngineError::InvalidArgument {
+                    field: "profile.id",
+                    reason: "must not be empty",
+                });
+            }
+            p.profile.id = trimmed_id.clone();
+            p.profile.base_url = normalize_base_url(&p.profile.base_url)?;
+            let summary = p.profile.summary();
+            if let Some(existing) = session.printers.iter_mut().find(|x| x.id == trimmed_id) {
+                *existing = p.profile;
+            } else {
+                session.printers.push(p.profile);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if p.persist {
+                session.save_printers_to_disk()?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = p.persist;
+            Ok(serde_json::to_value(summary)?)
+        }
+        "printer.remove" => {
+            let p: RemovePrinterParams = serde_json::from_value(params)?;
+            let target = p.id.trim();
+            let before = session.printers.len();
+            session.printers.retain(|pr| pr.id != target);
+            if session.printers.len() == before {
+                return Err(EngineError::PrinterNotFound(target.to_owned()));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if p.persist {
+                session.save_printers_to_disk()?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = p.persist;
+            Ok(serde_json::to_value(OkResult { ok: true })?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "printer.status" => {
+            let p: PrinterStatusParams = if params.is_null() {
+                PrinterStatusParams::default()
+            } else {
+                serde_json::from_value(params)?
+            };
+            let prof = session.resolve_printer_profile(p.printer_id.as_deref(), p.profile)?;
+            let report = probe_printer(&prof)?;
+            Ok(serde_json::to_value(report)?)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        "printer.upload" => {
+            let p: PrinterUploadParams = serde_json::from_value(params)?;
+            let prof = session.resolve_printer_profile(p.printer_id.as_deref(), p.profile)?;
+            if session.sliced.is_none() {
+                if p.auto_slice {
+                    let plate = slice_with_config(session, &session.config)?;
+                    session.sliced = Some(plate);
+                    session.last_gcode = None;
+                } else {
+                    return Err(EngineError::NotSliced);
+                }
+            }
+            if session.last_gcode.is_none() {
+                let plate = session.sliced.as_ref().ok_or(EngineError::NotSliced)?;
+                let out = emit_gcode(plate, &session.config)?;
+                session.last_gcode = Some(out);
+            }
+            let gcode_out = session.last_gcode.as_ref().ok_or(EngineError::NotSliced)?;
+
+            let fname_trim = p
+                .filename
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let use_bgcode = match p.format {
+                GcodeExportFormat::Bgcode => true,
+                GcodeExportFormat::Gcode => false,
+                GcodeExportFormat::Auto => {
+                    if let Some(name) = fname_trim {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.ends_with(".bgcode") {
+                            true
+                        } else if lower.ends_with(".gcode") {
+                            false
+                        } else {
+                            (prof.prefer_bgcode || session.config.machine.binary_gcode)
+                                && prof.protocol.supports_bgcode()
+                        }
+                    } else {
+                        (prof.prefer_bgcode || session.config.machine.binary_gcode)
+                            && prof.protocol.supports_bgcode()
+                    }
+                }
+            };
+
+            let remote_path = fname_trim
+                .map(str::to_owned)
+                .unwrap_or_else(|| session.default_export_filename(use_bgcode));
+            let (payload, format_str): (Vec<u8>, String) = if use_bgcode {
+                let opts = BgcodeOptions {
+                    compression: p.compression.unwrap_or_default(),
+                    ..BgcodeOptions::default()
+                };
+                (
+                    encode_bgcode(gcode_out, &session.config, &opts)?,
+                    "bgcode".to_owned(),
+                )
+            } else {
+                (gcode_out.gcode.as_bytes().to_vec(), "gcode".to_owned())
+            };
+
+            let evaluation = if p.evaluate || p.require_clean_safety {
+                let eval_text = if use_bgcode {
+                    decode_bgcode(&payload)?.gcode
+                } else {
+                    gcode_out.gcode.clone()
+                };
+                let (rep, _) = evaluate_gcode(
+                    &eval_text,
+                    session.config.filament.diameter_mm,
+                    session.config.machine.bed_width_mm,
+                    session.config.machine.bed_depth_mm,
+                )?;
+                if p.require_clean_safety && !rep.safety.is_clean() {
+                    return Err(EngineError::SafetyCheckFailed(format!(
+                        "non_finite={}, out_of_bounds={}, z_regressions={}",
+                        rep.safety.non_finite_values,
+                        rep.safety.out_of_bounds_moves,
+                        rep.safety.z_regressions
+                    )));
+                }
+                p.evaluate.then_some(rep)
+            } else {
+                None
+            };
+
+            let upload = upload_to_printer(
+                &prof,
+                &payload,
+                &UploadOptions {
+                    remote_path,
+                    storage: p.storage,
+                    start_print: p.start_print,
+                    overwrite: p.overwrite,
+                },
+            )?;
+            Ok(serde_json::to_value(PrinterUploadResult {
+                format: format_str,
+                upload,
                 stats: gcode_out.stats.clone(),
                 evaluation,
             })?)
@@ -4124,5 +4580,212 @@ mod tests {
         execute(&mut reloaded, "session.undo", Value::Null).unwrap();
         assert_eq!(reloaded.plate_count(), 3);
         assert_eq!(reloaded.list_plates()[2].name, "Extras");
+    }
+
+    #[test]
+    fn bgcode_export_save_and_printer_registry_keep_secrets_out_of_3mf() {
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20" }),
+        )
+        .unwrap();
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+
+        let exported: ExportBgcodeResult =
+            serde_json::from_value(execute(&mut sess, "gcode.export_bgcode", Value::Null).unwrap())
+                .unwrap();
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&exported.bytes_base64)
+            .unwrap();
+        assert!(layercraft_gcode::is_bgcode(&decoded_bytes));
+        assert!(exported.byte_len < exported.ascii_byte_len);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bg_path = std::env::temp_dir().join(format!(
+                "layercraft_engine_test_{}.bgcode",
+                std::process::id()
+            ));
+            let saved: SaveGcodeFileResult = serde_json::from_value(
+                execute(
+                    &mut sess,
+                    "gcode.save_file",
+                    serde_json::json!({ "path": bg_path.to_string_lossy(), "evaluate": true }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.format, "bgcode");
+            assert!(saved.evaluation.as_ref().unwrap().safety.is_clean());
+            let _ = std::fs::remove_file(&bg_path);
+        }
+
+        let summary: PrinterProfileSummary = serde_json::from_value(
+            execute(
+                &mut sess,
+                "printer.upsert",
+                serde_json::json!({
+                    "profile": {
+                        "id": "coreone",
+                        "name": "CORE One+",
+                        "protocol": "prusa_link",
+                        "base_url": "192.168.1.55",
+                        "auth": {
+                            "kind": "digest",
+                            "username": "maker",
+                            "password": "top-secret-password"
+                        }
+                    }
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(summary.has_credentials);
+        let list_json = execute(&mut sess, "printer.list", Value::Null).unwrap();
+        assert!(!list_json.to_string().contains("top-secret-password"));
+
+        let proj_bytes = export_project_3mf_bytes(&sess).unwrap();
+        let raw_text = String::from_utf8_lossy(&proj_bytes);
+        assert!(!raw_text.contains("top-secret-password"));
+        assert!(!raw_text.contains("192.168.1.55"));
+
+        execute(
+            &mut sess,
+            "printer.remove",
+            serde_json::json!({ "id": "coreone" }),
+        )
+        .unwrap();
+        assert!(sess.printers.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn printer_status_and_upload_commands_work_against_mock_prusalink() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uploaded_payload: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&uploaded_payload);
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                    }
+                }
+                let h_end = header_end.unwrap();
+                let head = String::from_utf8_lossy(&buf[..h_end]).into_owned();
+                let req_line = head.lines().next().unwrap_or("");
+                let content_len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            v.trim().parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while buf.len() < h_end + content_len {
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = buf[h_end..h_end + content_len].to_vec();
+                let (st, resp_json) = if req_line.starts_with("GET /api/v1/info ") {
+                    ("200 OK", r#"{"firmware":"6.2.0","type":"COREONE"}"#)
+                } else if req_line.starts_with("GET /api/v1/status ") {
+                    (
+                        "200 OK",
+                        r#"{"printer":{"state":"IDLE","temp_nozzle":22.0,"temp_bed":21.5}}"#,
+                    )
+                } else if req_line.starts_with("GET /api/v1/storage ") {
+                    (
+                        "200 OK",
+                        r#"{"storage_list":[{"name":"usb","path":"/usb","read_only":false,"ready":true}]}"#,
+                    )
+                } else {
+                    *rec.lock().unwrap() = body;
+                    ("201 Created", r#"{"ok":true}"#)
+                };
+                let raw = format!(
+                    "HTTP/1.1 {st}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{resp_json}",
+                    resp_json.len()
+                );
+                stream.write_all(raw.as_bytes()).unwrap();
+            }
+        });
+
+        let mut sess = Session::default();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20" }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "printer.upsert",
+            serde_json::json!({
+                "profile": {
+                    "id": "mock1",
+                    "name": "Mock CORE One",
+                    "protocol": "prusa_link",
+                    "base_url": format!("http://{addr}"),
+                    "auth": { "kind": "api_key", "api_key": "abc" }
+                }
+            }),
+        )
+        .unwrap();
+
+        let status: PrinterStatusReport = serde_json::from_value(
+            execute(
+                &mut sess,
+                "printer.status",
+                serde_json::json!({ "printer_id": "mock1" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(status.reachable);
+        assert_eq!(status.firmware.as_deref(), Some("6.2.0"));
+
+        let up_res: PrinterUploadResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "printer.upload",
+                serde_json::json!({ "printer_id": "mock1" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(up_res.format, "bgcode");
+        assert!(!up_res.upload.start_print_requested);
+        assert!(up_res.evaluation.as_ref().unwrap().safety.is_clean());
+        srv.join().unwrap();
+
+        let bytes = uploaded_payload.lock().unwrap();
+        assert!(layercraft_gcode::is_bgcode(&bytes));
+        let doc = decode_bgcode(&bytes).unwrap();
+        assert!(!doc.gcode.is_empty());
     }
 }

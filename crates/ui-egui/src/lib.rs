@@ -16,8 +16,14 @@ use layercraft_config::{
     ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileKind, ProfileSummary,
 };
 use layercraft_engine::{
-    HistoryActionResult, ProjectLoadResult, Session, execute, export_project_3mf_bytes,
+    HistoryActionResult, PrinterAuth, PrinterProfile, ProjectLoadResult, Session, execute,
+    export_project_3mf_bytes,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use layercraft_engine::{
+    PrinterStatusReport, UploadOptions, UploadResult, probe_printer, upload_to_printer,
+};
+use layercraft_gcode::{BgcodeOptions, encode_bgcode};
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
@@ -50,8 +56,53 @@ struct PendingSliceJob {
     rx: mpsc::Receiver<PendingSliceOutcome>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum PendingPrinterOutcome {
+    Probe(Result<PrinterStatusReport, String>),
+    Upload(Result<UploadResult, String>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingPrinterJob {
+    rx: mpsc::Receiver<PendingPrinterOutcome>,
+}
+
 /// Frame callback invoked before UI layout to pump external controllers (e.g. Live MCP bridge).
 pub type ExternalPoller = Box<dyn FnMut(&mut LayerCraftApp)>;
+
+fn default_printer_draft() -> PrinterProfile {
+    PrinterProfile {
+        auth: PrinterAuth::Digest {
+            username: "maker".to_owned(),
+            password: String::new(),
+        },
+        ..PrinterProfile::default()
+    }
+}
+
+fn slugify_printer_id(name: &str) -> String {
+    let mut slug: String = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "printer-1".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
 
 /// Shared application state driving both native `eframe` and browser `WebRunner`.
 pub struct LayerCraftApp {
@@ -95,12 +146,27 @@ pub struct LayerCraftApp {
     pub(crate) drag_undo_active: bool,
     pub(crate) pointer_active: bool,
     pub(crate) plate_rename_buf: (u32, String),
+    pub(crate) printer_draft: PrinterProfile,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) printer_status_report: Option<PrinterStatusReport>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) show_upload_dialog: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) upload_filename: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) upload_binary: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) upload_overwrite: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) upload_start_print: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
     #[cfg(not(target_arch = "wasm32"))]
     pending_slice: Option<PendingSliceJob>,
     #[cfg(not(target_arch = "wasm32"))]
     next_slice_job_id: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_printer_job: Option<PendingPrinterJob>,
     #[cfg(target_arch = "wasm32")]
     pending_drops: std::rc::Rc<std::cell::RefCell<Vec<(String, Result<Vec<u8>, String>)>>>,
 }
@@ -114,8 +180,21 @@ impl Default for LayerCraftApp {
 impl LayerCraftApp {
     /// Construct a new UI session, optionally preloading a sample shape.
     pub fn new(initial_sample: Option<SampleShape>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let session = {
+            let mut s = Session::default();
+            let _ = s.load_printers_from_disk();
+            s
+        };
+        #[cfg(target_arch = "wasm32")]
+        let session = Session::default();
+        let initial_printer_draft = session
+            .printers
+            .first()
+            .cloned()
+            .unwrap_or_else(default_printer_draft);
         let mut app = Self {
-            session: Session::default(),
+            session,
             camera: OrbitCamera::default(),
             view_mode: ViewMode::Prepare,
             color_mode: ColorMode::Feature,
@@ -156,12 +235,27 @@ impl LayerCraftApp {
             drag_undo_active: false,
             pointer_active: false,
             plate_rename_buf: (0, String::new()),
+            printer_draft: initial_printer_draft,
+            #[cfg(not(target_arch = "wasm32"))]
+            printer_status_report: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            show_upload_dialog: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            upload_filename: "layercraft_out.bgcode".to_owned(),
+            #[cfg(not(target_arch = "wasm32"))]
+            upload_binary: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            upload_overwrite: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            upload_start_print: false,
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_slice: None,
             #[cfg(not(target_arch = "wasm32"))]
             next_slice_job_id: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_printer_job: None,
             #[cfg(target_arch = "wasm32")]
             pending_drops: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         };
@@ -581,30 +675,82 @@ impl LayerCraftApp {
         }
     }
 
+    #[cfg(test)]
     fn default_gcode_filename(&self) -> String {
-        if self.session.plate_count() <= 1 && self.session.active_plate_name() == "Plate 1" {
-            return "layercraft_out.gcode".to_owned();
+        self.session
+            .default_export_filename(self.session.config.machine.binary_gcode)
+    }
+
+    pub(crate) fn save_printer_draft(&mut self) {
+        let mut draft = self.printer_draft.clone();
+        if draft.id.trim().is_empty() {
+            draft.id = slugify_printer_id(&draft.name);
         }
-        let mut slug: String = self
-            .session
-            .active_plate_name()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
+        if draft.name.trim().is_empty() {
+            draft.name = draft.id.clone();
+        }
+        self.printer_draft = draft.clone();
+        match execute(
+            &mut self.session,
+            "printer.upsert",
+            serde_json::json!({ "profile": draft, "persist": true }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.status_message = format!("Saved printer `{}`.", self.printer_draft.name);
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed saving printer: {e}"));
+            }
+        }
+    }
+
+    pub(crate) fn delete_selected_printer(&mut self) {
+        let target = self.printer_draft.id.clone();
+        match execute(
+            &mut self.session,
+            "printer.remove",
+            serde_json::json!({ "id": target, "persist": true }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.printer_status_report = None;
                 }
-            })
-            .collect();
-        while slug.contains("__") {
-            slug = slug.replace("__", "_");
+                self.printer_draft = self
+                    .session
+                    .printers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(default_printer_draft);
+                self.status_message = "Removed saved printer.".to_owned();
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed removing printer: {e}"));
+            }
         }
-        let trimmed = slug.trim_matches('_');
-        if trimmed.is_empty() {
-            format!("plate_{}.gcode", self.session.active_plate_id())
-        } else {
-            format!("{trimmed}.gcode")
+    }
+
+    pub(crate) fn select_saved_printer(&mut self, id: &str) {
+        if let Some(found) = self.session.printers.iter().find(|p| p.id == id).cloned() {
+            self.printer_draft = found;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.printer_status_report = None;
+            }
+        }
+    }
+
+    pub(crate) fn start_new_printer_draft(&mut self) {
+        let idx = self.session.printers.len() + 1;
+        let mut draft = default_printer_draft();
+        draft.id = format!("printer-{idx}");
+        draft.name = format!("Printer {idx}");
+        self.printer_draft = draft;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.printer_status_report = None;
         }
     }
 
@@ -1530,26 +1676,72 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn export_gcode_action(&mut self) {
-        let filename = self.default_gcode_filename();
+        self.export_gcode_with_format(self.session.config.machine.binary_gcode);
+    }
+
+    pub(crate) fn export_gcode_with_format(&mut self, binary: bool) {
+        let filename = self.session.default_export_filename(binary);
         let Some(g) = &self.session.last_gcode else {
             return;
         };
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Export G-code")
-                .set_file_name(&filename)
-                .add_filter("G-code", &["gcode", "gco", "g"])
-                .save_file()
-            {
-                match std::fs::write(&path, &g.gcode) {
-                    Ok(()) => {
-                        self.last_error = None;
-                        self.status_message = format!("Exported `{}`.", path.display());
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(if binary {
+                    "Export Binary G-code (.bgcode)"
+                } else {
+                    "Export G-code"
+                })
+                .set_file_name(&filename);
+            dialog = if binary {
+                dialog
+                    .add_filter("Binary G-code", &["bgcode"])
+                    .add_filter("G-code", &["gcode", "gco", "g"])
+            } else {
+                dialog
+                    .add_filter("G-code", &["gcode", "gco", "g"])
+                    .add_filter("Binary G-code", &["bgcode"])
+            };
+            if let Some(path) = dialog.save_file() {
+                let lower = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                let write_binary = match lower.as_str() {
+                    "bgcode" => true,
+                    "gcode" | "gco" | "g" => false,
+                    _ => binary,
+                };
+                if write_binary {
+                    match encode_bgcode(g, &self.session.config, &BgcodeOptions::default()) {
+                        Ok(bytes) => match std::fs::write(&path, &bytes) {
+                            Ok(()) => {
+                                self.last_error = None;
+                                self.status_message = format!(
+                                    "Exported `{}` ({} bytes .bgcode).",
+                                    path.display(),
+                                    bytes.len()
+                                );
+                            }
+                            Err(e) => {
+                                self.last_error = Some(format!("Export failed: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed encoding .bgcode: {e}"));
+                        }
                     }
-                    Err(e) => {
-                        self.last_error = Some(format!("Export failed: {e}"));
+                } else {
+                    match std::fs::write(&path, &g.gcode) {
+                        Ok(()) => {
+                            self.last_error = None;
+                            self.status_message = format!("Exported `{}`.", path.display());
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Export failed: {e}"));
+                        }
                     }
                 }
             }
@@ -1557,15 +1749,352 @@ impl LayerCraftApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            match trigger_browser_download(&filename, &g.gcode) {
-                Ok(()) => {
-                    self.last_error = None;
-                    self.status_message = format!("Triggered browser download `{filename}`.");
+            if binary {
+                match encode_bgcode(g, &self.session.config, &BgcodeOptions::default()) {
+                    Ok(bytes) => {
+                        match trigger_browser_download_bytes(
+                            &filename,
+                            &bytes,
+                            "application/octet-stream",
+                        ) {
+                            Ok(()) => {
+                                self.last_error = None;
+                                self.status_message = format!(
+                                    "Triggered browser download `{filename}` ({} bytes).",
+                                    bytes.len()
+                                );
+                            }
+                            Err(e) => {
+                                self.last_error = Some(format!("Download failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed encoding .bgcode: {e}"));
+                    }
                 }
-                Err(e) => {
-                    self.last_error = Some(format!("Download failed: {e}"));
+            } else {
+                match trigger_browser_download(&filename, &g.gcode) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.status_message = format!("Triggered browser download `{filename}`.");
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Download failed: {e}"));
+                    }
                 }
             }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_printer_busy(&self) -> bool {
+        self.pending_printer_job.is_some()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn open_upload_dialog(&mut self) {
+        let supports_bg = self.printer_draft.protocol.supports_bgcode();
+        let binary = supports_bg
+            && (self.printer_draft.prefer_bgcode || self.session.config.machine.binary_gcode);
+        self.upload_binary = binary;
+        self.upload_filename = self.session.default_export_filename(binary);
+        self.upload_overwrite = true;
+        self.upload_start_print = false;
+        self.show_upload_dialog = true;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_printer_probe_action(&mut self, ctx: &egui::Context) {
+        if self.pending_printer_job.is_some() {
+            return;
+        }
+        let prof = self.printer_draft.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx_clone = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("layercraft-printer-probe".to_owned())
+            .spawn(move || {
+                let res = probe_printer(&prof).map_err(|e| e.to_string());
+                let _ = tx.send(PendingPrinterOutcome::Probe(res));
+                ctx_clone.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.last_error = None;
+                self.status_message = format!("Connecting to `{}`...", self.printer_draft.base_url);
+                self.pending_printer_job = Some(PendingPrinterJob { rx });
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed spawning printer probe: {e}"));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_printer_upload_action(&mut self, ctx: &egui::Context) {
+        if self.pending_printer_job.is_some() {
+            return;
+        }
+        let Some(gcode_out) = self.session.last_gcode.clone() else {
+            self.last_error = Some("Slice the plate before uploading to a printer.".to_owned());
+            return;
+        };
+        let prof = self.printer_draft.clone();
+        let cfg = self.session.config.clone();
+        let binary = self.upload_binary;
+        let opts = UploadOptions {
+            remote_path: self.upload_filename.trim().to_owned(),
+            storage: None,
+            start_print: self.upload_start_print,
+            overwrite: self.upload_overwrite,
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx_clone = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("layercraft-printer-upload".to_owned())
+            .spawn(move || {
+                let res = (|| -> Result<UploadResult, String> {
+                    let payload = if binary {
+                        encode_bgcode(&gcode_out, &cfg, &BgcodeOptions::default())
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        gcode_out.gcode.into_bytes()
+                    };
+                    upload_to_printer(&prof, &payload, &opts).map_err(|e| e.to_string())
+                })();
+                let _ = tx.send(PendingPrinterOutcome::Upload(res));
+                ctx_clone.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.last_error = None;
+                self.status_message = format!(
+                    "Uploading `{}` to `{}`...",
+                    self.upload_filename, self.printer_draft.name
+                );
+                self.pending_printer_job = Some(PendingPrinterJob { rx });
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed starting upload thread: {e}"));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_pending_printer_job(&mut self, ctx: &egui::Context) {
+        let outcome = match self.pending_printer_job.as_ref() {
+            Some(job) => match job.rx.try_recv() {
+                Ok(o) => Some(o),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_printer_job = None;
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.pending_printer_job = None;
+        match outcome {
+            PendingPrinterOutcome::Probe(Ok(report)) => {
+                self.last_error = None;
+                self.status_message = format!(
+                    "Connected to `{}` ({}{}{}).",
+                    report.printer_name,
+                    report.state.as_deref().unwrap_or("online"),
+                    report
+                        .model
+                        .as_deref()
+                        .map(|m| format!(" · {m}"))
+                        .unwrap_or_default(),
+                    report
+                        .firmware
+                        .as_deref()
+                        .map(|f| format!(" · fw {f}"))
+                        .unwrap_or_default()
+                );
+                self.printer_status_report = Some(report);
+            }
+            PendingPrinterOutcome::Probe(Err(err)) => {
+                self.printer_status_report = None;
+                self.last_error = Some(format!("Printer probe failed: {err}"));
+            }
+            PendingPrinterOutcome::Upload(Ok(res)) => {
+                self.last_error = None;
+                self.show_upload_dialog = false;
+                self.status_message = format!(
+                    "{} `{}/{}` ({} bytes, HTTP {}).",
+                    res.message, res.storage, res.remote_path, res.bytes_uploaded, res.http_status
+                );
+            }
+            PendingPrinterOutcome::Upload(Err(err)) => {
+                self.last_error = Some(format!("Printer upload failed: {err}"));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn draw_printer_upload_dialog(&mut self, ctx: &egui::Context, p: &ThemePalette) {
+        if !self.show_upload_dialog {
+            return;
+        }
+        let mut open = self.show_upload_dialog;
+        let busy = self.is_printer_busy();
+        let mut upload_clicked = false;
+        let mut cancel_clicked = false;
+        let mut open_machine_tab = false;
+
+        egui::Window::new("Send to Printer")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+
+                if !self.session.printers.is_empty() {
+                    let mut picked: Option<String> = None;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Printer").color(p.text_secondary));
+                        egui::ComboBox::from_id_salt("upload_printer_sel")
+                            .width(220.0)
+                            .selected_text(self.printer_draft.name.as_str())
+                            .show_ui(ui, |ui| {
+                                for pr in &self.session.printers {
+                                    if ui
+                                        .selectable_label(pr.id == self.printer_draft.id, &pr.name)
+                                        .clicked()
+                                    {
+                                        picked = Some(pr.id.clone());
+                                    }
+                                }
+                            });
+                    });
+                    if let Some(id) = picked {
+                        self.select_saved_printer(&id);
+                        let bin = self.printer_draft.protocol.supports_bgcode()
+                            && (self.printer_draft.prefer_bgcode
+                                || self.session.config.machine.binary_gcode);
+                        self.upload_binary = bin;
+                        self.upload_filename = self.session.default_export_filename(bin);
+                    }
+                }
+
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {}",
+                        self.printer_draft.protocol.label(),
+                        if self.printer_draft.base_url.trim().is_empty() {
+                            "(no URL configured)"
+                        } else {
+                            self.printer_draft.base_url.as_str()
+                        }
+                    ))
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+
+                if self.printer_draft.base_url.trim().is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Configure a printer URL & credentials in Machine -> Direct Printer Upload.",
+                        )
+                        .size(11.5)
+                        .color(p.warning),
+                    );
+                    if ui_kit::secondary_button(ui, p, None, "Open Machine Settings").clicked() {
+                        open_machine_tab = true;
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Format").color(p.text_secondary));
+                    if ui.selectable_label(self.upload_binary, ".bgcode (Binary)").clicked()
+                        && !self.upload_binary
+                    {
+                        self.upload_binary = true;
+                        if self.upload_filename.to_ascii_lowercase().ends_with(".gcode") {
+                            let stem_len = self.upload_filename.len().saturating_sub(6);
+                            let stem = self.upload_filename.get(..stem_len).unwrap_or("print");
+                            self.upload_filename = format!("{stem}.bgcode");
+                        } else if !self.upload_filename.to_ascii_lowercase().ends_with(".bgcode") {
+                            self.upload_filename.push_str(".bgcode");
+                        }
+                    }
+                    if ui.selectable_label(!self.upload_binary, ".gcode (Text)").clicked()
+                        && self.upload_binary
+                    {
+                        self.upload_binary = false;
+                        if self.upload_filename.to_ascii_lowercase().ends_with(".bgcode") {
+                            let stem_len = self.upload_filename.len().saturating_sub(7);
+                            let stem = self.upload_filename.get(..stem_len).unwrap_or("print");
+                            self.upload_filename = format!("{stem}.gcode");
+                        } else if !self.upload_filename.to_ascii_lowercase().ends_with(".gcode") {
+                            self.upload_filename.push_str(".gcode");
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Filename").color(p.text_secondary));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.upload_filename)
+                            .desired_width(240.0),
+                    );
+                });
+
+                ui.checkbox(&mut self.upload_overwrite, "Overwrite existing file on printer");
+                ui.checkbox(
+                    &mut self.upload_start_print,
+                    "Start printing immediately after upload",
+                );
+                if self.upload_start_print {
+                    ui.label(
+                        RichText::new("Confirm the build plate is clear before starting.")
+                            .size(11.0)
+                            .color(p.warning),
+                    );
+                }
+
+                if let Some(err) = &self.last_error {
+                    ui.label(RichText::new(err).size(11.5).color(p.danger));
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if ui_kit::secondary_button(ui, p, None, "Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let ready = !busy && !self.printer_draft.base_url.trim().is_empty();
+                        ui.add_enabled_ui(ready, |ui| {
+                            let label = if busy { "Uploading..." } else { "Upload" };
+                            if ui_kit::primary_button(ui, p, icons::Icon::SendPrinter, label)
+                                .clicked()
+                            {
+                                upload_clicked = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+        self.show_upload_dialog = open && !cancel_clicked;
+        if open_machine_tab {
+            self.sidebar_open = true;
+            self.sidebar_tab = SidebarTab::Machine;
+            self.show_upload_dialog = false;
+        } else if upload_clicked {
+            self.start_printer_upload_action(ctx);
         }
     }
 
@@ -1832,7 +2361,10 @@ impl LayerCraftApp {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_pending_slice(ui.ctx());
+        {
+            self.poll_pending_slice(ui.ctx());
+            self.poll_pending_printer_job(ui.ctx());
+        }
 
         self.pointer_active = ui.ctx().egui_is_using_pointer();
         if !self.pointer_active {
@@ -1941,6 +2473,8 @@ impl LayerCraftApp {
         }
 
         self.viewport_panel(ui, &palette);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.draw_printer_upload_dialog(ui.ctx(), &palette);
     }
 }
 
@@ -2205,5 +2739,36 @@ mod tests {
         app.remove_plate(1);
         assert_eq!(app.session.plate_count(), 1);
         assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn binary_gcode_toggle_printer_draft_and_upload_dialog_render_cleanly() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        assert_eq!(app.default_gcode_filename(), "layercraft_out.gcode");
+        app.session.config.machine.binary_gcode = true;
+        assert_eq!(app.default_gcode_filename(), "layercraft_out.bgcode");
+
+        app.run_slice();
+        app.printer_draft = PrinterProfile {
+            id: "lab-c1".to_owned(),
+            name: "Lab CORE One".to_owned(),
+            base_url: "192.168.1.40".to_owned(),
+            auth: PrinterAuth::ApiKey {
+                api_key: "key-123".to_owned(),
+            },
+            ..PrinterProfile::default()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            app.open_upload_dialog();
+            assert!(app.show_upload_dialog);
+            assert!(!app.upload_start_print);
+        }
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_ui(ui);
+        });
+        out.textures_delta.clear();
     }
 }

@@ -9,6 +9,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 layercraft-config.workspace = true
 layercraft-gcode.workspace = true
 layercraft-geom.workspace = true

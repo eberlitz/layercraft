@@ -3,10 +3,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use layercraft_config::{PrintConfig, ProfileKind, ProfileLibrary, ProfileSummary};
-use layercraft_engine::{Session, command_registry, execute, slice_with_config};
-use layercraft_gcode::{compare_layer_iou, emit_gcode, evaluate_gcode};
+use layercraft_engine::{
+    PrinterAuth, PrinterProfile, PrinterProtocol, Session, UploadOptions, command_registry,
+    decode_bgcode, encode_bgcode, execute, is_bgcode, probe_printer, slice_with_config,
+    upload_to_printer,
+};
+use layercraft_gcode::{BgcodeOptions, compare_layer_iou, emit_gcode, evaluate_gcode};
 use layercraft_io::read_mesh_file;
 use layercraft_mcp::{McpConnectMode, McpServer};
 use layercraft_mesh::prepare_for_plate;
@@ -43,6 +47,99 @@ enum CliCamera {
     Right,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliPrinterProtocol {
+    PrusaLink,
+    PrusaConnectLocal,
+    Octoprint,
+    Moonraker,
+}
+
+impl From<CliPrinterProtocol> for PrinterProtocol {
+    fn from(value: CliPrinterProtocol) -> Self {
+        match value {
+            CliPrinterProtocol::PrusaLink => Self::PrusaLink,
+            CliPrinterProtocol::PrusaConnectLocal => Self::PrusaConnectLocal,
+            CliPrinterProtocol::Octoprint => Self::OctoPrint,
+            CliPrinterProtocol::Moonraker => Self::Moonraker,
+        }
+    }
+}
+
+#[derive(Args)]
+struct PrinterConnArgs {
+    /// Saved printer ID or name from `~/.config/layercraft/printers.json`.
+    #[arg(long)]
+    printer: Option<String>,
+    /// Printer base URL (e.g. `http://192.168.1.50`).
+    #[arg(long)]
+    url: Option<String>,
+    /// Printer API protocol.
+    #[arg(long, value_enum)]
+    protocol: Option<CliPrinterProtocol>,
+    /// Username (for HTTP Digest authentication).
+    #[arg(long)]
+    username: Option<String>,
+    /// Password (for HTTP Digest authentication).
+    #[arg(long)]
+    password: Option<String>,
+    /// API key header value (`X-Api-Key`).
+    #[arg(long)]
+    api_key: Option<String>,
+    /// Bearer auth token (Prusa Connect Local).
+    #[arg(long)]
+    token: Option<String>,
+    /// Remote storage target (`usb`, `local`, `gcodes`).
+    #[arg(long)]
+    storage: Option<String>,
+    /// Prusa Connect Local device ID (required for auto-print trigger).
+    #[arg(long)]
+    device_id: Option<String>,
+    /// Allow self-signed TLS certificates on HTTPS endpoints.
+    #[arg(long)]
+    accept_invalid_certs: bool,
+}
+
+#[derive(Args)]
+struct PrinterUploadArgs {
+    input: PathBuf,
+    #[command(flatten)]
+    conn: PrinterConnArgs,
+    #[arg(long)]
+    remote_name: Option<String>,
+    #[arg(long, value_name = "PLATE")]
+    plate: Option<String>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    profile_dir: Vec<PathBuf>,
+    #[arg(long)]
+    profile_file: Vec<PathBuf>,
+    #[arg(long)]
+    machine: Option<String>,
+    #[arg(long)]
+    filament: Option<String>,
+    #[arg(long)]
+    process: Option<String>,
+    /// Encode as compressed Prusa Binary G-code (`.bgcode`) before uploading.
+    #[arg(long)]
+    binary: bool,
+    /// Trigger print start immediately after upload (default false).
+    #[arg(long)]
+    print: bool,
+    /// Fail instead of overwriting an existing file on the printer.
+    #[arg(long)]
+    no_overwrite: bool,
+}
+
+#[derive(Subcommand)]
+enum PrinterCmd {
+    /// Query live firmware info, temperatures, state, and storage list from a printer.
+    Test(PrinterConnArgs),
+    /// Upload a `.gcode`/`.bgcode` or slice and upload an `.stl`/`.3mf` model directly to a printer.
+    Upload(Box<PrinterUploadArgs>),
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Slice an STL or 3MF mesh to G-code.
@@ -67,6 +164,9 @@ enum Cmd {
         /// Build plate to select for multi-plate .3mf files (1-based plate number or plate name).
         #[arg(long, value_name = "PLATE")]
         plate: Option<String>,
+        /// Emit Prusa Binary G-code (`.bgcode`) instead of plain-text `.gcode`.
+        #[arg(long)]
+        binary: bool,
     },
     /// List available machine, filament, and process JSON profiles.
     Profiles {
@@ -152,6 +252,11 @@ enum Cmd {
         #[arg(long, default_value_t = 0.21)]
         bead_radius_mm: f64,
     },
+    /// Connect to and upload prints directly to a LAN/local printer.
+    Printer {
+        #[command(subcommand)]
+        action: PrinterCmd,
+    },
     /// Print bundled third-party permissive licenses.
     Licences,
 }
@@ -215,6 +320,170 @@ fn auto_select_single(summaries: &[ProfileSummary], kind: ProfileKind) -> Option
     None
 }
 
+#[allow(clippy::too_many_arguments)]
+fn slice_cli_input(
+    input: &std::path::Path,
+    config: Option<PathBuf>,
+    profile_dir: &[PathBuf],
+    profile_file: &[PathBuf],
+    machine: Option<String>,
+    filament: Option<String>,
+    process: Option<String>,
+    plate: Option<&str>,
+) -> Result<(layercraft_gcode::GcodeOutput, PrintConfig), String> {
+    let is_3mf = input
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"));
+    let has_explicit_profiles = !profile_dir.is_empty()
+        || !profile_file.is_empty()
+        || machine.is_some()
+        || filament.is_some()
+        || process.is_some();
+
+    let (sliced, effective_cfg) = if is_3mf {
+        let mut session = Session::default();
+        let in_str = input.to_string_lossy().into_owned();
+        execute(
+            &mut session,
+            "project.load_file",
+            serde_json::json!({ "path": in_str }),
+        )
+        .map_err(|e| format!("{}: {e}", input.display()))?;
+        select_cli_plate(&mut session, plate)?;
+
+        if let Some(cfg_path) = &config {
+            let txt = std::fs::read_to_string(cfg_path)
+                .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+            let override_cfg: PrintConfig =
+                serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+            execute(
+                &mut session,
+                "config.set",
+                serde_json::json!({ "config": override_cfg }),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if has_explicit_profiles {
+            let (lib, file_summaries) = load_cli_profile_library(profile_dir, profile_file)?;
+            let m_sel =
+                machine.or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
+            let f_sel =
+                filament.or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
+            let p_sel =
+                process.or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
+            let res = lib
+                .build_print_config(
+                    &session.config,
+                    m_sel.as_deref(),
+                    f_sel.as_deref(),
+                    p_sel.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+            for w in &res.warnings {
+                eprintln!(
+                    "profile warning [{} :: {}]: {}",
+                    w.profile, w.key, w.message
+                );
+            }
+            execute(
+                &mut session,
+                "config.set",
+                serde_json::json!({ "config": res.config }),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let sliced = slice_with_config(&session, &session.config).map_err(|e| e.to_string())?;
+        (sliced, session.config)
+    } else {
+        let mut cfg: PrintConfig = match config {
+            Some(path) => {
+                let txt = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                serde_json::from_str(&txt).map_err(|e| format!("{}: {e}", path.display()))?
+            }
+            None => PrintConfig::default(),
+        };
+        if has_explicit_profiles {
+            let (lib, file_summaries) = load_cli_profile_library(profile_dir, profile_file)?;
+            let m_sel =
+                machine.or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
+            let f_sel =
+                filament.or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
+            let p_sel =
+                process.or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
+            let res = lib
+                .build_print_config(&cfg, m_sel.as_deref(), f_sel.as_deref(), p_sel.as_deref())
+                .map_err(|e| e.to_string())?;
+            for w in &res.warnings {
+                eprintln!(
+                    "profile warning [{} :: {}]: {}",
+                    w.profile, w.key, w.message
+                );
+            }
+            cfg = res.config;
+        }
+        let mesh = read_mesh_file(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
+        (sliced, cfg)
+    };
+    let gcode_out = emit_gcode(&sliced, &effective_cfg).map_err(|e| e.to_string())?;
+    Ok((gcode_out, effective_cfg))
+}
+
+fn resolve_cli_printer(conn: PrinterConnArgs) -> Result<PrinterProfile, String> {
+    let mut sess = Session::default();
+    let _ = sess.load_printers_from_disk();
+
+    let mut base = if let Some(id_or_name) = conn.printer.as_deref() {
+        sess.resolve_printer_profile(Some(id_or_name), None)
+            .map_err(|e| e.to_string())?
+    } else if conn.url.is_none() && sess.printers.len() == 1 {
+        sess.resolve_printer_profile(None, None)
+            .map_err(|e| e.to_string())?
+    } else {
+        PrinterProfile::default()
+    };
+
+    if let Some(url) = conn.url {
+        base.base_url = url;
+    }
+    if base.base_url.trim().is_empty() {
+        return Err("specify `--url <http://...>` or `--printer <saved_id>`".to_owned());
+    }
+    if let Some(proto) = conn.protocol {
+        base.protocol = proto.into();
+    }
+    if let Some(tok) = conn.token {
+        base.auth = PrinterAuth::Bearer { token: tok };
+    } else if let Some(key) = conn.api_key {
+        base.auth = PrinterAuth::ApiKey { api_key: key };
+    } else if conn.username.is_some() || conn.password.is_some() {
+        let prev_user = match &base.auth {
+            PrinterAuth::Digest { username, .. } => username.clone(),
+            _ => "maker".to_owned(),
+        };
+        let prev_pass = match &base.auth {
+            PrinterAuth::Digest { password, .. } => password.clone(),
+            _ => String::new(),
+        };
+        base.auth = PrinterAuth::Digest {
+            username: conn.username.unwrap_or(prev_user),
+            password: conn.password.unwrap_or(prev_pass),
+        };
+    }
+    if let Some(st) = conn.storage {
+        base.storage = Some(st);
+    }
+    if let Some(dev) = conn.device_id {
+        base.device_id = Some(dev);
+    }
+    if conn.accept_invalid_certs {
+        base.accept_invalid_certs = true;
+    }
+    Ok(base)
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::Slice {
@@ -228,129 +497,61 @@ fn run(cli: Cli) -> Result<(), String> {
             filament,
             process,
             plate,
+            binary,
         } => {
-            let is_3mf = input
+            let (gcode_out, effective_cfg) = slice_cli_input(
+                &input,
+                config,
+                &profile_dir,
+                &profile_file,
+                machine,
+                filament,
+                process,
+                plate.as_deref(),
+            )?;
+            let out_ext = output
                 .extension()
                 .and_then(|s| s.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"));
-            let has_explicit_profiles = !profile_dir.is_empty()
-                || !profile_file.is_empty()
-                || machine.is_some()
-                || filament.is_some()
-                || process.is_some();
-
-            let (sliced, effective_cfg) = if is_3mf {
-                let mut session = Session::default();
-                let in_str = input.to_string_lossy().into_owned();
-                execute(
-                    &mut session,
-                    "project.load_file",
-                    serde_json::json!({ "path": in_str }),
-                )
-                .map_err(|e| format!("{}: {e}", input.display()))?;
-                select_cli_plate(&mut session, plate.as_deref())?;
-
-                if let Some(cfg_path) = &config {
-                    let txt = std::fs::read_to_string(cfg_path)
-                        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
-                    let override_cfg: PrintConfig = serde_json::from_str(&txt)
-                        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
-                    execute(
-                        &mut session,
-                        "config.set",
-                        serde_json::json!({ "config": override_cfg }),
-                    )
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let write_bgcode = binary
+                || out_ext == "bgcode"
+                || (effective_cfg.machine.binary_gcode && out_ext != "gcode");
+            if write_bgcode {
+                let bg = encode_bgcode(&gcode_out, &effective_cfg, &BgcodeOptions::default())
                     .map_err(|e| e.to_string())?;
-                }
-                if has_explicit_profiles {
-                    let (lib, file_summaries) =
-                        load_cli_profile_library(&profile_dir, &profile_file)?;
-                    let m_sel = machine
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
-                    let f_sel = filament
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
-                    let p_sel = process
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
-                    let res = lib
-                        .build_print_config(
-                            &session.config,
-                            m_sel.as_deref(),
-                            f_sel.as_deref(),
-                            p_sel.as_deref(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    for w in &res.warnings {
-                        eprintln!(
-                            "profile warning [{} :: {}]: {}",
-                            w.profile, w.key, w.message
-                        );
-                    }
-                    execute(
-                        &mut session,
-                        "config.set",
-                        serde_json::json!({ "config": res.config }),
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                let sliced =
-                    slice_with_config(&session, &session.config).map_err(|e| e.to_string())?;
-                (sliced, session.config)
-            } else {
-                let mut cfg: PrintConfig = match config {
-                    Some(path) => {
-                        let txt = std::fs::read_to_string(&path)
-                            .map_err(|e| format!("{}: {e}", path.display()))?;
-                        serde_json::from_str(&txt)
-                            .map_err(|e| format!("{}: {e}", path.display()))?
-                    }
-                    None => PrintConfig::default(),
+                std::fs::write(&output, &bg).map_err(|e| format!("{}: {e}", output.display()))?;
+                let pct = if gcode_out.gcode.is_empty() {
+                    100.0
+                } else {
+                    (bg.len() as f64 / gcode_out.gcode.len() as f64) * 100.0
                 };
-                if has_explicit_profiles {
-                    let (lib, file_summaries) =
-                        load_cli_profile_library(&profile_dir, &profile_file)?;
-                    let m_sel = machine
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Machine));
-                    let f_sel = filament
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Filament));
-                    let p_sel = process
-                        .or_else(|| auto_select_single(&file_summaries, ProfileKind::Process));
-                    let res = lib
-                        .build_print_config(
-                            &cfg,
-                            m_sel.as_deref(),
-                            f_sel.as_deref(),
-                            p_sel.as_deref(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    for w in &res.warnings {
-                        eprintln!(
-                            "profile warning [{} :: {}]: {}",
-                            w.profile, w.key, w.message
-                        );
-                    }
-                    cfg = res.config;
-                }
-                let mesh =
-                    read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
-                let sliced = slice_single_mesh(&mesh, &cfg).map_err(|e| e.to_string())?;
-                (sliced, cfg)
-            };
-            let gcode_out = emit_gcode(&sliced, &effective_cfg).map_err(|e| e.to_string())?;
-            std::fs::write(&output, &gcode_out.gcode)
-                .map_err(|e| format!("{}: {e}", output.display()))?;
+                println!(
+                    "sliced {} -> {} ({} layers, {:.2} mm3 filament, .bgcode {} bytes / {:.1}% of ASCII)",
+                    input.display(),
+                    output.display(),
+                    gcode_out.stats.layer_count,
+                    gcode_out.stats.filament_volume_mm3,
+                    bg.len(),
+                    pct
+                );
+            } else {
+                std::fs::write(&output, &gcode_out.gcode)
+                    .map_err(|e| format!("{}: {e}", output.display()))?;
+                println!(
+                    "sliced {} -> {} ({} layers, {:.2} mm3 filament)",
+                    input.display(),
+                    output.display(),
+                    gcode_out.stats.layer_count,
+                    gcode_out.stats.filament_volume_mm3
+                );
+            }
             if let Some(stats_path) = stats {
                 let json =
                     serde_json::to_string_pretty(&gcode_out.stats).map_err(|e| e.to_string())?;
                 std::fs::write(&stats_path, json)
                     .map_err(|e| format!("{}: {e}", stats_path.display()))?;
             }
-            println!(
-                "sliced {} -> {} ({} layers, {:.2} mm3 filament)",
-                input.display(),
-                output.display(),
-                gcode_out.stats.layer_count,
-                gcode_out.stats.filament_volume_mm3
-            );
             Ok(())
         }
         Cmd::Profiles {
@@ -513,14 +714,122 @@ fn run(cli: Cli) -> Result<(), String> {
             bed_width,
             bed_depth,
         } => {
-            let txt =
-                std::fs::read_to_string(&gcode).map_err(|e| format!("{}: {e}", gcode.display()))?;
+            let bytes = std::fs::read(&gcode).map_err(|e| format!("{}: {e}", gcode.display()))?;
+            let txt = if is_bgcode(&bytes) {
+                decode_bgcode(&bytes)
+                    .map_err(|e| format!("{}: {e}", gcode.display()))?
+                    .gcode
+            } else {
+                String::from_utf8(bytes).map_err(|e| format!("{}: {e}", gcode.display()))?
+            };
             let (report, _) = evaluate_gcode(&txt, filament_diameter, bed_width, bed_depth)
                 .map_err(|e| e.to_string())?;
             let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
             println!("{json}");
             Ok(())
         }
+        Cmd::Printer { action } => match action {
+            PrinterCmd::Test(conn) => {
+                let prof = resolve_cli_printer(conn)?;
+                let report = probe_printer(&prof).map_err(|e| e.to_string())?;
+                let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+                println!("{json}");
+                Ok(())
+            }
+            PrinterCmd::Upload(args) => {
+                let PrinterUploadArgs {
+                    input,
+                    conn,
+                    remote_name,
+                    plate,
+                    config,
+                    profile_dir,
+                    profile_file,
+                    machine,
+                    filament,
+                    process,
+                    binary,
+                    print,
+                    no_overwrite,
+                } = *args;
+                let prof = resolve_cli_printer(conn)?;
+                let in_ext = input
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                let (payload, default_name) =
+                    if matches!(in_ext.as_str(), "gcode" | "gco" | "g" | "bgcode") {
+                        let bytes = std::fs::read(&input)
+                            .map_err(|e| format!("{}: {e}", input.display()))?;
+                        let fallback = input
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("print.gcode")
+                            .to_owned();
+                        (bytes, fallback)
+                    } else {
+                        let (gcode_out, effective_cfg) = slice_cli_input(
+                            &input,
+                            config,
+                            &profile_dir,
+                            &profile_file,
+                            machine,
+                            filament,
+                            process,
+                            plate.as_deref(),
+                        )?;
+                        let (rep, _) = evaluate_gcode(
+                            &gcode_out.gcode,
+                            effective_cfg.filament.diameter_mm,
+                            effective_cfg.machine.bed_width_mm,
+                            effective_cfg.machine.bed_depth_mm,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if !rep.safety.is_clean() {
+                            return Err(format!(
+                                "aborted upload due to G-code safety violations: {:?}",
+                                rep.safety
+                            ));
+                        }
+                        let use_bgcode = binary
+                            || remote_name
+                                .as_deref()
+                                .is_some_and(|n| n.to_ascii_lowercase().ends_with(".bgcode"))
+                            || ((prof.prefer_bgcode || effective_cfg.machine.binary_gcode)
+                                && prof.protocol.supports_bgcode()
+                                && !remote_name
+                                    .as_deref()
+                                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".gcode")));
+                        let stem = input
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("layercraft_out");
+                        let ext = if use_bgcode { "bgcode" } else { "gcode" };
+                        let bytes = if use_bgcode {
+                            encode_bgcode(&gcode_out, &effective_cfg, &BgcodeOptions::default())
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            gcode_out.gcode.into_bytes()
+                        };
+                        (bytes, format!("{stem}.{ext}"))
+                    };
+                let up = upload_to_printer(
+                    &prof,
+                    &payload,
+                    &UploadOptions {
+                        remote_path: remote_name.unwrap_or(default_name),
+                        storage: prof.storage.clone(),
+                        start_print: print,
+                        overwrite: !no_overwrite,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                let json = serde_json::to_string_pretty(&up).map_err(|e| e.to_string())?;
+                println!("{json}");
+                Ok(())
+            }
+        },
         Cmd::Compare {
             a,
             b,

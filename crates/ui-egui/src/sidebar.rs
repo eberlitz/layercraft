@@ -6,6 +6,7 @@ use layercraft_config::{
     ProfileKind, SeamPosition, SupportStyle, SurfacePattern, ThumbnailSize, WallGenerator,
     WallOrder,
 };
+use layercraft_engine::{PrinterAuth, PrinterProtocol};
 use layercraft_mesh::{ModifierPrimitive, ModifierTransform, inspect_mesh};
 
 use crate::LayerCraftApp;
@@ -1504,6 +1505,9 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
         setting_row(ui, p, "Emit M73 progress", |ui| {
             toggle_switch(ui, p, &mut m.emit_progress_m73);
         });
+        setting_row(ui, p, "Binary G-code (.bgcode)", |ui| {
+            toggle_switch(ui, p, &mut m.binary_gcode);
+        });
         let mut thumb_enabled = !m.thumbnails.is_empty();
         setting_row(ui, p, "Embed G-code thumbnails", |ui| {
             if toggle_switch(ui, p, &mut thumb_enabled).changed() {
@@ -1641,4 +1645,278 @@ fn draw_machine_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
             };
         }
     });
+
+    ui.add_space(6.0);
+    draw_direct_printer_card(app, ui, p);
+}
+
+fn draw_direct_printer_card(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    let mut picked_saved: Option<String> = None;
+    let mut new_clicked = false;
+    let mut save_clicked = false;
+    let mut delete_clicked = false;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut test_clicked = false;
+
+    card(ui, p, Some("Direct Printer Upload"), |ui| {
+        ui.horizontal(|ui| {
+            let sel_label = app
+                .session
+                .printers
+                .iter()
+                .find(|pr| pr.id == app.printer_draft.id)
+                .map(|pr| pr.name.as_str())
+                .unwrap_or("(Unsaved printer)");
+            egui::ComboBox::from_id_salt("saved_printer_sel")
+                .width(136.0)
+                .selected_text(sel_label)
+                .show_ui(ui, |ui| {
+                    for pr in &app.session.printers {
+                        if ui
+                            .selectable_label(pr.id == app.printer_draft.id, &pr.name)
+                            .clicked()
+                        {
+                            picked_saved = Some(pr.id.clone());
+                        }
+                    }
+                });
+            if secondary_button(ui, p, Some(Icon::AddPlus), "New").clicked() {
+                new_clicked = true;
+            }
+            let can_delete = app
+                .session
+                .printers
+                .iter()
+                .any(|pr| pr.id == app.printer_draft.id);
+            ui.add_enabled_ui(can_delete, |ui| {
+                if small_icon_button(ui, p, Icon::Trash, "Delete saved printer").clicked() {
+                    delete_clicked = true;
+                }
+            });
+        });
+
+        setting_row(ui, p, "Name", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut app.printer_draft.name).desired_width(140.0));
+        });
+
+        setting_row(ui, p, "Protocol", |ui| {
+            egui::ComboBox::from_id_salt("printer_proto_sel")
+                .width(140.0)
+                .selected_text(app.printer_draft.protocol.label())
+                .show_ui(ui, |ui| {
+                    for proto in PrinterProtocol::ALL {
+                        ui.selectable_value(&mut app.printer_draft.protocol, proto, proto.label());
+                    }
+                });
+        });
+
+        setting_row(ui, p, "Host URL", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.printer_draft.base_url)
+                    .hint_text("http://192.168.1.50")
+                    .desired_width(140.0),
+            );
+        });
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum AuthKindChoice {
+            Digest,
+            ApiKey,
+            Bearer,
+            None,
+        }
+        let mut choice = match &app.printer_draft.auth {
+            PrinterAuth::Digest { .. } => AuthKindChoice::Digest,
+            PrinterAuth::ApiKey { .. } => AuthKindChoice::ApiKey,
+            PrinterAuth::Bearer { .. } => AuthKindChoice::Bearer,
+            PrinterAuth::None => AuthKindChoice::None,
+        };
+        let choice_label = match choice {
+            AuthKindChoice::Digest => "HTTP Digest",
+            AuthKindChoice::ApiKey => "API Key",
+            AuthKindChoice::Bearer => "Bearer Token",
+            AuthKindChoice::None => "None",
+        };
+        let prev_choice = choice;
+        setting_row(ui, p, "Auth", |ui| {
+            egui::ComboBox::from_id_salt("printer_auth_sel")
+                .width(140.0)
+                .selected_text(choice_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, AuthKindChoice::Digest, "HTTP Digest");
+                    ui.selectable_value(&mut choice, AuthKindChoice::ApiKey, "API Key");
+                    ui.selectable_value(&mut choice, AuthKindChoice::Bearer, "Bearer Token");
+                    ui.selectable_value(&mut choice, AuthKindChoice::None, "None");
+                });
+        });
+        if choice != prev_choice {
+            app.printer_draft.auth = match choice {
+                AuthKindChoice::Digest => PrinterAuth::Digest {
+                    username: "maker".to_owned(),
+                    password: String::new(),
+                },
+                AuthKindChoice::ApiKey => PrinterAuth::ApiKey {
+                    api_key: String::new(),
+                },
+                AuthKindChoice::Bearer => PrinterAuth::Bearer {
+                    token: String::new(),
+                },
+                AuthKindChoice::None => PrinterAuth::None,
+            };
+        }
+
+        match &mut app.printer_draft.auth {
+            PrinterAuth::Digest { username, password } => {
+                setting_row(ui, p, "Username", |ui| {
+                    ui.add(egui::TextEdit::singleline(username).desired_width(140.0));
+                });
+                setting_row(ui, p, "Password", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(password)
+                            .password(true)
+                            .desired_width(140.0),
+                    );
+                });
+            }
+            PrinterAuth::ApiKey { api_key } => {
+                setting_row(ui, p, "API key", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(api_key)
+                            .password(true)
+                            .desired_width(140.0),
+                    );
+                });
+            }
+            PrinterAuth::Bearer { token } => {
+                setting_row(ui, p, "Bearer token", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(token)
+                            .password(true)
+                            .desired_width(140.0),
+                    );
+                });
+            }
+            PrinterAuth::None => {}
+        }
+
+        let mut storage_buf = app.printer_draft.storage.clone().unwrap_or_default();
+        let default_storage = app.printer_draft.protocol.default_storage();
+        setting_row(ui, p, "Storage", |ui| {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut storage_buf)
+                        .hint_text(default_storage)
+                        .desired_width(140.0),
+                )
+                .changed()
+            {
+                let trimmed = storage_buf.trim();
+                app.printer_draft.storage = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+            }
+        });
+
+        if app.printer_draft.protocol == PrinterProtocol::PrusaConnectLocal {
+            let mut dev_buf = app.printer_draft.device_id.clone().unwrap_or_default();
+            setting_row(ui, p, "Device ID", |ui| {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut dev_buf)
+                            .hint_text("required for auto-print")
+                            .desired_width(140.0),
+                    )
+                    .changed()
+                {
+                    let trimmed = dev_buf.trim();
+                    app.printer_draft.device_id = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_owned())
+                    };
+                }
+            });
+        }
+
+        setting_row(ui, p, "Prefer .bgcode", |ui| {
+            toggle_switch(ui, p, &mut app.printer_draft.prefer_bgcode);
+        });
+        setting_row(ui, p, "Allow self-signed", |ui| {
+            toggle_switch(ui, p, &mut app.printer_draft.accept_invalid_certs);
+        });
+
+        ui.horizontal(|ui| {
+            if secondary_button(ui, p, Some(Icon::SaveProject), "Save Printer").clicked() {
+                save_clicked = true;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let busy = app.is_printer_busy();
+                let ready = !busy && !app.printer_draft.base_url.trim().is_empty();
+                ui.add_enabled_ui(ready, |ui| {
+                    let lbl = if busy {
+                        "Testing..."
+                    } else {
+                        "Test Connection"
+                    };
+                    if secondary_button(ui, p, Some(Icon::SendPrinter), lbl).clicked() {
+                        test_clicked = true;
+                    }
+                });
+            }
+        });
+
+        #[cfg(target_arch = "wasm32")]
+        ui.label(
+            RichText::new(
+                "Direct LAN HTTP upload requires desktop Studio due to browser CORS; `.bgcode` download works in-browser.",
+            )
+            .size(10.5)
+            .color(p.text_muted),
+        );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(rep) = &app.printer_status_report {
+            ui.separator();
+            let state = rep.state.as_deref().unwrap_or("Reachable");
+            let fw = rep.firmware.as_deref().unwrap_or("-");
+            let model = rep.model.as_deref().unwrap_or("-");
+            ui.label(
+                RichText::new(format!("State: {state} · Model: {model} · FW: {fw}"))
+                    .size(11.0)
+                    .color(p.success),
+            );
+            if rep.nozzle_temp_c.is_some() || rep.bed_temp_c.is_some() {
+                let noz = rep
+                    .nozzle_temp_c
+                    .map(|t| format!("{t:.1}°C"))
+                    .unwrap_or_else(|| "-".to_owned());
+                let bed = rep
+                    .bed_temp_c
+                    .map(|t| format!("{t:.1}°C"))
+                    .unwrap_or_else(|| "-".to_owned());
+                ui.label(
+                    RichText::new(format!("Temps: Nozzle {noz} · Bed {bed}"))
+                        .size(11.0)
+                        .color(p.text_secondary),
+                );
+            }
+        }
+    });
+
+    if let Some(id) = picked_saved {
+        app.select_saved_printer(&id);
+    } else if new_clicked {
+        app.start_new_printer_draft();
+    } else if save_clicked {
+        app.save_printer_draft();
+    } else if delete_clicked {
+        app.delete_selected_printer();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if test_clicked {
+        app.start_printer_probe_action(ui.ctx());
+    }
 }

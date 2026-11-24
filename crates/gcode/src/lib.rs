@@ -24,10 +24,15 @@ use thumbnail::{
 };
 
 pub mod arc;
+pub mod bgcode;
 pub mod combing;
 pub mod template;
 pub mod thumbnail;
 pub use arc::MotionCmd;
+pub use bgcode::{
+    BgcodeChecksum, BgcodeCompression, BgcodeDocument, BgcodeError, BgcodeOptions, BgcodeThumbnail,
+    BgcodeThumbnailFormat, decode_bgcode, encode_bgcode, is_bgcode,
+};
 pub use template::{TemplateVars, expand_gcode_template};
 
 /// Errors produced during G-code emission or evaluation.

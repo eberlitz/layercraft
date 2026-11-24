@@ -40,8 +40,11 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
    - Use `compare_screenshot` to get a side-by-side 3-panel `A | B | Diff` PNG (`image/png`).
 5. **Inspect visually:**
    - Call `screenshot` in `preview` mode (`isometric`) and `layer_top_down` on critical overhang, bridge, thin-wall, or top-ironing layers (`inspect_layer` gives exact numeric lengths).
-6. **Export verified G-code:**
-   - Call `save_gcode` with `{ "path": "/abs/path/part.gcode", "evaluate": true }` and check `evaluation.safety` (`non_finite_values == 0`, `out_of_bounds_moves == 0`, `z_regressions == 0`).
+6. **Export verified G-code or `.bgcode`:**
+   - Call `save_gcode` with `{ "path": "/abs/path/part.gcode", "evaluate": true }` (or `.bgcode` / `"format": "bgcode"` for compressed Binary G-code with CRC32 and thumbnails) and check `evaluation.safety` (`non_finite_values == 0`, `out_of_bounds_moves == 0`, `z_regressions == 0`).
+7. **Direct Printer Status & LAN Upload (optional):**
+   - Check saved printers via `layercraft://printers` (credentials redacted) or query live telemetry/temperatures/storages via `printer_status`.
+   - Call `upload_to_printer` (`printer_id` or inline `profile`) to slice (if needed), run safety verification, encode `.bgcode`/`.gcode`, and upload directly over LAN (`PrusaLink`, `Prusa Connect Local`, `OctoPrint`, or `Moonraker`). Keep `start_print: false` (default) unless explicitly asked to start printing immediately.
 
 ## Printability & DFM Heuristics
 
