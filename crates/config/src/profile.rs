@@ -411,6 +411,36 @@ impl ProfileLibrary {
         .map_err(|e| ProfileError::JsonParse(e.to_string()))
     }
 
+    /// Serialize all non-builtin user profiles into a JSON array bundle for cross-session persistence.
+    pub fn export_user_profiles_json(&self) -> Result<String, ProfileError> {
+        let entries: Vec<Value> = self
+            .docs
+            .values()
+            .filter(|doc| !is_builtin_document(doc))
+            .map(profile_document_to_json_value)
+            .collect();
+        serde_json::to_string(&entries).map_err(|e| ProfileError::JsonParse(e.to_string()))
+    }
+
+    /// Import a JSON array bundle of user profiles, skipping entries that conflict with built-ins.
+    pub fn import_user_profiles_json(&mut self, raw: &str) -> Result<usize, ProfileError> {
+        if raw.trim().is_empty() {
+            return Ok(0);
+        }
+        let entries: Vec<Value> =
+            serde_json::from_str(raw).map_err(|e| ProfileError::JsonParse(e.to_string()))?;
+        let mut count = 0_usize;
+        for val in entries {
+            let Ok(doc) = ProfileDocument::from_json_value(val, None) else {
+                continue;
+            };
+            if self.upsert_user_profile(doc).is_ok() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Load user profile JSON files from a base directory without overwriting built-ins.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_user_profiles_from_dir(
@@ -5442,5 +5472,37 @@ mod tests {
         );
         assert!((applied.config.process.extruder_clearance_radius_mm - 42.0).abs() < 1e-9);
         assert!((applied.config.process.extruder_clearance_height_mm - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn user_profiles_json_bundle_roundtrips_and_skips_builtins() {
+        let mut lib = ProfileLibrary::with_builtin_presets();
+        assert_eq!(lib.import_user_profiles_json("   ").unwrap(), 0);
+
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_loops = 5;
+        let user_proc =
+            profile_document_from_config(ProfileKind::Process, "My Web Process", &cfg).unwrap();
+        lib.upsert_user_profile(user_proc).unwrap();
+
+        let bundle = lib.export_user_profiles_json().unwrap();
+        assert!(bundle.contains("My Web Process"));
+        assert!(!bundle.contains("LayerCraft CORE One+ HF 0.4mm"));
+
+        let mut fresh = ProfileLibrary::with_builtin_presets();
+        let imported = fresh.import_user_profiles_json(&bundle).unwrap();
+        assert_eq!(imported, 1);
+        assert!(fresh.get(ProfileKind::Process, "My Web Process").is_some());
+        assert!(!fresh.is_builtin(ProfileKind::Process, "My Web Process"));
+
+        // Entries colliding with built-in names are skipped cleanly.
+        let conflict = serde_json::json!([
+            { "type": "machine", "name": "LayerCraft CORE One+ HF 0.4mm", "from": "User" },
+            { "type": "filament", "name": "My Web PLA", "from": "User", "nozzle_temperature": ["212"] }
+        ])
+        .to_string();
+        assert_eq!(fresh.import_user_profiles_json(&conflict).unwrap(), 1);
+        assert!(fresh.is_builtin(ProfileKind::Machine, "LayerCraft CORE One+ HF 0.4mm"));
+        assert!(fresh.get(ProfileKind::Filament, "My Web PLA").is_some());
     }
 }

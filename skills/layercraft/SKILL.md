@@ -46,7 +46,7 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
    - Call `save_gcode` with `{ "path": "/abs/path/part.gcode", "evaluate": true }` (or `.bgcode` / `"format": "bgcode"` for compressed Binary G-code with CRC32 and thumbnails) and check `evaluation.safety` (`non_finite_values == 0`, `out_of_bounds_moves == 0`, `z_regressions == 0`).
 7. **Direct Printer Status & LAN Upload (optional):**
    - Check saved printers via `layercraft://printers` (credentials redacted; stored via OS keychain / `0600` ACL-protected `printers.json`) or query live telemetry/temperatures/storages via `printer_status`.
-   - Call `upload_to_printer` (`printer_id` or inline `profile`) to slice (if needed), run safety verification, encode `.bgcode`/`.gcode`, and upload directly over LAN (`PrusaLink`, `Prusa Connect Local`, `OctoPrint`, or `Moonraker`). Keep `start_print: false` (default) unless explicitly asked to start printing immediately.
+   - Call `upload_to_printer` (`printer_id` or inline `profile`) to slice (if needed), run safety verification, encode `.bgcode`/`.gcode`, and upload directly over LAN (`PrusaLink`, `Prusa Connect Local`, `OctoPrint`, or `Moonraker`). Keep `start_print: false` (default) unless explicitly asked to start printing immediately. See `docs/core-one-signoff.md` for the Prusa CORE One+ 2nd Gen physical calibration & validation suite.
 
 ## Printability & DFM Heuristics
 

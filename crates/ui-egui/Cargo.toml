@@ -31,4 +31,4 @@ rfd.workspace = true
 js-sys.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url"] }
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlAnchorElement", "HtmlInputElement", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "EventTarget", "Storage", "Worker", "MessageEvent", "ErrorEvent"] }

@@ -6,7 +6,6 @@ use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Stroke, StrokeKind, pos2}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     BrandMark,
-    #[cfg(not(target_arch = "wasm32"))]
     OpenFile,
     AddPlus,
     SaveProject,
@@ -43,7 +42,6 @@ pub enum Icon {
     Pause,
     #[cfg(not(target_arch = "wasm32"))]
     SendPrinter,
-    #[cfg(not(target_arch = "wasm32"))]
     Import,
 }
 
@@ -74,7 +72,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 }
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
         Icon::OpenFile => {
             painter.line_segment([pt(0.10, 0.22), pt(0.38, 0.22)], stroke);
             painter.line_segment([pt(0.38, 0.22), pt(0.48, 0.34)], stroke);
@@ -208,7 +205,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([pt(0.14, 0.86), pt(0.86, 0.86)], stroke);
             painter.line_segment([pt(0.86, 0.86), pt(0.86, 0.62)], stroke);
         }
-        #[cfg(not(target_arch = "wasm32"))]
         Icon::Import => {
             painter.line_segment([pt(0.50, 0.14), pt(0.50, 0.62)], stroke);
             painter.line_segment([pt(0.30, 0.42), pt(0.50, 0.62)], stroke);

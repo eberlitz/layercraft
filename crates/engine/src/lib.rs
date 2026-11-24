@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub mod worker_protocol;
+
 /// Errors returned by command execution in [`Session`].
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -6060,5 +6062,220 @@ mod tests {
             !mid_layer.slice_regions[0].holes.is_empty(),
             "expected NegativePart cutout from 3MF to punch hole into block"
         );
+    }
+
+    #[test]
+    fn core_one_physical_signoff_suite() {
+        let mut sess = Session::default();
+        let apply = |s: &mut Session, filament: &str| {
+            execute(
+                s,
+                "profile.apply",
+                serde_json::json!({
+                    "machine": "LayerCraft CORE One+ HF 0.4mm",
+                    "filament": filament,
+                    "process": "LayerCraft 0.20mm Balanced (0.4mm HF)",
+                    "reset_to_defaults": true
+                }),
+            )
+            .unwrap();
+        };
+        let eval_session = |s: &Session| -> layercraft_gcode::GcodeReport {
+            let gcode = &s.last_gcode.as_ref().unwrap().gcode;
+            evaluate_gcode(
+                gcode,
+                s.config.filament.diameter_mm,
+                s.config.machine.bed_width_mm,
+                s.config.machine.bed_depth_mm,
+            )
+            .unwrap()
+            .0
+        };
+
+        // 1. Calibration cube + .bgcode + CRC32 + CORE One+ startup + time estimate
+        apply(&mut sess, "LayerCraft PLA (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": false }),
+        )
+        .unwrap();
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let gcode_out = sess.last_gcode.as_ref().unwrap().clone();
+        let report = eval_session(&sess);
+        assert!(report.safety.is_clean(), "{:?}", report.safety);
+        assert!(gcode_out.gcode.contains("M862.3 P \"COREONE\""));
+        assert!(gcode_out.gcode.contains("M862.1"));
+        assert!(gcode_out.gcode.contains("M862.5 P2"));
+        assert!(gcode_out.gcode.contains("G29 P9"));
+        assert!(gcode_out.gcode.contains("M17"));
+        assert!(gcode_out.gcode.contains("M106 P3"));
+        assert!(report.pressure_advance_commands_count > 0);
+        assert!(report.thumbnail_count >= 1);
+        assert!(
+            (10.0..=3600.0).contains(&gcode_out.stats.estimated_time_s),
+            "unexpected est time: {}",
+            gcode_out.stats.estimated_time_s
+        );
+        let bg = encode_bgcode(&gcode_out, &sess.config, &BgcodeOptions::default()).unwrap();
+        let decoded = decode_bgcode(&bg).unwrap();
+        assert_eq!(decoded.thumbnails.len(), 4);
+        assert!(decoded.gcode_block_count >= 1);
+        assert_eq!(
+            decoded
+                .printer_metadata
+                .get("printer_model")
+                .map(String::as_str),
+            Some("COREONE")
+        );
+        let (decoded_rep, _) = evaluate_gcode(
+            &decoded.gcode,
+            sess.config.filament.diameter_mm,
+            sess.config.machine.bed_width_mm,
+            sess.config.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(decoded_rep.safety.is_clean());
+        assert_eq!(decoded_rep.active_layer_count, report.active_layer_count);
+
+        // 2. Bridges (PETG HF) & Tree Supports (CBracket)
+        apply(&mut sess, "LayerCraft PETG (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "bridge_arch", "append": false }),
+        )
+        .unwrap();
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let rep_bridge = eval_session(&sess);
+        assert!(rep_bridge.safety.is_clean());
+        assert!(
+            rep_bridge
+                .feature_volumes_mm3
+                .contains_key(layercraft_slice::ExtrusionRole::Bridge.label())
+        );
+
+        apply(&mut sess, "LayerCraft PLA (0.4mm HF Nozzle)");
+        let c_mesh = layercraft_testkit::make_c_bracket(24.0, 12.0, 4.0, 6.0, 6.0, 4.0).unwrap();
+        let c_stl = layercraft_io::write_stl_binary(&c_mesh);
+        execute(
+            &mut sess,
+            "plate.add_stl_bytes",
+            serde_json::json!({ "bytes": c_stl, "name": "CBracket", "append": false }),
+        )
+        .unwrap();
+        sess.config.process.support.enabled = true;
+        sess.config.process.support.style = layercraft_config::SupportStyle::Tree;
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let rep_tree = eval_session(&sess);
+        assert!(rep_tree.safety.is_clean());
+        assert!(
+            rep_tree
+                .feature_volumes_mm3
+                .get(layercraft_slice::ExtrusionRole::Support.label())
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0
+        );
+
+        // 3. Arachne thin walls
+        apply(&mut sess, "LayerCraft PLA (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "thin_rib", "append": false }),
+        )
+        .unwrap();
+        sess.config.process.wall_generator = layercraft_config::WallGenerator::Arachne;
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let rep_arachne = eval_session(&sess);
+        assert!(rep_arachne.safety.is_clean());
+        assert!(
+            rep_arachne
+                .feature_volumes_mm3
+                .get(layercraft_slice::ExtrusionRole::OuterWall.label())
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        assert!(rep_arachne.wall_width_variation_ratio >= 1.0);
+
+        // 4. Scarf seam + Topmost ironing + G2/G3 arcs + PA
+        apply(&mut sess, "LayerCraft PLA (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cylinder", "append": false }),
+        )
+        .unwrap();
+        sess.config.process.scarf_seam.enabled = true;
+        sess.config.process.ironing.mode = layercraft_config::IroningType::TopmostSurface;
+        sess.config.process.arc_fitting = true;
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let rep_finish = eval_session(&sess);
+        assert!(rep_finish.safety.is_clean());
+        assert!(rep_finish.arc_moves_count > 0);
+        assert!(rep_finish.scarf_ramp_moves_count > 0);
+        assert!(rep_finish.pressure_advance_commands_count > 0);
+        assert!(
+            rep_finish
+                .feature_volumes_mm3
+                .contains_key(layercraft_slice::ExtrusionRole::Ironing.label())
+        );
+
+        // 5. ASA chamber setpoint
+        apply(&mut sess, "LayerCraft ASA (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": false }),
+        )
+        .unwrap();
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let asa_gcode = sess.last_gcode.as_ref().unwrap().gcode.clone();
+        let rep_asa = eval_session(&sess);
+        assert!(rep_asa.safety.is_clean());
+        assert!(asa_gcode.contains("M141 S55"));
+
+        // 6. TPU 95A volumetric flow cap & Multi-object M486 cancel-object
+        apply(&mut sess, "LayerCraft TPU 95A (0.4mm HF Nozzle)");
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let rep_tpu = eval_session(&sess);
+        assert!(rep_tpu.safety.is_clean());
+        assert!(
+            rep_tpu.max_volumetric_flow_mm3_s <= 5.5,
+            "TPU flow too high: {}",
+            rep_tpu.max_volumetric_flow_mm3_s
+        );
+
+        apply(&mut sess, "LayerCraft PLA (0.4mm HF Nozzle)");
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": false }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plate.add_sample_shape",
+            serde_json::json!({ "shape": "cube20", "append": true }),
+        )
+        .unwrap();
+        execute(&mut sess, "plate.auto_arrange", Value::Null).unwrap();
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        execute(&mut sess, "gcode.export", Value::Null).unwrap();
+        let multi_gcode = sess.last_gcode.as_ref().unwrap().gcode.clone();
+        let rep_multi = eval_session(&sess);
+        assert!(rep_multi.safety.is_clean());
+        assert!(rep_multi.object_label_commands_count >= 4);
+        assert!(multi_gcode.contains("M486 T2"));
+        assert!(multi_gcode.contains("M486 A"));
     }
 }

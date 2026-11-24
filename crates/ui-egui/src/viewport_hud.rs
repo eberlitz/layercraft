@@ -11,7 +11,6 @@ use layercraft_viewport::{
 
 use crate::icons::Icon;
 use crate::theme::ThemePalette;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::ui_kit::badge;
 use crate::ui_kit::{hud_frame, icon_button, ribbon_button};
 use crate::{LayerCraftApp, ViewMode};
@@ -211,7 +210,6 @@ fn draw_preview_summary_hud(
                             .strong()
                             .color(p.text_muted),
                     );
-                    #[cfg(not(target_arch = "wasm32"))]
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if let Some(ms) = app.last_slice_ms {
                             badge(ui, p.bg_card, p.text_secondary, &format!("{ms:.0} ms"));

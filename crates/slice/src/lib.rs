@@ -62,17 +62,60 @@ pub enum SliceError {
 }
 
 /// Cooperative cancellation flag and per-layer progress counters shared with slicing workers.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SliceProgress {
     completed_layers: std::sync::atomic::AtomicUsize,
     total_layers: std::sync::atomic::AtomicUsize,
     cancelled: std::sync::atomic::AtomicBool,
+    on_update: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SliceProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SliceProgress")
+            .field(
+                "completed_layers",
+                &self
+                    .completed_layers
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "total_layers",
+                &self.total_layers.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "cancelled",
+                &self.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("has_callback", &self.on_update.is_some())
+            .finish()
+    }
 }
 
 impl SliceProgress {
     /// Construct a fresh zeroed progress/cancellation handle.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a progress handle that invokes `on_update(completed_layers, total_layers)` whenever counters change.
+    pub fn with_callback<F>(on_update: F) -> Self
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
+        Self {
+            completed_layers: std::sync::atomic::AtomicUsize::new(0),
+            total_layers: std::sync::atomic::AtomicUsize::new(0),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            on_update: Some(Box::new(on_update)),
+        }
+    }
+
+    fn notify(&self) {
+        if let Some(cb) = &self.on_update {
+            let (done, total) = self.snapshot();
+            cb(done, total);
+        }
     }
 
     /// Request cooperative cancellation at the next layer or stage boundary.
@@ -90,18 +133,21 @@ impl SliceProgress {
     pub fn set_total_layers(&self, total: usize) {
         self.total_layers
             .store(total, std::sync::atomic::Ordering::Relaxed);
+        self.notify();
     }
 
     /// Increment the total expected layer work count.
     pub fn add_total_layers(&self, delta: usize) {
         self.total_layers
             .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+        self.notify();
     }
 
     /// Increment completed layer count by 1.
     pub fn inc_completed_layers(&self) {
         self.completed_layers
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.notify();
     }
 
     /// Read `(completed_layers, total_layers)`.
@@ -6621,5 +6667,29 @@ mod tests {
             slice_plate_objects_with_progress(&[obj], &cfg, &[], Some(&cancelled)),
             Err(SliceError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn slice_progress_callback_receives_layer_updates() {
+        let mesh = make_box_mesh(12.0, 12.0, 3.0);
+        let prepared = prepare_for_plate(&mesh, 250.0, 250.0).unwrap();
+        let cfg = PrintConfig::default();
+
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let rec_cb = std::sync::Arc::clone(&recorded);
+        let progress = SliceProgress::with_callback(move |done, total| {
+            if let Ok(mut guard) = rec_cb.lock() {
+                guard.push((done, total));
+            }
+        });
+        let plate =
+            slice_prepared_mesh_with_progress(&prepared, &cfg, &[], Some(&progress)).unwrap();
+        let log = recorded.lock().unwrap();
+        assert!(!log.is_empty());
+        assert!(log.iter().any(|&(d, t)| d == 0 && t == plate.layers.len()));
+        assert_eq!(
+            log.last().copied(),
+            Some((plate.layers.len(), plate.layers.len()))
+        );
     }
 }

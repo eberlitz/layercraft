@@ -420,20 +420,20 @@ pub fn draw_plates_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
 }
 
 fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    if ribbon_button(ui, p, Icon::OpenFile, "Open", false)
+        .on_hover_text("Open STL or 3MF model/project (replaces current plate)")
+        .clicked()
+    {
+        app.request_discard_or_run(crate::PendingDiscardAction::OpenFileDialog);
+    }
+    if ribbon_button(ui, p, Icon::AddPlus, "Add File", false)
+        .on_hover_text("Add STL or 3MF model to plate")
+        .clicked()
+    {
+        app.open_file_dialog(true);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if ribbon_button(ui, p, Icon::OpenFile, "Open", false)
-            .on_hover_text("Open STL or 3MF model/project (replaces current plate)")
-            .clicked()
-        {
-            app.request_discard_or_run(crate::PendingDiscardAction::OpenFileDialog);
-        }
-        if ribbon_button(ui, p, Icon::AddPlus, "Add File", false)
-            .on_hover_text("Add STL or 3MF model to plate")
-            .clicked()
-        {
-            app.open_file_dialog(true);
-        }
         let has_recent = !app.prefs.recent_files.is_empty();
         ui.add_enabled_ui(has_recent, |ui| {
             let recent_resp = ribbon_dropdown_button(ui, p, Icon::OpenFile, "Recent")
@@ -622,15 +622,15 @@ fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
         );
     }
 
+    v_divider(ui, p);
+    if ribbon_button(ui, p, Icon::Import, "Import JSON", false)
+        .on_hover_text("Import OrcaSlicer/Bambu JSON profile")
+        .clicked()
+    {
+        app.import_profile_file_dialog();
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        v_divider(ui, p);
-        if ribbon_button(ui, p, Icon::Import, "Import JSON", false)
-            .on_hover_text("Import OrcaSlicer/Bambu JSON profile")
-            .clicked()
-        {
-            app.import_profile_file_dialog();
-        }
         if ribbon_button(ui, p, Icon::OpenFile, "Profile Dir", false)
             .on_hover_text("Load all JSON profiles in a folder")
             .clicked()

@@ -1942,11 +1942,16 @@ name = "layercraft-web"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "js-sys",
+ "layercraft-engine",
+ "layercraft-slice",
  "layercraft-ui-egui",
  "layercraft-viewport-gpu",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]

@@ -66,3 +66,10 @@ js-sys = "0.3"
 web-sys = "0.3"
 rfd = "0.18"
 pollster = "1.0"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

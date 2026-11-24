@@ -1,10 +1,16 @@
-//! Persistent lightweight Studio preferences (`prefs.json` on native, no-op on WASM).
+//! Persistent lightweight Studio preferences (`prefs.json` on native, `localStorage` on WASM).
 
 use layercraft_config::ActiveProfiles;
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of recent files kept in [`AppPreferences::recent_files`].
 pub const MAX_RECENT_FILES: usize = 10;
+
+/// Browser `localStorage` key storing [`AppPreferences`] in WASM builds.
+pub const BROWSER_PREFS_STORAGE_KEY: &str = "layercraft.prefs.v1";
+
+/// Browser `localStorage` key storing user-created presets in WASM builds.
+pub const BROWSER_USER_PROFILES_STORAGE_KEY: &str = "layercraft.user_profiles.v1";
 
 /// User UI preferences saved across native Studio restarts.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -98,10 +104,16 @@ impl AppPreferences {
         Self::load_from_path(&path).unwrap_or_default()
     }
 
-    /// WASM preferences stub (returns defaults).
+    /// Load user preferences from browser `localStorage` (falling back to defaults).
     #[cfg(target_arch = "wasm32")]
     pub fn load_from_disk() -> Self {
-        Self::default()
+        let Some(storage) = browser_local_storage() else {
+            return Self::default();
+        };
+        let Ok(Some(raw)) = storage.get_item(BROWSER_PREFS_STORAGE_KEY) else {
+            return Self::default();
+        };
+        Self::from_json_str(&raw).unwrap_or_default()
     }
 
     /// Persist user preferences to the default native path.
@@ -113,9 +125,48 @@ impl AppPreferences {
         self.save_to_path(&path)
     }
 
-    /// WASM preferences persistence stub (no-op).
+    /// Persist user preferences to browser `localStorage`.
     #[cfg(target_arch = "wasm32")]
     pub fn save_to_disk(&self) -> Result<(), String> {
-        Ok(())
+        let Some(storage) = browser_local_storage() else {
+            return Ok(());
+        };
+        let json = self.to_json_pretty()?;
+        storage
+            .set_item(BROWSER_PREFS_STORAGE_KEY, &json)
+            .map_err(|e| format!("failed saving preferences to localStorage: {e:?}"))
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// Load custom user presets from browser `localStorage` into `lib`.
+#[cfg(target_arch = "wasm32")]
+pub fn load_user_profiles_from_browser(lib: &mut layercraft_config::ProfileLibrary) -> usize {
+    let Some(storage) = browser_local_storage() else {
+        return 0;
+    };
+    let Ok(Some(raw)) = storage.get_item(BROWSER_USER_PROFILES_STORAGE_KEY) else {
+        return 0;
+    };
+    lib.import_user_profiles_json(&raw).unwrap_or(0)
+}
+
+/// Persist all custom user presets from `lib` into browser `localStorage`.
+#[cfg(target_arch = "wasm32")]
+pub fn save_user_profiles_to_browser(
+    lib: &layercraft_config::ProfileLibrary,
+) -> Result<(), String> {
+    let Some(storage) = browser_local_storage() else {
+        return Ok(());
+    };
+    let json = lib
+        .export_user_profiles_json()
+        .map_err(|e| format!("failed serializing user presets: {e}"))?;
+    storage
+        .set_item(BROWSER_USER_PROFILES_STORAGE_KEY, &json)
+        .map_err(|e| format!("failed saving user presets to localStorage: {e:?}"))
 }

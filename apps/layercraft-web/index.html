@@ -21,6 +21,7 @@
 </head>
 <body>
   <canvas id="layercraft_canvas"></canvas>
-  <link data-trunk rel="rust" data-wasm-opt="0" />
+  <link data-trunk rel="rust" href="Cargo.toml" data-bin="layercraft-web" data-type="main" data-cargo-profile-release="wasm-release" data-wasm-opt="s" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals" />
+  <link data-trunk rel="rust" href="Cargo.toml" data-bin="slice_worker" data-type="worker" data-loader-shim data-bindgen-target="no-modules" data-cargo-profile-release="wasm-release" data-wasm-opt="s" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals" />
 </body>
 </html>

@@ -17,6 +17,8 @@ use layercraft_config::{
     ModifierOverrides, ModifierRole, PrintConfig, ProfileApplyResult, ProfileKind, ProfileSummary,
     SupportStyle,
 };
+#[cfg(target_arch = "wasm32")]
+use layercraft_engine::worker_protocol::{SliceJobEvent, SliceJobObject, SliceJobRequest};
 use layercraft_engine::{
     HistoryActionResult, PlateRepairResult, PrinterAuth, PrinterProfile, ProjectLoadResult,
     SaveUserProfileResult, Session, execute, export_project_3mf_bytes,
@@ -226,11 +228,45 @@ pub enum ViewportToolMode {
     Select,
 }
 
+#[cfg(target_arch = "wasm32")]
+type PendingWebDrops =
+    std::rc::Rc<std::cell::RefCell<Vec<(WebFilePickMode, String, Result<Vec<u8>, String>)>>>;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebFilePickMode {
+    OpenReplace,
+    AddToPlate,
+    ImportProfileJson,
+}
+
+#[cfg(target_arch = "wasm32")]
+enum WebSliceOutcome {
+    Done {
+        job_id: u64,
+        elapsed_ms: f64,
+        plate: layercraft_slice::SlicedPlate,
+        gcode: layercraft_gcode::GcodeOutput,
+    },
+    Error {
+        job_id: u64,
+        message: String,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+struct PendingWebSliceJob {
+    worker: web_sys::Worker,
+    _on_message: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _on_error: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::ErrorEvent)>,
+    progress: std::rc::Rc<std::cell::Cell<(usize, usize)>>,
+    outcome: std::rc::Rc<std::cell::RefCell<Option<WebSliceOutcome>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingDiscardAction {
     ClearPlate,
     LoadSample(SampleShape),
-    #[cfg(not(target_arch = "wasm32"))]
     OpenFileDialog,
     #[cfg(not(target_arch = "wasm32"))]
     OpenRecentPath(String),
@@ -308,18 +344,22 @@ pub struct LayerCraftApp {
     pub(crate) upload_overwrite: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) upload_start_print: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
     #[cfg(not(target_arch = "wasm32"))]
     pending_slice: Option<PendingSliceJob>,
-    #[cfg(not(target_arch = "wasm32"))]
     next_slice_job_id: u64,
     #[cfg(not(target_arch = "wasm32"))]
     pending_printer_job: Option<PendingPrinterJob>,
     #[cfg(not(target_arch = "wasm32"))]
     next_printer_job_id: u64,
     #[cfg(target_arch = "wasm32")]
-    pending_drops: std::rc::Rc<std::cell::RefCell<Vec<(String, Result<Vec<u8>, String>)>>>,
+    pending_web_slice: Option<PendingWebSliceJob>,
+    #[cfg(target_arch = "wasm32")]
+    last_ctx: Option<egui::Context>,
+    #[cfg(target_arch = "wasm32")]
+    file_picker_cb: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_drops: PendingWebDrops,
 }
 
 impl Default for LayerCraftApp {
@@ -340,11 +380,15 @@ impl LayerCraftApp {
             s
         };
         #[cfg(target_arch = "wasm32")]
-        let mut session = Session::default();
+        let mut session = {
+            let mut s = Session::default();
+            let _ = prefs::load_user_profiles_from_browser(&mut s.profiles);
+            s
+        };
 
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(not(test))]
         let loaded_prefs = prefs::AppPreferences::load_from_disk();
-        #[cfg(any(target_arch = "wasm32", test))]
+        #[cfg(test)]
         let loaded_prefs = prefs::AppPreferences::default();
 
         let initial_theme = match loaded_prefs
@@ -477,16 +521,20 @@ impl LayerCraftApp {
             upload_overwrite: true,
             #[cfg(not(target_arch = "wasm32"))]
             upload_start_print: false,
-            #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_slice: None,
-            #[cfg(not(target_arch = "wasm32"))]
             next_slice_job_id: 0,
             #[cfg(not(target_arch = "wasm32"))]
             pending_printer_job: None,
             #[cfg(not(target_arch = "wasm32"))]
             next_printer_job_id: 0,
+            #[cfg(target_arch = "wasm32")]
+            pending_web_slice: None,
+            #[cfg(target_arch = "wasm32")]
+            last_ctx: None,
+            #[cfg(target_arch = "wasm32")]
+            file_picker_cb: None,
             #[cfg(target_arch = "wasm32")]
             pending_drops: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         };
@@ -1017,57 +1065,76 @@ impl LayerCraftApp {
 
     /// Load a mesh or LayerCraft `.3mf` project from raw STL or 3MF bytes via `layercraft-engine`.
     pub fn load_mesh_bytes(&mut self, name: &str, bytes: Vec<u8>) {
+        self.load_mesh_bytes_with_mode(name, bytes, false);
+    }
+
+    /// Load or append a mesh or `.3mf` file from raw bytes (`append: false` replaces, `append: true` adds to active plate).
+    pub fn load_mesh_bytes_with_mode(&mut self, name: &str, bytes: Vec<u8>, append: bool) {
         self.cancel_pending_slice();
         let is_3mf = name.to_ascii_lowercase().ends_with(".3mf");
         if is_3mf {
-            match execute(
-                &mut self.session,
-                "project.load_3mf_bytes",
-                serde_json::json!({ "bytes": bytes, "name": name }),
-            ) {
+            let cmd = if append {
+                "plate.add_3mf_bytes"
+            } else {
+                "project.load_3mf_bytes"
+            };
+            let params = if append {
+                serde_json::json!({ "bytes": bytes, "name": name, "append": true })
+            } else {
+                serde_json::json!({ "bytes": bytes, "name": name })
+            };
+            match execute(&mut self.session, cmd, params) {
                 Ok(val) => {
-                    let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
-                    let plate_count = res
-                        .as_ref()
-                        .map(|r| r.plate_count)
-                        .unwrap_or_else(|| self.session.plate_count());
-                    self.last_error = None;
-                    if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
-                        self.selected_machine_profile =
-                            self.session.active_profiles.machine.clone();
-                        self.selected_filament_profile =
-                            self.session.active_profiles.filament.clone();
-                        self.selected_process_profile =
-                            self.session.active_profiles.process.clone();
-                        if plate_count > 1 {
+                    if !append {
+                        let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
+                        let plate_count = res
+                            .as_ref()
+                            .map(|r| r.plate_count)
+                            .unwrap_or_else(|| self.session.plate_count());
+                        if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
+                            self.selected_machine_profile =
+                                self.session.active_profiles.machine.clone();
+                            self.selected_filament_profile =
+                                self.session.active_profiles.filament.clone();
+                            self.selected_process_profile =
+                                self.session.active_profiles.process.clone();
+                            if plate_count > 1 {
+                                self.status_message = format!(
+                                    "Loaded project `{name}` ({plate_count} plates, active `{}`: {} object(s), {} modifier(s)).",
+                                    self.session.active_plate_name(),
+                                    self.session.objects.len(),
+                                    self.session.modifiers.len()
+                                );
+                            } else {
+                                self.status_message = format!(
+                                    "Loaded project `{name}` ({} object(s), {} modifier(s)).",
+                                    self.session.objects.len(),
+                                    self.session.modifiers.len()
+                                );
+                            }
+                        } else if plate_count > 1 {
                             self.status_message = format!(
-                                "Loaded project `{name}` ({plate_count} plates, active `{}`: {} object(s), {} modifier(s)).",
+                                "Loaded `{name}` ({plate_count} plates, active `{}`: {} object(s)).",
                                 self.session.active_plate_name(),
-                                self.session.objects.len(),
-                                self.session.modifiers.len()
+                                self.session.objects.len()
                             );
                         } else {
                             self.status_message = format!(
-                                "Loaded project `{name}` ({} object(s), {} modifier(s)).",
-                                self.session.objects.len(),
-                                self.session.modifiers.len()
+                                "Loaded `{name}` ({} object(s)).",
+                                self.session.objects.len()
                             );
                         }
-                    } else if plate_count > 1 {
-                        self.status_message = format!(
-                            "Loaded `{name}` ({plate_count} plates, active `{}`: {} object(s)).",
-                            self.session.active_plate_name(),
-                            self.session.objects.len()
-                        );
+                        self.project_dirty = !res.as_ref().is_some_and(|r| r.is_layercraft_project);
                     } else {
                         self.status_message = format!(
-                            "Loaded `{name}` ({} object(s)).",
+                            "Added `{name}` to plate ({} object(s)).",
                             self.session.objects.len()
                         );
+                        self.project_dirty = true;
                     }
+                    self.last_error = None;
                     self.append_repair_warning_to_status();
                     self.printability_report = None;
-                    self.project_dirty = !res.as_ref().is_some_and(|r| r.is_layercraft_project);
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
@@ -1087,7 +1154,7 @@ impl LayerCraftApp {
         match execute(
             &mut self.session,
             "plate.add_stl_bytes",
-            serde_json::json!({ "bytes": bytes, "name": name }),
+            serde_json::json!({ "bytes": bytes, "name": name, "append": append }),
         ) {
             Ok(_) => {
                 self.last_error = None;
@@ -1096,7 +1163,11 @@ impl LayerCraftApp {
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
-                self.status_message = format!("Loaded `{name}`.");
+                self.status_message = if append {
+                    format!("Added `{name}` to plate.")
+                } else {
+                    format!("Loaded `{name}`.")
+                };
                 self.append_repair_warning_to_status();
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
@@ -1141,6 +1212,10 @@ impl LayerCraftApp {
             Ok(val) => {
                 let loaded: Vec<ProfileSummary> = serde_json::from_value(val).unwrap_or_default();
                 self.apply_loaded_profile_selection(&loaded);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = prefs::save_user_profiles_to_browser(&self.session.profiles);
+                }
                 self.last_error = None;
                 self.status_message = format!("Loaded {} profile(s) from `{name}`.", loaded.len());
             }
@@ -1524,7 +1599,7 @@ impl LayerCraftApp {
         }
     }
 
-    /// Return `true` while a native background slice job is active.
+    /// Return `true` while a background slice job is active.
     pub(crate) fn is_slicing(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1532,7 +1607,7 @@ impl LayerCraftApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            false
+            self.pending_web_slice.is_some()
         }
     }
 
@@ -1543,16 +1618,24 @@ impl LayerCraftApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            None
+            self.pending_web_slice.as_ref().map(|j| j.progress.get())
         }
     }
 
     pub(crate) fn cancel_pending_slice(&mut self) {
+        self.next_slice_job_id = self.next_slice_job_id.wrapping_add(1);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.next_slice_job_id = self.next_slice_job_id.wrapping_add(1);
             if let Some(job) = self.pending_slice.take() {
                 job.progress.cancel();
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(job) = self.pending_web_slice.take() {
+                job.worker.set_onmessage(None);
+                job.worker.set_onerror(None);
+                job.worker.terminate();
             }
         }
     }
@@ -1563,12 +1646,170 @@ impl LayerCraftApp {
         self.status_message = "Slicing cancelled.".to_owned();
     }
 
-    /// Trigger slicing from interactive UI controls (async background thread on native, sync on WASM).
+    /// Trigger slicing from interactive UI controls (async background thread on native, Web Worker on WASM).
     pub(crate) fn start_slice_action(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = ctx;
-            self.run_slice();
+            if self.pending_web_slice.is_some() {
+                return;
+            }
+            if self.session.objects.is_empty()
+                && self.session.prepared_mesh.is_none()
+                && self.session.mesh.is_none()
+            {
+                self.last_error = Some("No mesh loaded on build plate.".to_owned());
+                return;
+            }
+            if let Err(e) = self.session.config.validate() {
+                self.last_error = Some(e.to_string());
+                return;
+            }
+            if let Some(prev_cfg) = self.pending_config_undo.take()
+                && self.session.config != prev_cfg
+            {
+                self.session
+                    .push_config_undo_snapshot("Edit settings", prev_cfg);
+            }
+
+            let job_id = self.next_slice_job_id.wrapping_add(1);
+            self.next_slice_job_id = job_id;
+            let objects: Vec<SliceJobObject> = self
+                .session
+                .objects
+                .iter()
+                .map(|o| SliceJobObject {
+                    id: o.id,
+                    name: o.name.clone(),
+                    prepared_mesh: layercraft_geom::TriangleMesh::clone(&o.prepared_mesh),
+                    overrides: o.overrides.clone(),
+                })
+                .collect();
+            let req = SliceJobRequest {
+                job_id,
+                config: self.session.config.clone(),
+                objects,
+                prepared_mesh: if self.session.objects.is_empty() {
+                    self.session.prepared_mesh.as_deref().cloned()
+                } else {
+                    None
+                },
+                modifiers: self
+                    .session
+                    .modifiers
+                    .iter()
+                    .map(|m| layercraft_slice::ModifierVolume {
+                        id: m.id,
+                        name: m.name.clone(),
+                        role: m.role,
+                        mesh: layercraft_geom::TriangleMesh::clone(&m.prepared_mesh),
+                        overrides: m.overrides.clone(),
+                    })
+                    .collect(),
+            };
+            let Ok(req_json) = serde_json::to_string(&req) else {
+                self.run_slice();
+                return;
+            };
+
+            let Ok(worker) = web_sys::Worker::new("./slice_worker_loader.js") else {
+                self.run_slice();
+                return;
+            };
+
+            use wasm_bindgen::JsCast as _;
+            let progress = std::rc::Rc::new(std::cell::Cell::new((0_usize, 0_usize)));
+            let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let worker_cb = worker.clone();
+            let progress_cb = std::rc::Rc::clone(&progress);
+            let outcome_cb = std::rc::Rc::clone(&outcome);
+            let ctx_cb = ctx.clone();
+            let mut pending_payload = Some(req_json);
+
+            let on_message =
+                wasm_bindgen::closure::Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
+                    let Some(raw) = ev.data().as_string() else {
+                        return;
+                    };
+                    match serde_json::from_str::<SliceJobEvent>(&raw) {
+                        Ok(SliceJobEvent::Ready) => {
+                            if let Some(payload) = pending_payload.take()
+                                && let Err(err) = worker_cb
+                                    .post_message(&wasm_bindgen::JsValue::from_str(&payload))
+                            {
+                                *outcome_cb.borrow_mut() = Some(WebSliceOutcome::Error {
+                                    job_id,
+                                    message: format!("failed posting slice job to worker: {err:?}"),
+                                });
+                                ctx_cb.request_repaint();
+                            }
+                        }
+                        Ok(SliceJobEvent::Progress {
+                            job_id: jid,
+                            completed_layers,
+                            total_layers,
+                        }) if jid == job_id => {
+                            progress_cb.set((completed_layers, total_layers));
+                            ctx_cb.request_repaint();
+                        }
+                        Ok(SliceJobEvent::Done {
+                            job_id: jid,
+                            elapsed_ms,
+                            plate,
+                            gcode,
+                        }) if jid == job_id => {
+                            *outcome_cb.borrow_mut() = Some(WebSliceOutcome::Done {
+                                job_id: jid,
+                                elapsed_ms,
+                                plate,
+                                gcode,
+                            });
+                            ctx_cb.request_repaint();
+                        }
+                        Ok(SliceJobEvent::Error {
+                            job_id: jid,
+                            message,
+                        }) if jid == job_id => {
+                            *outcome_cb.borrow_mut() = Some(WebSliceOutcome::Error {
+                                job_id: jid,
+                                message,
+                            });
+                            ctx_cb.request_repaint();
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            *outcome_cb.borrow_mut() = Some(WebSliceOutcome::Error {
+                                job_id,
+                                message: format!("invalid worker message: {e}"),
+                            });
+                            ctx_cb.request_repaint();
+                        }
+                    }
+                })
+                    as Box<dyn FnMut(web_sys::MessageEvent)>);
+
+            let outcome_err = std::rc::Rc::clone(&outcome);
+            let ctx_err = ctx.clone();
+            let on_error =
+                wasm_bindgen::closure::Closure::wrap(Box::new(move |ev: web_sys::ErrorEvent| {
+                    *outcome_err.borrow_mut() = Some(WebSliceOutcome::Error {
+                        job_id,
+                        message: format!("slice worker error: {}", ev.message()),
+                    });
+                    ctx_err.request_repaint();
+                })
+                    as Box<dyn FnMut(web_sys::ErrorEvent)>);
+
+            worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+            self.last_error = None;
+            self.status_message = "Slicing in background worker...".to_owned();
+            self.pending_web_slice = Some(PendingWebSliceJob {
+                worker,
+                _on_message: on_message,
+                _on_error: on_error,
+                progress,
+                outcome,
+            });
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1713,6 +1954,59 @@ impl LayerCraftApp {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn poll_pending_web_slice(&mut self, ctx: &egui::Context) {
+        let out = {
+            let Some(job) = self.pending_web_slice.as_ref() else {
+                return;
+            };
+            job.outcome.borrow_mut().take()
+        };
+        let Some(outcome) = out else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        };
+        if let Some(job) = self.pending_web_slice.take() {
+            job.worker.set_onmessage(None);
+            job.worker.set_onerror(None);
+            job.worker.terminate();
+        }
+        match outcome {
+            WebSliceOutcome::Done {
+                job_id,
+                elapsed_ms,
+                plate,
+                gcode,
+            } => {
+                if job_id != self.next_slice_job_id {
+                    return;
+                }
+                let layers = plate.layers.len();
+                self.session.sliced = Some(plate);
+                self.session.last_gcode = Some(gcode);
+                self.gcode_index = GcodeLayerIndex::default();
+                self.last_slice_ms = Some(elapsed_ms);
+                self.view_mode = ViewMode::Preview;
+                self.last_error = None;
+                self.status_message = format!("Sliced {layers} layers in {elapsed_ms:.1} ms.");
+                self.refresh_printability_after_slice();
+                self.rebuild_scene();
+                self.set_active_layer(layers.saturating_sub(1));
+            }
+            WebSliceOutcome::Error { job_id, message } => {
+                if job_id != self.next_slice_job_id {
+                    return;
+                }
+                if message == "slicing cancelled" {
+                    self.last_error = None;
+                    self.status_message = "Slicing cancelled.".to_owned();
+                } else {
+                    self.last_error = Some(message);
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_pending_slice(&mut self, ctx: &egui::Context) {
         let outcome = match self.pending_slice.as_ref() {
@@ -1782,10 +2076,7 @@ impl LayerCraftApp {
             return;
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.last_slice_ms = Some(elapsed_ms);
-        }
+        self.last_slice_ms = Some(elapsed_ms);
         let layers = self
             .session
             .sliced
@@ -1947,17 +2238,25 @@ impl LayerCraftApp {
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         {
-            let ready: Vec<(String, Result<Vec<u8>, String>)> =
+            let ready: Vec<(WebFilePickMode, String, Result<Vec<u8>, String>)> =
                 std::mem::take(&mut *self.pending_drops.borrow_mut());
-            for (name, res) in ready {
+            for (mode, name, res) in ready {
                 match res {
-                    Ok(bytes) => {
-                        if name.to_ascii_lowercase().ends_with(".json") {
+                    Ok(bytes) => match mode {
+                        WebFilePickMode::ImportProfileJson => {
                             self.load_profile_json_bytes(&name, bytes);
-                        } else {
-                            self.load_mesh_bytes(&name, bytes);
                         }
-                    }
+                        WebFilePickMode::AddToPlate => {
+                            self.load_mesh_bytes_with_mode(&name, bytes, true);
+                        }
+                        WebFilePickMode::OpenReplace => {
+                            if name.to_ascii_lowercase().ends_with(".json") {
+                                self.load_profile_json_bytes(&name, bytes);
+                            } else {
+                                self.load_mesh_bytes_with_mode(&name, bytes, false);
+                            }
+                        }
+                    },
                     Err(e) => self.last_error = Some(format!("Failed reading `{name}`: {e}")),
                 }
             }
@@ -2002,7 +2301,12 @@ impl LayerCraftApp {
             let ctx_clone = ctx.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let res = file.bytes_async().await;
-                queue.borrow_mut().push((name, res));
+                let mode = if name.to_ascii_lowercase().ends_with(".json") {
+                    WebFilePickMode::ImportProfileJson
+                } else {
+                    WebFilePickMode::OpenReplace
+                };
+                queue.borrow_mut().push((mode, name, res));
                 ctx_clone.request_repaint();
             });
         }
@@ -2158,6 +2462,88 @@ impl LayerCraftApp {
                 }
             }
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn open_file_dialog(&mut self, append: bool) {
+        let mode = if append {
+            WebFilePickMode::AddToPlate
+        } else {
+            WebFilePickMode::OpenReplace
+        };
+        if let Err(err) = self.trigger_browser_file_picker(".stl,.3mf,.STL,.3MF", mode) {
+            self.last_error = Some(err);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn import_profile_file_dialog(&mut self) {
+        if let Err(err) =
+            self.trigger_browser_file_picker(".json,.JSON", WebFilePickMode::ImportProfileJson)
+        {
+            self.last_error = Some(err);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn trigger_browser_file_picker(
+        &mut self,
+        accept: &str,
+        mode: WebFilePickMode,
+    ) -> Result<(), String> {
+        use wasm_bindgen::JsCast as _;
+
+        let win = web_sys::window().ok_or_else(|| "missing browser window".to_owned())?;
+        let doc = win
+            .document()
+            .ok_or_else(|| "missing browser document".to_owned())?;
+        let body = doc
+            .body()
+            .ok_or_else(|| "missing document body".to_owned())?;
+        if let Some(old) = doc.get_element_by_id("layercraft_hidden_file_input") {
+            old.remove();
+        }
+        let elem = doc
+            .create_element("input")
+            .map_err(|e| format!("failed creating file input: {e:?}"))?;
+        let input = elem
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .map_err(|_| "element is not HtmlInputElement".to_owned())?;
+        input.set_id("layercraft_hidden_file_input");
+        input.set_type("file");
+        input.set_accept(accept);
+        let _ = input.style().set_property("display", "none");
+        let _ = body.append_child(&input);
+
+        let queue = std::rc::Rc::clone(&self.pending_drops);
+        let ctx_opt = self.last_ctx.clone();
+        let input_cb = input.clone();
+        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move |_ev: web_sys::Event| {
+            let file_opt = input_cb.files().and_then(|fl| fl.get(0));
+            input_cb.remove();
+            let Some(file) = file_opt else {
+                return;
+            };
+            let name = file.name();
+            let promise = file.array_buffer();
+            let q = std::rc::Rc::clone(&queue);
+            let c = ctx_opt.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let bytes_res = match wasm_bindgen_futures::JsFuture::from(promise).await {
+                    Ok(buf) => Ok(js_sys::Uint8Array::new(&buf).to_vec()),
+                    Err(e) => Err(format!("failed reading file bytes: {e:?}")),
+                };
+                q.borrow_mut().push((mode, name, bytes_res));
+                if let Some(ctx) = &c {
+                    ctx.request_repaint();
+                }
+            });
+        }) as Box<dyn FnMut(web_sys::Event)>);
+
+        input.set_onchange(Some(cb.as_ref().unchecked_ref()));
+        self.file_picker_cb = Some(cb);
+        input.click();
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2983,6 +3369,11 @@ impl LayerCraftApp {
             self.poll_pending_slice(ui.ctx());
             self.poll_pending_printer_job(ui.ctx());
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.last_ctx = Some(ui.ctx().clone());
+            self.poll_pending_web_slice(ui.ctx());
+        }
 
         self.pointer_active = ui.ctx().egui_is_using_pointer();
         if !self.pointer_active {
@@ -3129,7 +3520,7 @@ impl LayerCraftApp {
         if let Some(sz) = self.last_window_inner_size {
             self.prefs.window_size = Some(sz);
         }
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(not(test))]
         {
             let _ = self.prefs.save_to_disk();
         }
@@ -3290,6 +3681,10 @@ impl LayerCraftApp {
             ProfileKind::MachineModel => {}
         }
         self.last_error = None;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = prefs::save_user_profiles_to_browser(&self.session.profiles);
+        }
         self.sync_and_save_prefs();
         self.status_message = format!("Saved custom preset `{}`.", res.summary.name);
         Ok(res.summary.name)
@@ -3326,6 +3721,10 @@ impl LayerCraftApp {
                     ProfileKind::MachineModel => {}
                 }
                 self.last_error = None;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = prefs::save_user_profiles_to_browser(&self.session.profiles);
+                }
                 self.sync_and_save_prefs();
                 self.status_message = format!("Deleted custom preset `{name}`.");
             }
@@ -3367,7 +3766,6 @@ impl LayerCraftApp {
         match action {
             PendingDiscardAction::ClearPlate => self.clear_plate_action(),
             PendingDiscardAction::LoadSample(shape) => self.load_sample_with_mode(shape, false),
-            #[cfg(not(target_arch = "wasm32"))]
             PendingDiscardAction::OpenFileDialog => self.open_file_dialog(false),
             #[cfg(not(target_arch = "wasm32"))]
             PendingDiscardAction::OpenRecentPath(path) => {
