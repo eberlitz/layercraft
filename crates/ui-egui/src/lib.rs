@@ -21,7 +21,8 @@ use layercraft_engine::{
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::{
     CameraPreset, ColorMode, OrbitCamera, ViewportTheme, build_bed_grid_themed,
-    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_mesh_with_config, ray_intersect_mesh,
+    build_bed_plate_mesh, build_mesh_vertices, build_toolpath_instances_with_config,
+    ray_intersect_mesh,
 };
 use layercraft_viewport_gpu::{GpuSceneSnapshot, ViewportCallback};
 use serde_json::Value;
@@ -1273,7 +1274,7 @@ impl LayerCraftApp {
             .sliced
             .as_ref()
             .map(|s| {
-                build_toolpath_mesh_with_config(s, self.color_mode, Some(&self.session.config))
+                build_toolpath_instances_with_config(s, self.color_mode, Some(&self.session.config))
             })
             .unwrap_or_default();
 

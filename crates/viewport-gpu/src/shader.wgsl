@@ -55,6 +55,79 @@ fn vs_lit(in: LitIn) -> LitOut {
     return out;
 }
 
+struct BeadVertIn {
+    @location(0) uv_t_cap: vec4<f32>,
+    @location(1) norm_ao: vec3<f32>,
+    @location(2) p01: vec4<f32>,
+    @location(3) off01: vec4<f32>,
+    @location(4) bead_meta: vec4<f32>,
+};
+
+@vertex
+fn vs_bead(in: BeadVertIn) -> LitOut {
+    let pa = in.p01.xy;
+    let pb = in.p01.zw;
+    let off_a = in.off01.xy;
+    let off_b = in.off01.zw;
+    let z_mid = in.bead_meta.x;
+    let hz = in.bead_meta.y;
+    let flags = u32(max(in.bead_meta.z, 0.0) + 0.5);
+    let packed_rgb = u32(max(in.bead_meta.w, 0.0) + 0.5);
+    let base_rgb = vec3<f32>(
+        f32((packed_rgb >> 16u) & 255u) / 255.0,
+        f32((packed_rgb >> 8u) & 255u) / 255.0,
+        f32(packed_rgb & 255u) / 255.0,
+    );
+
+    let d = pb - pa;
+    let len = max(length(d), 1e-5);
+    let dir = d / len;
+    let left = vec2<f32>(-dir.y, dir.x);
+
+    let cap_push = in.uv_t_cap.w;
+    var world_pos: vec3<f32>;
+    var normal: vec3<f32>;
+    let ao = in.norm_ao.z;
+
+    if abs(cap_push) > 0.5 {
+        if cap_push < 0.0 {
+            let has_cap = (flags & 1u) != 0u;
+            let push = select(0.0, min(0.35 * length(off_a), 0.25), has_cap);
+            world_pos = vec3<f32>(pa - dir * push, z_mid);
+            normal = vec3<f32>(-dir.x, -dir.y, 0.0);
+        } else {
+            let has_cap = (flags & 2u) != 0u;
+            let push = select(0.0, min(0.35 * length(off_b), 0.25), has_cap);
+            world_pos = vec3<f32>(pb + dir * push, z_mid);
+            normal = vec3<f32>(dir.x, dir.y, 0.0);
+        }
+    } else {
+        let u = in.uv_t_cap.x;
+        let v = in.uv_t_cap.y;
+        let t = in.uv_t_cap.z;
+        let nu = in.norm_ao.x;
+        let nz = in.norm_ao.y;
+
+        let center_xy = mix(pa, pb, t);
+        let off_vec = mix(off_a, off_b, t);
+        world_pos = vec3<f32>(center_xy + off_vec * u, z_mid + hz * v);
+
+        let use_smooth = select((flags & 4u) != 0u, (flags & 8u) != 0u, t > 0.5);
+        var norm_xy = left;
+        if use_smooth && length(off_vec) > 1e-5 {
+            norm_xy = normalize(off_vec);
+        }
+        normal = normalize(vec3<f32>(norm_xy * nu, nz));
+    }
+
+    var out: LitOut;
+    out.clip_pos = scene.view_proj * vec4<f32>(world_pos, 1.0);
+    out.normal = normal;
+    out.color = vec4<f32>(clamp(base_rgb * ao, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    out.world_pos = world_pos;
+    return out;
+}
+
 @fragment
 fn fs_lit(in: LitOut) -> @location(0) vec4<f32> {
     let light_mode = scene.eye_pos.w > 0.5;

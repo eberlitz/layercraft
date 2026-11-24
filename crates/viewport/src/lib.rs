@@ -667,7 +667,117 @@ impl MoveKind {
     }
 }
 
-/// One sequential motion step within a layer, indexing into extruded bead and travel buffers.
+/// Flag bit on [`BeadInstance::flags`] enabling a domed start end-cap.
+pub const BEAD_FLAG_START_CAP: u32 = 1;
+/// Flag bit on [`BeadInstance::flags`] enabling a domed end cap.
+pub const BEAD_FLAG_END_CAP: u32 = 2;
+/// Flag bit on [`BeadInstance::flags`] selecting smooth radially interpolated normals at the start ring.
+pub const BEAD_FLAG_START_SMOOTH: u32 = 4;
+/// Flag bit on [`BeadInstance::flags`] selecting smooth radially interpolated normals at the end ring.
+pub const BEAD_FLAG_END_SMOOTH: u32 = 8;
+
+/// Static template vertex for GPU-instanced rounded stadium bead rendering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeadTemplateVertex {
+    pub uv_t_cap: [f32; 4],
+    pub norm_ao: [f32; 3],
+}
+
+impl BeadTemplateVertex {
+    /// Pack into `[u, v, t, cap_push, nu, nz, ao]` (`7 × f32 = 28 bytes`).
+    pub fn to_packed(self) -> [f32; 7] {
+        [
+            self.uv_t_cap[0],
+            self.uv_t_cap[1],
+            self.uv_t_cap[2],
+            self.uv_t_cap[3],
+            self.norm_ao[0],
+            self.norm_ao[1],
+            self.norm_ao[2],
+        ]
+    }
+}
+
+/// Build the reusable unit stadium-capsule template mesh (`18` vertices, `96` indices) for GPU instancing.
+pub fn build_bead_template_mesh() -> (Vec<BeadTemplateVertex>, Vec<u16>) {
+    let n = PROFILE_8.len();
+    let mut verts = Vec::with_capacity(n * 2 + 2);
+    for t in [0.0_f32, 1.0_f32] {
+        for s in PROFILE_8 {
+            verts.push(BeadTemplateVertex {
+                uv_t_cap: [s.u, s.v, t, 0.0],
+                norm_ao: [s.nu, s.nz, s.ao],
+            });
+        }
+    }
+    // Start cap apex (index 2*n) and end cap apex (index 2*n + 1).
+    verts.push(BeadTemplateVertex {
+        uv_t_cap: [0.0, 0.0, 0.0, -1.0],
+        norm_ao: [0.0, 0.0, 0.90],
+    });
+    verts.push(BeadTemplateVertex {
+        uv_t_cap: [0.0, 0.0, 1.0, 1.0],
+        norm_ao: [0.0, 0.0, 0.90],
+    });
+
+    let mut indices = Vec::with_capacity(n * 12);
+    let start_apex = (n * 2) as u16;
+    let end_apex = (n * 2 + 1) as u16;
+    for k in 0..n {
+        let k_next = (k + 1) % n;
+        let a0 = k as u16;
+        let a1 = k_next as u16;
+        let b0 = (n + k) as u16;
+        let b1 = (n + k_next) as u16;
+
+        // Body quad (a0, b0, b1), (a0, b1, a1)
+        indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        // Start cap fan (start_apex, a0, a1)
+        indices.extend_from_slice(&[start_apex, a0, a1]);
+        // End cap fan (end_apex, b1, b0)
+        indices.extend_from_slice(&[end_apex, b1, b0]);
+    }
+    (verts, indices)
+}
+
+/// Compact per-segment extruded filament bead instance (`48` bytes packed on GPU vs `1.44 KB` unindexed CPU tube).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeadInstance {
+    pub pa: [f32; 2],
+    pub pb: [f32; 2],
+    pub off_a: [f32; 2],
+    pub off_b: [f32; 2],
+    pub z_mid: f32,
+    pub hz: f32,
+    pub flags: u32,
+    pub color: [f32; 4],
+}
+
+impl BeadInstance {
+    /// Pack into `12 × f32` (`48 bytes`) with 24-bit RGB stored exactly in the trailing IEEE-754 float.
+    pub fn to_packed(self) -> [f32; 12] {
+        let r8 = ((self.color[0].clamp(0.0, 1.0) * 255.0).round() as u32).min(255);
+        let g8 = ((self.color[1].clamp(0.0, 1.0) * 255.0).round() as u32).min(255);
+        let b8 = ((self.color[2].clamp(0.0, 1.0) * 255.0).round() as u32).min(255);
+        let packed_rgb = ((r8 << 16) | (g8 << 8) | b8) as f32;
+        [
+            self.pa[0],
+            self.pa[1],
+            self.pb[0],
+            self.pb[1],
+            self.off_a[0],
+            self.off_a[1],
+            self.off_b[0],
+            self.off_b[1],
+            self.z_mid,
+            self.hz,
+            (self.flags & 0xF) as f32,
+            packed_rgb,
+        ]
+    }
+}
+
+/// One sequential motion step within a layer, indexing into extruded bead (vertices or instances) and travel buffers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerMoveStep {
     pub toolpath_vertex_end: u32,
@@ -678,6 +788,16 @@ pub struct LayerMoveStep {
     pub width_mm: f32,
 }
 
+/// Compact GPU-instanced toolpath data indexed by layer and intra-layer move step.
+#[derive(Debug, Clone, Default)]
+pub struct ToolpathInstances {
+    pub beads: Vec<BeadInstance>,
+    pub layer_ranges: Vec<Range<u32>>,
+    pub travel_lines: Vec<LineVertex>,
+    pub travel_layer_ranges: Vec<Range<u32>>,
+    pub layer_steps: Vec<Vec<LayerMoveStep>>,
+}
+
 /// 3D extruded bead ribbon and travel-line geometry indexed by layer and intra-layer step.
 #[derive(Debug, Clone, Default)]
 pub struct ToolpathGeometry {
@@ -686,6 +806,11 @@ pub struct ToolpathGeometry {
     pub travel_lines: Vec<LineVertex>,
     pub travel_layer_ranges: Vec<Range<u32>>,
     pub layer_steps: Vec<Vec<LayerMoveStep>>,
+}
+
+/// Build compact GPU-instanced bead ribbons (without combing travel hints) for every layer in `plate`.
+pub fn build_toolpath_instances(plate: &SlicedPlate, mode: ColorMode) -> ToolpathInstances {
+    build_toolpath_instances_with_config(plate, mode, None)
 }
 
 /// Build 3D extruded bead ribbons (without combing travel hints) for every layer in `plate`.
@@ -996,12 +1121,107 @@ fn push_domed_cap(
     }
 }
 
-/// Build realistic rounded stadium-profile filament beads, combed/Z-hop travel lines, and per-step scrubbing indices.
-pub fn build_toolpath_mesh_with_config(
+fn expand_bead_into(bead: BeadInstance, profile: &[ProfileSample], out: &mut Vec<SceneVertex>) {
+    let n_prof = profile.len();
+    let [ax, ay] = bead.pa;
+    let [bx, by] = bead.pb;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len = dx.hypot(dy).max(1e-5);
+    let dir = (dx / len, dy / len);
+    let left = (-dir.1, dir.0);
+
+    let norm_from_offset = |off: [f32; 2], smooth: bool| -> (f32, f32) {
+        if smooth {
+            let l = off[0].hypot(off[1]);
+            if l > 1e-5 {
+                (off[0] / l, off[1] / l)
+            } else {
+                left
+            }
+        } else {
+            left
+        }
+    };
+
+    let start_norm = norm_from_offset(bead.off_a, (bead.flags & BEAD_FLAG_START_SMOOTH) != 0);
+    let end_norm = norm_from_offset(bead.off_b, (bead.flags & BEAD_FLAG_END_SMOOTH) != 0);
+
+    let start_ring = build_ring_vertices(
+        profile,
+        [ax, ay, bead.z_mid],
+        (1.0, bead.hz),
+        (bead.off_a[0], bead.off_a[1]),
+        start_norm,
+        bead.color,
+    );
+    let end_ring = build_ring_vertices(
+        profile,
+        [bx, by, bead.z_mid],
+        (1.0, bead.hz),
+        (bead.off_b[0], bead.off_b[1]),
+        end_norm,
+        bead.color,
+    );
+
+    for k in 0..n_prof {
+        let k_next = (k + 1) % n_prof;
+        if let (Some(&a0), Some(&a1), Some(&b0), Some(&b1)) = (
+            start_ring.get(k),
+            start_ring.get(k_next),
+            end_ring.get(k),
+            end_ring.get(k_next),
+        ) {
+            push_smooth_quad(out, a0, b0, b1, a1);
+        }
+    }
+
+    if (bead.flags & BEAD_FLAG_START_CAP) != 0 {
+        let hw_a = bead.off_a[0].hypot(bead.off_a[1]);
+        push_domed_cap(
+            out,
+            &start_ring,
+            [ax, ay, bead.z_mid],
+            dir,
+            hw_a,
+            bead.color,
+            true,
+        );
+    }
+    if (bead.flags & BEAD_FLAG_END_CAP) != 0 {
+        let hw_b = bead.off_b[0].hypot(bead.off_b[1]);
+        push_domed_cap(
+            out,
+            &end_ring,
+            [bx, by, bead.z_mid],
+            dir,
+            hw_b,
+            bead.color,
+            false,
+        );
+    }
+}
+
+/// Expand a slice of compact [`BeadInstance`] records into world-space CPU [`SceneVertex`] triangles.
+pub fn expand_bead_instances_to_vertices(beads: &[BeadInstance]) -> Vec<SceneVertex> {
+    let profile = if beads.len() > 60_000 {
+        PROFILE_6
+    } else {
+        PROFILE_8
+    };
+    let mut out = Vec::with_capacity(beads.len() * profile.len() * 6);
+    for &bead in beads {
+        expand_bead_into(bead, profile, &mut out);
+    }
+    out
+}
+
+/// Build compact GPU-instanced rounded bead descriptors, combed/Z-hop travel lines, and per-step scrubbing indices.
+pub fn build_toolpath_instances_with_config(
     plate: &SlicedPlate,
     mode: ColorMode,
     config: Option<&PrintConfig>,
-) -> ToolpathGeometry {
+) -> ToolpathInstances {
     let total_layers = plate.layers.len();
     let height_range_mm = if mode == ColorMode::LayerHeight && !plate.layers.is_empty() {
         let mut min_h = f64::INFINITY;
@@ -1019,25 +1239,6 @@ pub fn build_toolpath_mesh_with_config(
         (0.04, 0.32)
     };
 
-    let total_segments_est: usize = plate
-        .layers
-        .iter()
-        .flat_map(|l| l.paths.iter())
-        .map(|p| {
-            if p.closed {
-                p.points.len()
-            } else {
-                p.points.len().saturating_sub(1)
-            }
-        })
-        .sum();
-    let profile = if total_segments_est > 60_000 {
-        PROFILE_6
-    } else {
-        PROFILE_8
-    };
-    let n_prof = profile.len();
-
     let travel_speed = config
         .map(|c| c.machine.travel_speed_mm_s as f32)
         .unwrap_or(180.0);
@@ -1053,7 +1254,7 @@ pub fn build_toolpath_mesh_with_config(
         .map(|c| c.process.avoid_crossing_perimeters_max_detour_mm)
         .unwrap_or(50.0);
 
-    let mut vertices = Vec::new();
+    let mut beads = Vec::new();
     let mut layer_ranges = Vec::with_capacity(total_layers);
     let mut travel_lines = Vec::new();
     let mut travel_layer_ranges = Vec::with_capacity(total_layers);
@@ -1061,7 +1262,7 @@ pub fn build_toolpath_mesh_with_config(
     let mut prev_xy: Option<(f64, f64)> = None;
 
     for (layer_idx, layer) in plate.layers.iter().enumerate() {
-        let start = vertices.len() as u32;
+        let start = beads.len() as u32;
         let travel_start = travel_lines.len() as u32;
         let mut steps = Vec::new();
         let z_top = layer.z_top_mm as f32;
@@ -1092,7 +1293,7 @@ pub fn build_toolpath_mesh_with_config(
             if let Some((px, py)) = prev_xy {
                 let dist = (sx_f64 - px).hypot(sy_f64 - py);
                 if dist > 1e-3 {
-                    let cur_v_end = vertices.len() as u32;
+                    let cur_v_end = beads.len() as u32;
                     let combed_pts = combing
                         .as_ref()
                         .and_then(|c| c.plan_travel((px, py), (sx_f64, sy_f64), max_detour_mm));
@@ -1275,86 +1476,42 @@ pub fn build_toolpath_mesh_with_config(
                     let prev_join = prev_opt.and_then(|prev| corner_join(prev, &cur));
                     let next_join = next_opt.and_then(|next| corner_join(&cur, next));
 
-                    let (start_offset, start_norm, start_joined) = match prev_join {
-                        Some((miter, smooth)) => {
-                            let norm = if smooth {
-                                let l = miter.0.hypot(miter.1).max(1e-5);
-                                (miter.0 / l, miter.1 / l)
-                            } else {
-                                cur.left
-                            };
-                            (miter, norm, true)
-                        }
-                        None => (cur.left, cur.left, false),
+                    let (start_offset, start_joined, start_smooth) = match prev_join {
+                        Some((miter, smooth)) => (miter, true, smooth),
+                        None => (cur.left, false, false),
+                    };
+                    let (end_offset, end_joined, end_smooth) = match next_join {
+                        Some((miter, smooth)) => (miter, true, smooth),
+                        None => (cur.left, false, false),
                     };
 
-                    let (end_offset, end_norm, end_joined) = match next_join {
-                        Some((miter, smooth)) => {
-                            let norm = if smooth {
-                                let l = miter.0.hypot(miter.1).max(1e-5);
-                                (miter.0 / l, miter.1 / l)
-                            } else {
-                                cur.left
-                            };
-                            (miter, norm, true)
-                        }
-                        None => (cur.left, cur.left, false),
-                    };
-
-                    let start_ring = build_ring_vertices(
-                        profile,
-                        [cur.pa.0, cur.pa.1, z_mid],
-                        (cur.hwa, hz),
-                        start_offset,
-                        start_norm,
-                        color,
-                    );
-                    let end_ring = build_ring_vertices(
-                        profile,
-                        [cur.pb.0, cur.pb.1, z_mid],
-                        (cur.hwb, hz),
-                        end_offset,
-                        end_norm,
-                        color,
-                    );
-
-                    for k in 0..n_prof {
-                        let k_next = (k + 1) % n_prof;
-                        if let (Some(&a0), Some(&a1), Some(&b0), Some(&b1)) = (
-                            start_ring.get(k),
-                            start_ring.get(k_next),
-                            end_ring.get(k),
-                            end_ring.get(k_next),
-                        ) {
-                            push_smooth_quad(&mut vertices, a0, b0, b1, a1);
-                        }
-                    }
-
+                    let mut flags = 0u32;
                     if !start_joined {
-                        push_domed_cap(
-                            &mut vertices,
-                            &start_ring,
-                            [cur.pa.0, cur.pa.1, z_mid],
-                            cur.dir,
-                            cur.hwa,
-                            color,
-                            true,
-                        );
+                        flags |= BEAD_FLAG_START_CAP;
                     }
                     if !end_joined {
-                        push_domed_cap(
-                            &mut vertices,
-                            &end_ring,
-                            [cur.pb.0, cur.pb.1, z_mid],
-                            cur.dir,
-                            cur.hwb,
-                            color,
-                            false,
-                        );
+                        flags |= BEAD_FLAG_END_CAP;
+                    }
+                    if start_smooth {
+                        flags |= BEAD_FLAG_START_SMOOTH;
+                    }
+                    if end_smooth {
+                        flags |= BEAD_FLAG_END_SMOOTH;
                     }
 
+                    beads.push(BeadInstance {
+                        pa: [cur.pa.0, cur.pa.1],
+                        pb: [cur.pb.0, cur.pb.1],
+                        off_a: [start_offset.0 * cur.hwa, start_offset.1 * cur.hwa],
+                        off_b: [end_offset.0 * cur.hwb, end_offset.1 * cur.hwb],
+                        z_mid,
+                        hz,
+                        flags,
+                        color,
+                    });
+
                     steps.push(LayerMoveStep {
-                        toolpath_vertex_end: vertices.len() as u32,
+                        toolpath_vertex_end: beads.len() as u32,
                         travel_vertex_end: travel_lines.len() as u32,
                         nozzle_pos: [cur.pb.0, cur.pb.1, z_top],
                         kind: MoveKind::Extrusion(path.role),
@@ -1372,18 +1529,71 @@ pub fn build_toolpath_mesh_with_config(
             prev_xy = Some(end_pt.to_mm());
         }
 
-        let end = vertices.len() as u32;
+        let end = beads.len() as u32;
         let travel_end = travel_lines.len() as u32;
         layer_ranges.push(start..end);
         travel_layer_ranges.push(travel_start..travel_end);
         layer_steps.push(steps);
     }
 
-    ToolpathGeometry {
-        vertices,
+    ToolpathInstances {
+        beads,
         layer_ranges,
         travel_lines,
         travel_layer_ranges,
+        layer_steps,
+    }
+}
+
+/// Build realistic rounded stadium-profile filament beads, combed/Z-hop travel lines, and per-step scrubbing indices.
+pub fn build_toolpath_mesh_with_config(
+    plate: &SlicedPlate,
+    mode: ColorMode,
+    config: Option<&PrintConfig>,
+) -> ToolpathGeometry {
+    let insts = build_toolpath_instances_with_config(plate, mode, config);
+    let profile = if insts.beads.len() > 60_000 {
+        PROFILE_6
+    } else {
+        PROFILE_8
+    };
+    let mut vertices = Vec::with_capacity(insts.beads.len() * profile.len() * 6);
+    let mut inst_end_to_vert_end = Vec::with_capacity(insts.beads.len() + 1);
+    inst_end_to_vert_end.push(0u32);
+    for &bead in &insts.beads {
+        expand_bead_into(bead, profile, &mut vertices);
+        inst_end_to_vert_end.push(vertices.len() as u32);
+    }
+    let map_end = |inst_idx: u32| -> u32 {
+        inst_end_to_vert_end
+            .get(inst_idx as usize)
+            .copied()
+            .unwrap_or(vertices.len() as u32)
+    };
+    let layer_ranges = insts
+        .layer_ranges
+        .into_iter()
+        .map(|r| map_end(r.start)..map_end(r.end))
+        .collect();
+    let layer_steps = insts
+        .layer_steps
+        .into_iter()
+        .map(|steps| {
+            steps
+                .into_iter()
+                .map(|mut step| {
+                    step.toolpath_vertex_end = map_end(step.toolpath_vertex_end);
+                    step
+                })
+                .collect()
+        })
+        .collect();
+
+    ToolpathGeometry {
+        vertices,
+        layer_ranges,
+        travel_lines: insts.travel_lines,
+        travel_layer_ranges: insts.travel_layer_ranges,
         layer_steps,
     }
 }
@@ -1708,5 +1918,46 @@ mod tests {
         assert_eq!(path_geom.vertices.len(), 192);
         // Seg 0 end vertex b0 (vertex 1) must match Seg 1 start vertex a0 (vertex 48).
         assert_eq!(path_geom.vertices[1].pos, path_geom.vertices[48].pos);
+    }
+
+    #[test]
+    fn toolpath_instances_pack_template_and_match_cpu_beads() {
+        let (tpl_verts, tpl_indices) = build_bead_template_mesh();
+        assert_eq!(tpl_verts.len(), 18);
+        assert_eq!(tpl_indices.len(), 96);
+        assert_eq!(tpl_verts[16].uv_t_cap[3], -1.0);
+        assert_eq!(tpl_verts[17].uv_t_cap[3], 1.0);
+
+        let cfg = PrintConfig::default();
+        let mesh = sample_cube();
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let insts = build_toolpath_instances_with_config(&plate, ColorMode::Feature, Some(&cfg));
+        assert_eq!(insts.layer_ranges.len(), plate.layers.len());
+        assert!(!insts.beads.is_empty());
+
+        let expanded = expand_bead_instances_to_vertices(&insts.beads);
+        let cpu_geom = build_toolpath_mesh_with_config(&plate, ColorMode::Feature, Some(&cfg));
+        assert_eq!(expanded.len(), cpu_geom.vertices.len());
+
+        // Verify RGB24 exact roundtrip in packed IEEE-754 float.
+        let sample_bead = BeadInstance {
+            pa: [10.0, 20.0],
+            pb: [30.0, 40.0],
+            off_a: [0.0, 0.21],
+            off_b: [-0.21, 0.21],
+            z_mid: 0.1,
+            hz: 0.106,
+            flags: BEAD_FLAG_START_CAP | BEAD_FLAG_END_SMOOTH,
+            color: [0.95, 0.52, 0.14, 1.0],
+        };
+        let packed = sample_bead.to_packed();
+        assert_eq!(
+            packed[10] as u32,
+            BEAD_FLAG_START_CAP | BEAD_FLAG_END_SMOOTH
+        );
+        let rgb = packed[11].round() as u32;
+        assert_eq!((rgb >> 16) & 0xFF, (0.95_f32 * 255.0).round() as u32);
+        assert_eq!((rgb >> 8) & 0xFF, (0.52_f32 * 255.0).round() as u32);
+        assert_eq!(rgb & 0xFF, (0.14_f32 * 255.0).round() as u32);
     }
 }

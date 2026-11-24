@@ -5,11 +5,13 @@ use std::sync::Arc;
 
 use glam::Mat4;
 use layercraft_viewport::{
-    LayerMoveStep, LineVertex, SceneVertex, ToolpathGeometry, build_nozzle_marker_mesh,
+    BeadInstance, LayerMoveStep, LineVertex, SceneVertex, ToolpathInstances,
+    build_bead_template_mesh, build_nozzle_marker_mesh,
 };
 use wgpu::util::DeviceExt as _;
 
 const MSAA_SAMPLES: u32 = 4;
+const MAX_CHUNK_BYTES: usize = 128 * 1024 * 1024;
 
 /// Immutable GPU-uploadable scene geometry produced when mesh/plate/toolpaths change.
 #[derive(Debug, Default)]
@@ -20,7 +22,7 @@ pub struct GpuSceneSnapshot {
     pub mesh_verts: Vec<[f32; 10]>,
     pub modifier_verts: Vec<[f32; 10]>,
     pub ghost_verts: Vec<[f32; 10]>,
-    pub toolpath_verts: Vec<[f32; 10]>,
+    pub toolpath_beads: Vec<[f32; 12]>,
     pub layer_ranges: Vec<Range<u32>>,
     pub travel_lines: Vec<[f32; 7]>,
     pub travel_layer_ranges: Vec<Range<u32>>,
@@ -28,7 +30,7 @@ pub struct GpuSceneSnapshot {
 }
 
 impl GpuSceneSnapshot {
-    /// Pack CPU vertex arrays into `bytemuck`-friendly float arrays without `unsafe`.
+    /// Pack CPU vertex and bead instance arrays into `bytemuck`-friendly float arrays without `unsafe`.
     pub fn from_geometry(
         revision: u64,
         bed_plate: &[SceneVertex],
@@ -36,7 +38,7 @@ impl GpuSceneSnapshot {
         mesh: &[SceneVertex],
         modifiers: &[SceneVertex],
         ghost: &[SceneVertex],
-        toolpaths: &ToolpathGeometry,
+        toolpaths: &ToolpathInstances,
     ) -> Self {
         Self {
             revision,
@@ -53,11 +55,11 @@ impl GpuSceneSnapshot {
                 .map(SceneVertex::to_packed)
                 .collect(),
             ghost_verts: ghost.iter().copied().map(SceneVertex::to_packed).collect(),
-            toolpath_verts: toolpaths
-                .vertices
+            toolpath_beads: toolpaths
+                .beads
                 .iter()
                 .copied()
-                .map(SceneVertex::to_packed)
+                .map(BeadInstance::to_packed)
                 .collect(),
             layer_ranges: toolpaths.layer_ranges.clone(),
             travel_lines: toolpaths
@@ -98,22 +100,35 @@ struct OffscreenTarget {
     blit_bind_group: wgpu::BindGroup,
 }
 
-struct UploadedBuffers {
-    revision: u64,
-    bed_plate_buf: Option<(wgpu::Buffer, u32)>,
-    bed_buf: Option<(wgpu::Buffer, u32)>,
-    mesh_buf: Option<(wgpu::Buffer, u32)>,
-    modifier_buf: Option<(wgpu::Buffer, u32)>,
-    ghost_buf: Option<(wgpu::Buffer, u32)>,
-    toolpath_buf: Option<(wgpu::Buffer, u32)>,
-    travel_buf: Option<(wgpu::Buffer, u32)>,
+struct BufferChunk {
+    buf: wgpu::Buffer,
+    start: u32,
+    count: u32,
+    stride: u64,
 }
 
-/// Persistent GPU pipelines and cached scene vertex buffers stored in `egui_wgpu` resources.
+struct ChunkedGpuBuffer {
+    total_count: u32,
+    chunks: Vec<BufferChunk>,
+}
+
+struct UploadedBuffers {
+    revision: u64,
+    bed_plate_buf: Option<ChunkedGpuBuffer>,
+    bed_buf: Option<ChunkedGpuBuffer>,
+    mesh_buf: Option<ChunkedGpuBuffer>,
+    modifier_buf: Option<ChunkedGpuBuffer>,
+    ghost_buf: Option<ChunkedGpuBuffer>,
+    toolpath_buf: Option<ChunkedGpuBuffer>,
+    travel_buf: Option<ChunkedGpuBuffer>,
+}
+
+/// Persistent GPU pipelines and cached scene vertex/instance buffers stored in `egui_wgpu` resources.
 pub struct ViewportGpuRenderer {
     target_format: wgpu::TextureFormat,
     bg_pipeline: wgpu::RenderPipeline,
     lit_pipeline: wgpu::RenderPipeline,
+    bead_pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
@@ -121,6 +136,9 @@ pub struct ViewportGpuRenderer {
     sampler: wgpu::Sampler,
     cam_buf: wgpu::Buffer,
     cam_bind_group: wgpu::BindGroup,
+    bead_template_vbuf: wgpu::Buffer,
+    bead_template_ibuf: wgpu::Buffer,
+    bead_template_index_count: u32,
     offscreen: Option<OffscreenTarget>,
     uploaded: Option<UploadedBuffers>,
 }
@@ -326,6 +344,72 @@ impl ViewportGpuRenderer {
             true,
             "layercraft_lit_pipeline",
         );
+
+        let tpl_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x3];
+        let inst_attrs = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
+        let bead_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("layercraft_bead_pipeline"),
+            layout: Some(&scene_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_bead"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 28,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &tpl_attrs,
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 48,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &inst_attrs,
+                    }),
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_lit"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let (tpl_verts, tpl_indices) = build_bead_template_mesh();
+        let tpl_packed: Vec<[f32; 7]> = tpl_verts.into_iter().map(|v| v.to_packed()).collect();
+        let bead_template_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("layercraft_bead_template_verts"),
+            contents: bytemuck::cast_slice(&tpl_packed),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let bead_template_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("layercraft_bead_template_indices"),
+            contents: bytemuck::cast_slice(&tpl_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let bead_template_index_count = u32::try_from(tpl_indices.len()).unwrap_or(u32::MAX);
         let translucent_pipeline = make_lit_pipeline(
             device,
             &scene_layout,
@@ -446,6 +530,7 @@ impl ViewportGpuRenderer {
             target_format,
             bg_pipeline,
             lit_pipeline,
+            bead_pipeline,
             translucent_pipeline,
             line_pipeline,
             blit_pipeline,
@@ -453,6 +538,9 @@ impl ViewportGpuRenderer {
             sampler,
             cam_buf,
             cam_bind_group,
+            bead_template_vbuf,
+            bead_template_ibuf,
+            bead_template_index_count,
             offscreen: None,
             uploaded: None,
         }
@@ -547,13 +635,24 @@ impl ViewportGpuRenderer {
         {
             return;
         }
-        let bed_plate_buf = upload_slice(device, "layercraft_bed_plate", &scene.bed_plate_verts);
-        let bed_buf = upload_slice(device, "layercraft_bed_lines", &scene.bed_lines);
-        let mesh_buf = upload_slice(device, "layercraft_mesh_verts", &scene.mesh_verts);
-        let modifier_buf = upload_slice(device, "layercraft_modifier_verts", &scene.modifier_verts);
-        let ghost_buf = upload_slice(device, "layercraft_ghost_verts", &scene.ghost_verts);
-        let toolpath_buf = upload_slice(device, "layercraft_toolpath_verts", &scene.toolpath_verts);
-        let travel_buf = upload_slice(device, "layercraft_travel_lines", &scene.travel_lines);
+        let bed_plate_buf =
+            upload_chunked(device, "layercraft_bed_plate", &scene.bed_plate_verts, 3);
+        let bed_buf = upload_chunked(device, "layercraft_bed_lines", &scene.bed_lines, 2);
+        let mesh_buf = upload_chunked(device, "layercraft_mesh_verts", &scene.mesh_verts, 3);
+        let modifier_buf = upload_chunked(
+            device,
+            "layercraft_modifier_verts",
+            &scene.modifier_verts,
+            3,
+        );
+        let ghost_buf = upload_chunked(device, "layercraft_ghost_verts", &scene.ghost_verts, 3);
+        let toolpath_buf = upload_chunked(
+            device,
+            "layercraft_toolpath_beads",
+            &scene.toolpath_beads,
+            1,
+        );
+        let travel_buf = upload_chunked(device, "layercraft_travel_lines", &scene.travel_lines, 2);
         self.uploaded = Some(UploadedBuffers {
             revision: scene.revision,
             bed_plate_buf,
@@ -565,6 +664,88 @@ impl ViewportGpuRenderer {
             travel_buf,
         });
     }
+}
+
+/// Partition `total_elems` of `elem_size` bytes into contiguous ranges each fitting within `max_bytes`
+/// and aligned down to a multiple of `granularity` elements (e.g. `3` for triangle lists, `2` for lines).
+pub fn plan_buffer_chunks(
+    total_elems: usize,
+    elem_size: usize,
+    max_bytes: usize,
+    granularity: usize,
+) -> Vec<Range<usize>> {
+    if total_elems == 0 || elem_size == 0 {
+        return Vec::new();
+    }
+    let gran = granularity.max(1);
+    let max_elems_raw = max_bytes.max(elem_size * gran) / elem_size;
+    let chunk_elems = ((max_elems_raw / gran) * gran).max(gran);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < total_elems {
+        let end = start.saturating_add(chunk_elems).min(total_elems);
+        chunks.push(start..end);
+        start = end;
+    }
+    chunks
+}
+
+/// Compute local `(start_offset, element_count)` of `range` overlapping a chunk spanning `chunk_start..chunk_start + chunk_count`.
+pub fn chunk_range_overlap(
+    chunk_start: u32,
+    chunk_count: u32,
+    range: &Range<u32>,
+) -> Option<(u32, u32)> {
+    let chunk_end = chunk_start.saturating_add(chunk_count);
+    let lo = range.start.max(chunk_start);
+    let hi = range.end.min(chunk_end);
+    if hi > lo {
+        Some((lo - chunk_start, hi - lo))
+    } else {
+        None
+    }
+}
+
+fn upload_chunked<T: bytemuck::NoUninit>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+    elem_granularity: usize,
+) -> Option<ChunkedGpuBuffer> {
+    if data.is_empty() {
+        return None;
+    }
+    let elem_size = std::mem::size_of::<T>();
+    let device_limit = usize::try_from(device.limits().max_buffer_size).unwrap_or(MAX_CHUNK_BYTES);
+    let max_bytes = device_limit.min(MAX_CHUNK_BYTES);
+    let ranges = plan_buffer_chunks(data.len(), elem_size, max_bytes, elem_granularity);
+    let mut chunks = Vec::with_capacity(ranges.len());
+    for (idx, range) in ranges.into_iter().enumerate() {
+        let Some(slice) = data.get(range.clone()) else {
+            continue;
+        };
+        let chunk_label = if idx == 0 {
+            label.to_owned()
+        } else {
+            format!("{label}_{idx}")
+        };
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&chunk_label),
+            contents: bytemuck::cast_slice(slice),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        chunks.push(BufferChunk {
+            buf,
+            start: u32::try_from(range.start).unwrap_or(u32::MAX),
+            count: u32::try_from(slice.len()).unwrap_or(u32::MAX),
+            stride: u64::try_from(elem_size).unwrap_or(0),
+        });
+    }
+    let total_count = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    Some(ChunkedGpuBuffer {
+        total_count,
+        chunks,
+    })
 }
 
 fn upload_slice<T: bytemuck::NoUninit>(
@@ -582,6 +763,60 @@ fn upload_slice<T: bytemuck::NoUninit>(
     });
     let count = u32::try_from(data.len()).unwrap_or(u32::MAX);
     Some((buf, count))
+}
+
+fn draw_chunked_vertices(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &wgpu::RenderPipeline,
+    cam_bg: &wgpu::BindGroup,
+    buf: &ChunkedGpuBuffer,
+    range: Option<&Range<u32>>,
+) {
+    let full = 0..buf.total_count;
+    let target = range.unwrap_or(&full);
+    if target.is_empty() {
+        return;
+    }
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, cam_bg, &[]);
+    for chunk in &buf.chunks {
+        let Some((local_start, count)) = chunk_range_overlap(chunk.start, chunk.count, target)
+        else {
+            continue;
+        };
+        let byte_start = u64::from(local_start) * chunk.stride;
+        let byte_len = u64::from(count) * chunk.stride;
+        pass.set_vertex_buffer(0, chunk.buf.slice(byte_start..(byte_start + byte_len)));
+        pass.draw(0..count, 0..1);
+    }
+}
+
+fn draw_chunked_instanced(
+    pass: &mut wgpu::RenderPass<'_>,
+    renderer: &ViewportGpuRenderer,
+    buf: &ChunkedGpuBuffer,
+    range: &Range<u32>,
+) {
+    if range.is_empty() || renderer.bead_template_index_count == 0 {
+        return;
+    }
+    pass.set_pipeline(&renderer.bead_pipeline);
+    pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
+    pass.set_vertex_buffer(0, renderer.bead_template_vbuf.slice(..));
+    pass.set_index_buffer(
+        renderer.bead_template_ibuf.slice(..),
+        wgpu::IndexFormat::Uint16,
+    );
+    for chunk in &buf.chunks {
+        let Some((local_start, count)) = chunk_range_overlap(chunk.start, chunk.count, range)
+        else {
+            continue;
+        };
+        let byte_start = u64::from(local_start) * chunk.stride;
+        let byte_len = u64::from(count) * chunk.stride;
+        pass.set_vertex_buffer(1, chunk.buf.slice(byte_start..(byte_start + byte_len)));
+        pass.draw_indexed(0..renderer.bead_template_index_count, 0, 0..count);
+    }
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -648,55 +883,56 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         pass.draw(0..3, 0..1);
 
         // 2. Physical matte build plate
-        if let Some((buf, count)) = &uploaded.bed_plate_buf {
-            pass.set_pipeline(&renderer.lit_pipeline);
-            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
+        if let Some(buf) = &uploaded.bed_plate_buf {
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.lit_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                None,
+            );
         }
 
         // 3. Bed grid lines & origin triad
-        if let Some((buf, count)) = &uploaded.bed_buf {
-            pass.set_pipeline(&renderer.line_pipeline);
-            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
+        if let Some(buf) = &uploaded.bed_buf {
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.line_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                None,
+            );
         }
 
-        // 4. Opaque model mesh (Prepare) or sliced toolpath beads (Preview)
+        // 4. Opaque model mesh (Prepare) or GPU-instanced sliced toolpath beads (Preview)
         if self.draw_mesh
-            && let Some((buf, count)) = &uploaded.mesh_buf
+            && let Some(buf) = &uploaded.mesh_buf
         {
-            pass.set_pipeline(&renderer.lit_pipeline);
-            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.lit_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                None,
+            );
         }
 
         if !self.toolpath_range.is_empty()
-            && let Some((buf, count)) = &uploaded.toolpath_buf
+            && let Some(buf) = &uploaded.toolpath_buf
         {
-            let start = self.toolpath_range.start.min(*count);
-            let end = self.toolpath_range.end.min(*count);
-            if end > start {
-                pass.set_pipeline(&renderer.lit_pipeline);
-                pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(start..end, 0..1);
-            }
+            draw_chunked_instanced(pass_ref(&mut pass), renderer, buf, &self.toolpath_range);
         }
 
         if !self.travel_range.is_empty()
-            && let Some((buf, count)) = &uploaded.travel_buf
+            && let Some(buf) = &uploaded.travel_buf
         {
-            let start = self.travel_range.start.min(*count);
-            let end = self.travel_range.end.min(*count);
-            if end > start {
-                pass.set_pipeline(&renderer.line_pipeline);
-                pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(start..end, 0..1);
-            }
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.line_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                Some(&self.travel_range),
+            );
         }
 
         if let Some((buf, count)) = &nozzle_buf {
@@ -708,21 +944,27 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
         // 5. Translucent modifiers & ghost mesh (depth-tested, no depth write)
         if self.draw_mesh
-            && let Some((buf, count)) = &uploaded.modifier_buf
+            && let Some(buf) = &uploaded.modifier_buf
         {
-            pass.set_pipeline(&renderer.translucent_pipeline);
-            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.translucent_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                None,
+            );
         }
 
         if self.draw_ghost
-            && let Some((buf, count)) = &uploaded.ghost_buf
+            && let Some(buf) = &uploaded.ghost_buf
         {
-            pass.set_pipeline(&renderer.translucent_pipeline);
-            pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
-            pass.set_vertex_buffer(0, buf.slice(..));
-            pass.draw(0..*count, 0..1);
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.translucent_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                None,
+            );
         }
 
         Vec::new()
@@ -755,5 +997,35 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         pass.set_pipeline(&renderer.blit_pipeline);
         pass.set_bind_group(0, &offscreen.blit_bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+#[inline]
+fn pass_ref<'a, 'b>(pass: &'a mut wgpu::RenderPass<'b>) -> &'a mut wgpu::RenderPass<'b> {
+    pass
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_chunk_planner_respects_limit_and_granularity() {
+        assert!(plan_buffer_chunks(0, 48, 1024, 1).is_empty());
+
+        // Single chunk when total fits under limit
+        assert_eq!(plan_buffer_chunks(10, 48, 1024, 1), vec![0..10]);
+
+        // Triangle granularity (3 verts = 120 bytes): max 300 bytes -> max 2 triangles (6 verts) per chunk
+        let tri_chunks = plan_buffer_chunks(15, 40, 300, 3);
+        assert_eq!(tri_chunks, vec![0..6, 6..12, 12..15]);
+        for r in &tri_chunks {
+            assert!(r.len() * 40 <= 300);
+        }
+
+        // Exact overlap computation across multiple chunks
+        assert_eq!(chunk_range_overlap(0, 6, &(2..10)), Some((2, 4)));
+        assert_eq!(chunk_range_overlap(6, 6, &(2..10)), Some((0, 4)));
+        assert_eq!(chunk_range_overlap(12, 3, &(2..10)), None);
     }
 }

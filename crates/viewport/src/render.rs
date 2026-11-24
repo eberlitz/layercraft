@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CameraPreset, ColorMode, LineVertex, OrbitCamera, SceneVertex, ViewportError, build_bed_grid,
-    build_mesh_vertices, build_toolpath_mesh, path_color,
+    build_mesh_vertices, build_toolpath_instances, expand_bead_instances_to_vertices, path_color,
 };
 
 /// Render target style for [`render_png`].
@@ -136,23 +136,24 @@ pub fn render_png_with_camera(
         }
         RenderMode::Preview => {
             if let Some(sliced) = plate {
-                let geom = build_toolpath_mesh(sliced, req.color_mode);
-                let total = geom.layer_ranges.len();
+                let insts = build_toolpath_instances(sliced, req.color_mode);
+                let total = insts.layer_ranges.len();
                 if total > 0 {
                     let top_idx = req.max_layer.unwrap_or(total - 1).min(total - 1);
                     let start_idx = if req.single_layer_only { top_idx } else { 0 };
-                    let start_v = geom
+                    let start_i = insts
                         .layer_ranges
                         .get(start_idx)
                         .map(|r| r.start as usize)
                         .unwrap_or(0);
-                    let end_v = geom
+                    let end_i = insts
                         .layer_ranges
                         .get(top_idx)
                         .map(|r| r.end as usize)
                         .unwrap_or(0);
-                    if let Some(slice) = geom.vertices.get(start_v..end_v) {
-                        rasterize_triangles(slice, vp, w, h, &mut color_buf, &mut depth_buf);
+                    if let Some(slice) = insts.beads.get(start_i..end_i) {
+                        let verts = expand_bead_instances_to_vertices(slice);
+                        rasterize_triangles(&verts, vp, w, h, &mut color_buf, &mut depth_buf);
                     }
                 }
             } else if let Some(m) = mesh {
