@@ -14,6 +14,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 /// Archive entry path storing LayerCraft project state inside a `.3mf` package.
 pub const LAYERCRAFT_PROJECT_PATH: &str = "Metadata/layercraft_project.json";
 
+/// Archive entry path storing plate assignments and slicer object metadata inside a `.3mf` package.
+pub const MODEL_SETTINGS_PATH: &str = "Metadata/model_settings.config";
+
 const MAX_3MF_COMPONENT_DEPTH: usize = 32;
 const MAX_3MF_ARCHIVE_ENTRIES: usize = 4096;
 
@@ -317,12 +320,22 @@ impl ThreeMfMatrix {
     }
 }
 
+/// Logical build plate metadata parsed from `Metadata/model_settings.config`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreeMfPlateMeta {
+    pub id: u32,
+    pub name: String,
+}
+
 /// Resolved world-space mesh part instantiated from a 3MF `<build>` item (or fallback model object).
 #[derive(Debug, Clone)]
 pub struct ThreeMfPart {
     pub name: String,
     pub mesh: TriangleMesh,
     pub item_transform: Option<[f64; 12]>,
+    pub object_id: u32,
+    pub instance_id: u32,
+    pub plate_index: usize,
 }
 
 /// Raw resource `<mesh>` object read from a 3MF model file (used for LayerCraft project loading).
@@ -341,11 +354,21 @@ pub struct ThreeMfBuildItem {
     pub transform: Option<[f64; 12]>,
 }
 
-/// Full parsed 3MF package: transformed parts, root model resource meshes, and optional project manifest JSON.
+/// Logical build plate entry for 3MF `Metadata/model_settings.config` export.
+#[derive(Debug, Clone)]
+pub struct ThreeMfExportPlate {
+    pub id: u32,
+    pub name: String,
+    /// `(object_id, instance_id)` pairs belonging to this plate.
+    pub instances: Vec<(u32, u32)>,
+}
+
+/// Full parsed 3MF package: transformed parts, root model resource meshes, plates, and optional project JSON.
 #[derive(Debug, Clone)]
 pub struct ThreeMfDocument {
     pub parts: Vec<ThreeMfPart>,
     pub resources: Vec<ThreeMfResourceMesh>,
+    pub plates: Vec<ThreeMfPlateMeta>,
     pub project_json: Option<String>,
 }
 
@@ -354,6 +377,7 @@ pub struct ThreeMfDocument {
 pub struct ThreeMfExportDocument {
     pub resources: Vec<ThreeMfResourceMesh>,
     pub build_items: Vec<ThreeMfBuildItem>,
+    pub plates: Vec<ThreeMfExportPlate>,
     pub project_json: Option<String>,
 }
 
@@ -825,7 +849,226 @@ fn find_root_model_path(archive_files: &HashMap<String, Vec<u8>>) -> Result<Stri
         })
 }
 
-/// Parse a complete 3MF archive into individual transformed parts, resource meshes, and optional project JSON.
+#[derive(Debug, Default)]
+struct ParsedModelSettings {
+    object_names: HashMap<u32, String>,
+    plates: Vec<ThreeMfPlateMeta>,
+    instance_plate: HashMap<(u32, u32), usize>,
+}
+
+fn should_skip_3mf_entry(norm_name: &str) -> bool {
+    if norm_name.starts_with("auxiliaries/") {
+        return true;
+    }
+    [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".ico"]
+        .iter()
+        .any(|ext| norm_name.ends_with(ext))
+}
+
+fn read_metadata_key_value(e: &quick_xml::events::BytesStart<'_>) -> Option<(String, String)> {
+    let mut key = None;
+    let mut value = None;
+    for attr in e.attributes().flatten() {
+        let Some(val) = attr_value_utf8(&attr) else {
+            continue;
+        };
+        match attr.key.local_name().as_ref() {
+            "key" => key = Some(val),
+            "value" => value = Some(val),
+            _ => {}
+        }
+    }
+    Some((key?, value.unwrap_or_default()))
+}
+
+fn parse_model_settings_config(xml: &str) -> Result<ParsedModelSettings, IoError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut out = ParsedModelSettings::default();
+    let mut current_object_id: Option<u32> = None;
+    let mut object_part_depth: usize = 0;
+    let mut in_plate = false;
+    let mut current_plater_id: Option<u32> = None;
+    let mut current_plater_name = String::new();
+    let mut current_instances: Vec<(u32, u32)> = Vec::new();
+    let mut in_model_instance = false;
+    let mut inst_object_id: Option<u32> = None;
+    let mut inst_instance_id: Option<u32> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                "object" => {
+                    object_part_depth = 0;
+                    current_object_id = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| a.key.local_name().as_ref() == "id")
+                        .and_then(|a| attr_value_utf8(&a))
+                        .and_then(|v| v.trim().parse::<u32>().ok());
+                }
+                "part" if current_object_id.is_some() => {
+                    object_part_depth += 1;
+                }
+                "plate" => {
+                    in_plate = true;
+                    current_plater_id = None;
+                    current_plater_name.clear();
+                    current_instances.clear();
+                }
+                "model_instance" if in_plate => {
+                    in_model_instance = true;
+                    inst_object_id = None;
+                    inst_instance_id = None;
+                }
+                "metadata" => {
+                    if let Some((key, val)) = read_metadata_key_value(e) {
+                        apply_model_settings_metadata(
+                            &key,
+                            val,
+                            current_object_id,
+                            object_part_depth,
+                            in_plate,
+                            in_model_instance,
+                            &mut current_plater_id,
+                            &mut current_plater_name,
+                            &mut inst_object_id,
+                            &mut inst_instance_id,
+                            &mut out.object_names,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(ref e)) => {
+                if e.local_name().as_ref() == "metadata"
+                    && let Some((key, val)) = read_metadata_key_value(e)
+                {
+                    apply_model_settings_metadata(
+                        &key,
+                        val,
+                        current_object_id,
+                        object_part_depth,
+                        in_plate,
+                        in_model_instance,
+                        &mut current_plater_id,
+                        &mut current_plater_name,
+                        &mut inst_object_id,
+                        &mut inst_instance_id,
+                        &mut out.object_names,
+                    );
+                } else if e.local_name().as_ref() == "plate" {
+                    let id = u32::try_from(out.plates.len() + 1).unwrap_or(u32::MAX);
+                    out.plates.push(ThreeMfPlateMeta {
+                        id,
+                        name: format!("Plate {id}"),
+                    });
+                }
+            }
+            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
+                "object" => {
+                    current_object_id = None;
+                    object_part_depth = 0;
+                }
+                "part" => {
+                    object_part_depth = object_part_depth.saturating_sub(1);
+                }
+                "model_instance" => {
+                    if in_model_instance && let Some(obj_id) = inst_object_id.take() {
+                        let inst_id = inst_instance_id.take().unwrap_or(0);
+                        current_instances.push((obj_id, inst_id));
+                    }
+                    in_model_instance = false;
+                }
+                "plate" => {
+                    if in_plate
+                        && (current_plater_id.is_some()
+                            || !current_plater_name.trim().is_empty()
+                            || !current_instances.is_empty())
+                    {
+                        let id = current_plater_id.unwrap_or_else(|| {
+                            u32::try_from(out.plates.len() + 1).unwrap_or(u32::MAX)
+                        });
+                        let trimmed = current_plater_name.trim();
+                        let name = if trimmed.is_empty() {
+                            format!("Plate {id}")
+                        } else {
+                            trimmed.to_owned()
+                        };
+                        let plate_idx = out.plates.len();
+                        out.plates.push(ThreeMfPlateMeta { id, name });
+                        for (obj_id, inst_id) in current_instances.drain(..) {
+                            out.instance_plate
+                                .entry((obj_id, inst_id))
+                                .or_insert(plate_idx);
+                        }
+                    }
+                    in_plate = false;
+                    in_model_instance = false;
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(IoError::Malformed3mf(format!(
+                    "XML parse error in {MODEL_SETTINGS_PATH}: {e}"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_model_settings_metadata(
+    key: &str,
+    val: String,
+    current_object_id: Option<u32>,
+    object_part_depth: usize,
+    in_plate: bool,
+    in_model_instance: bool,
+    current_plater_id: &mut Option<u32>,
+    current_plater_name: &mut String,
+    inst_object_id: &mut Option<u32>,
+    inst_instance_id: &mut Option<u32>,
+    object_names: &mut HashMap<u32, String>,
+) {
+    if in_model_instance {
+        match key {
+            "object_id" => *inst_object_id = val.trim().parse::<u32>().ok(),
+            "instance_id" => *inst_instance_id = val.trim().parse::<u32>().ok(),
+            _ => {}
+        }
+        return;
+    }
+    if in_plate {
+        match key {
+            "plater_id" => *current_plater_id = val.trim().parse::<u32>().ok(),
+            "plater_name" => *current_plater_name = val,
+            _ => {}
+        }
+        return;
+    }
+    if let Some(obj_id) = current_object_id
+        && key == "name"
+    {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            if object_part_depth == 0 {
+                object_names.insert(obj_id, trimmed.to_owned());
+            } else {
+                object_names
+                    .entry(obj_id)
+                    .or_insert_with(|| trimmed.to_owned());
+            }
+        }
+    }
+}
+
+/// Parse a complete 3MF archive into individual transformed parts, resource meshes, plates, and optional project JSON.
 pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError> {
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor)
@@ -850,6 +1093,9 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
             .map_err(|e| IoError::Malformed3mf(format!("invalid entry name: {e}")))?
             .into_owned();
         let norm_name = normalize_archive_path(&raw_name);
+        if should_skip_3mf_entry(&norm_name) {
+            continue;
+        }
         let mut buf = Vec::new();
         entry
             .read_to_end(&mut buf)
@@ -861,6 +1107,12 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
     let mut cache: HashMap<String, ParsedModelFile> = HashMap::new();
     let root_model = load_parsed_model(&archive_files, &mut cache, &root_path)?.clone();
 
+    let model_settings = archive_files
+        .get(&normalize_archive_path(MODEL_SETTINGS_PATH))
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .map(parse_model_settings_config)
+        .transpose()?;
+
     let project_json = archive_files
         .get(&normalize_archive_path(LAYERCRAFT_PROJECT_PATH))
         .map(|raw| {
@@ -869,6 +1121,11 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
                 .map_err(|e| IoError::Malformed3mf(format!("UTF-8 error in project JSON: {e}")))
         })
         .transpose()?;
+
+    let mut plates = model_settings
+        .as_ref()
+        .map(|ms| ms.plates.clone())
+        .unwrap_or_default();
 
     let mut resources = Vec::new();
     for obj in root_model.objects.values() {
@@ -889,9 +1146,18 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
             tris.push(Triangle::new(a, b, c));
         }
         if let Ok(mesh) = TriangleMesh::new(tris) {
+            let name = if obj.name.trim().is_empty() {
+                model_settings
+                    .as_ref()
+                    .and_then(|ms| ms.object_names.get(&obj.id))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                obj.name.clone()
+            };
             resources.push(ThreeMfResourceMesh {
                 id: obj.id,
-                name: obj.name.clone(),
+                name,
                 object_type: if obj.object_type.is_empty() {
                     "model".to_owned()
                 } else {
@@ -903,8 +1169,13 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
     }
 
     let mut parts = Vec::new();
+    let mut instance_counts: HashMap<u32, u32> = HashMap::new();
     if !root_model.build_items.is_empty() {
         for (idx, item) in root_model.build_items.iter().enumerate() {
+            let inst_counter = instance_counts.entry(item.object_id).or_insert(0);
+            let instance_id = *inst_counter;
+            *inst_counter += 1;
+
             let target_model = item.path.as_deref().unwrap_or(&root_path);
             let mut tris = Vec::new();
             let obj_name = collect_object_triangles(
@@ -920,15 +1191,30 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
                 continue;
             }
             let mesh = TriangleMesh::new(tris)?;
-            let name = if obj_name.trim().is_empty() {
-                format!("Part {}", idx + 1)
-            } else {
-                obj_name
-            };
+            let config_name = model_settings
+                .as_ref()
+                .and_then(|ms| ms.object_names.get(&item.object_id))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let name = config_name
+                .map(str::to_owned)
+                .or_else(|| (!obj_name.trim().is_empty()).then_some(obj_name))
+                .unwrap_or_else(|| format!("Part {}", idx + 1));
+            let plate_index = model_settings
+                .as_ref()
+                .and_then(|ms| {
+                    ms.instance_plate
+                        .get(&(item.object_id, instance_id))
+                        .copied()
+                })
+                .unwrap_or(0);
             parts.push(ThreeMfPart {
                 name,
                 mesh,
                 item_transform: item.has_explicit_transform.then_some(item.transform.0),
+                object_id: item.object_id,
+                instance_id,
+                plate_index,
             });
         }
     } else {
@@ -951,17 +1237,35 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
                 continue;
             }
             let mesh = TriangleMesh::new(tris)?;
-            let name = if obj_name.trim().is_empty() {
-                format!("Part {}", idx + 1)
-            } else {
-                obj_name
-            };
+            let config_name = model_settings
+                .as_ref()
+                .and_then(|ms| ms.object_names.get(&obj.id))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let name = config_name
+                .map(str::to_owned)
+                .or_else(|| (!obj_name.trim().is_empty()).then_some(obj_name))
+                .unwrap_or_else(|| format!("Part {}", idx + 1));
+            let plate_index = model_settings
+                .as_ref()
+                .and_then(|ms| ms.instance_plate.get(&(obj.id, 0)).copied())
+                .unwrap_or(0);
             parts.push(ThreeMfPart {
                 name,
                 mesh,
                 item_transform: None,
+                object_id: obj.id,
+                instance_id: 0,
+                plate_index,
             });
         }
+    }
+
+    if plates.is_empty() && !parts.is_empty() {
+        plates.push(ThreeMfPlateMeta {
+            id: 1,
+            name: "Plate 1".to_owned(),
+        });
     }
 
     if parts.is_empty() && project_json.is_none() {
@@ -973,6 +1277,7 @@ pub fn read_3mf_document_bytes(bytes: &[u8]) -> Result<ThreeMfDocument, IoError>
     Ok(ThreeMfDocument {
         parts,
         resources,
+        plates,
         project_json,
     })
 }
@@ -1011,13 +1316,24 @@ pub fn write_3mf_document_bytes(doc: &ThreeMfExportDocument) -> Result<Vec<u8>, 
     let mut zip = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    let content_types = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let content_types = if doc.plates.is_empty() {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
   <Default Extension="json" ContentType="application/json"/>
 </Types>
-"#;
+"#
+    } else {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+  <Default Extension="json" ContentType="application/json"/>
+  <Default Extension="config" ContentType="text/xml"/>
+</Types>
+"#
+    };
     zip.start_file("[Content_Types].xml", opts)
         .map_err(|e| IoError::Malformed3mf(format!("zip write error: {e}")))?;
     zip.write_all(content_types.as_bytes())
@@ -1127,6 +1443,43 @@ pub fn write_3mf_document_bytes(doc: &ThreeMfExportDocument) -> Result<Vec<u8>, 
         zip.start_file(LAYERCRAFT_PROJECT_PATH, opts)
             .map_err(|e| IoError::Malformed3mf(format!("zip write error: {e}")))?;
         zip.write_all(project_json.as_bytes())
+            .map_err(|e| IoError::Malformed3mf(format!("zip write error: {e}")))?;
+    }
+
+    if !doc.plates.is_empty() {
+        let mut settings_xml =
+            String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n");
+        for res in &doc.resources {
+            let trimmed = res.name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let escaped = xml_escape(trimmed);
+            let _ = writeln!(
+                settings_xml,
+                "  <object id=\"{}\">\n    <metadata key=\"name\" value=\"{escaped}\"/>\n  </object>",
+                res.id
+            );
+        }
+        for plate in &doc.plates {
+            let escaped_name = xml_escape(&plate.name);
+            let _ = writeln!(
+                settings_xml,
+                "  <plate>\n    <metadata key=\"plater_id\" value=\"{}\"/>\n    <metadata key=\"plater_name\" value=\"{escaped_name}\"/>",
+                plate.id
+            );
+            for &(object_id, instance_id) in &plate.instances {
+                let _ = writeln!(
+                    settings_xml,
+                    "    <model_instance>\n      <metadata key=\"object_id\" value=\"{object_id}\"/>\n      <metadata key=\"instance_id\" value=\"{instance_id}\"/>\n    </model_instance>"
+                );
+            }
+            settings_xml.push_str("  </plate>\n");
+        }
+        settings_xml.push_str("</config>\n");
+        zip.start_file(MODEL_SETTINGS_PATH, opts)
+            .map_err(|e| IoError::Malformed3mf(format!("zip write error: {e}")))?;
+        zip.write_all(settings_xml.as_bytes())
             .map_err(|e| IoError::Malformed3mf(format!("zip write error: {e}")))?;
     }
 
@@ -1438,6 +1791,7 @@ mod tests {
                     ]),
                 },
             ],
+            plates: Vec::new(),
             project_json: Some("{\"format_version\":1}".to_owned()),
         };
 
@@ -1445,6 +1799,8 @@ mod tests {
         let doc_in = read_3mf_document_bytes(&bytes).unwrap();
         assert_eq!(doc_in.parts.len(), 2);
         assert_eq!(doc_in.resources.len(), 3);
+        assert_eq!(doc_in.plates.len(), 1);
+        assert_eq!(doc_in.plates[0].name, "Plate 1");
         assert_eq!(doc_in.parts[0].name, "Block & <One>");
         assert_eq!(doc_in.resources[2].object_type, "other");
         assert_eq!(
@@ -1454,5 +1810,151 @@ mod tests {
         let bb0 = doc_in.parts[0].mesh.aabb().unwrap();
         assert!((bb0.min.x - 40.0).abs() < 1e-5);
         assert!((bb0.min.y - 50.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn three_mf_multiplate_model_settings_parses_plates_and_object_names() {
+        let model = r#"<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="2" type="model">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>
+          <vertex x="10" y="10" z="0"/><vertex x="0" y="10" z="0"/>
+          <vertex x="0" y="0" z="10"/><vertex x="10" y="0" z="10"/>
+          <vertex x="10" y="10" z="10"/><vertex x="0" y="10" z="10"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+    <object id="9" type="model">
+      <mesh>
+        <vertices>
+          <vertex x="0" y="0" z="0"/><vertex x="12" y="0" z="0"/>
+          <vertex x="12" y="12" z="0"/><vertex x="0" y="12" z="0"/>
+          <vertex x="0" y="0" z="12"/><vertex x="12" y="0" z="12"/>
+          <vertex x="12" y="12" z="12"/><vertex x="0" y="12" z="12"/>
+        </vertices>
+        <triangles>
+          <triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="3" v3="2"/>
+          <triangle v1="4" v2="5" v3="6"/><triangle v1="4" v2="6" v3="7"/>
+          <triangle v1="0" v2="1" v3="5"/><triangle v1="0" v2="5" v3="4"/>
+          <triangle v1="1" v2="2" v3="6"/><triangle v1="1" v2="6" v3="5"/>
+          <triangle v1="2" v2="3" v3="7"/><triangle v1="2" v2="7" v3="6"/>
+          <triangle v1="3" v2="0" v3="4"/><triangle v1="3" v2="4" v3="7"/>
+        </triangles>
+      </mesh>
+    </object>
+  </resources>
+  <build>
+    <item objectid="2" transform="1 0 0 0 1 0 0 0 1 125 125 0"/>
+    <item objectid="9" transform="1 0 0 0 1 0 0 0 1 435 125 0"/>
+    <item objectid="9" transform="1 0 0 0 1 0 0 0 1 435 -180 0"/>
+  </build>
+</model>"#;
+        let settings = r#"<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="2">
+    <metadata key="name" value="01_Base.stl"/>
+    <part id="1"><metadata key="name" value="inner_part"/></part>
+  </object>
+  <object id="9">
+    <metadata key="name" value="04_Bolt.stl"/>
+  </object>
+  <plate>
+    <metadata key="plater_id" value="1"/>
+    <metadata key="plater_name" value="Base Plate"/>
+    <model_instance>
+      <metadata key="object_id" value="2"/>
+      <metadata key="instance_id" value="0"/>
+    </model_instance>
+  </plate>
+  <plate>
+    <metadata key="plater_id" value="2"/>
+    <metadata key="plater_name" value=""/>
+    <model_instance>
+      <metadata key="object_id" value="9"/>
+      <metadata key="instance_id" value="0"/>
+    </model_instance>
+    <model_instance>
+      <metadata key="object_id" value="9"/>
+      <metadata key="instance_id" value="1"/>
+    </model_instance>
+  </plate>
+</config>"#;
+        let bytes = make_zip(&[
+            ("3D/3dmodel.model", model),
+            ("Metadata/model_settings.config", settings),
+            ("Auxiliaries/thumb.png", "not_actually_parsed"),
+        ]);
+        let doc = read_3mf_document_bytes(&bytes).unwrap();
+        assert_eq!(doc.plates.len(), 2);
+        assert_eq!(doc.plates[0].name, "Base Plate");
+        assert_eq!(doc.plates[1].name, "Plate 2");
+        assert_eq!(doc.parts.len(), 3);
+        assert_eq!(doc.parts[0].name, "01_Base.stl");
+        assert_eq!(doc.parts[0].plate_index, 0);
+        assert_eq!(doc.parts[1].name, "04_Bolt.stl");
+        assert_eq!(doc.parts[1].instance_id, 0);
+        assert_eq!(doc.parts[1].plate_index, 1);
+        assert_eq!(doc.parts[2].name, "04_Bolt.stl");
+        assert_eq!(doc.parts[2].instance_id, 1);
+        assert_eq!(doc.parts[2].plate_index, 1);
+
+        // Also test multi-plate export & reload roundtrip.
+        let export = ThreeMfExportDocument {
+            resources: vec![
+                ThreeMfResourceMesh {
+                    id: 2,
+                    name: doc.parts[0].name.clone(),
+                    object_type: "model".to_owned(),
+                    mesh: unit_cube_mesh(10.0),
+                },
+                ThreeMfResourceMesh {
+                    id: 9,
+                    name: doc.parts[1].name.clone(),
+                    object_type: "model".to_owned(),
+                    mesh: unit_cube_mesh(12.0),
+                },
+            ],
+            build_items: vec![
+                ThreeMfBuildItem {
+                    object_id: 2,
+                    transform: None,
+                },
+                ThreeMfBuildItem {
+                    object_id: 9,
+                    transform: None,
+                },
+            ],
+            plates: vec![
+                ThreeMfExportPlate {
+                    id: 1,
+                    name: "Base Plate".to_owned(),
+                    instances: vec![(2, 0)],
+                },
+                ThreeMfExportPlate {
+                    id: 2,
+                    name: "Bolts".to_owned(),
+                    instances: vec![(9, 0)],
+                },
+            ],
+            project_json: None,
+        };
+        let re_bytes = write_3mf_document_bytes(&export).unwrap();
+        let re_doc = read_3mf_document_bytes(&re_bytes).unwrap();
+        assert_eq!(re_doc.plates.len(), 2);
+        assert_eq!(re_doc.plates[0].name, "Base Plate");
+        assert_eq!(re_doc.plates[1].name, "Bolts");
+        assert_eq!(re_doc.parts[0].plate_index, 0);
+        assert_eq!(re_doc.parts[1].plate_index, 1);
     }
 }

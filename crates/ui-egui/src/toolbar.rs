@@ -263,6 +263,119 @@ pub fn draw_ribbon_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
     );
 }
 
+/// Compact build plate switcher strip shown whenever the project has multiple plates.
+pub fn draw_plates_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    if app.session.plate_count() <= 1 {
+        return;
+    }
+    let plates = app.session.list_plates();
+    let mut select_idx: Option<usize> = None;
+    let mut add_requested = false;
+
+    let resp = egui::Panel::top("layercraft_plates_bar")
+        .frame(
+            egui::Frame::NONE
+                .fill(p.bg_chrome)
+                .inner_margin(Margin::symmetric(12, 3)),
+        )
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("layercraft_plates_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(22.0);
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(RichText::new("Plates:").size(11.0).color(p.text_muted));
+
+                        for plate in &plates {
+                            let label = format!(
+                                "{}. {} ({})",
+                                plate.index + 1,
+                                plate.name,
+                                plate.object_count
+                            );
+                            let fill = if plate.active {
+                                p.accent_muted
+                            } else {
+                                p.bg_card
+                            };
+                            let stroke = if plate.active {
+                                Stroke::new(1.0, p.accent)
+                            } else {
+                                Stroke::new(1.0, p.border_subtle)
+                            };
+                            let text_col = if plate.active {
+                                p.text_primary
+                            } else {
+                                p.text_secondary
+                            };
+                            let btn_resp = egui::Frame::new()
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(CornerRadius::same(5))
+                                .inner_margin(Margin::symmetric(8, 2))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        if plate.sliced {
+                                            let (dot_r, _) = ui.allocate_exact_size(
+                                                vec2(6.0, 12.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(
+                                                dot_r.center(),
+                                                2.5,
+                                                p.success,
+                                            );
+                                        }
+                                        ui.label(
+                                            RichText::new(&label)
+                                                .size(11.5)
+                                                .strong()
+                                                .color(text_col),
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if btn_resp
+                                .on_hover_text(format!(
+                                    "Switch to `{}` ({} object(s){})",
+                                    plate.name,
+                                    plate.object_count,
+                                    if plate.sliced { ", sliced" } else { "" }
+                                ))
+                                .clicked()
+                                && !plate.active
+                            {
+                                select_idx = Some(plate.index);
+                            }
+                        }
+
+                        if icon_button(ui, p, Icon::AddPlus, "Add new empty build plate", false)
+                            .clicked()
+                        {
+                            add_requested = true;
+                        }
+                    });
+                });
+        })
+        .response;
+
+    let r = resp.rect;
+    ui.painter().line_segment(
+        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+        Stroke::new(1.0, p.border_subtle),
+    );
+
+    if let Some(idx) = select_idx {
+        app.select_plate(idx);
+    } else if add_requested {
+        app.add_plate(None);
+    }
+}
+
 fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
     #[cfg(not(target_arch = "wasm32"))]
     {

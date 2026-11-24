@@ -12,7 +12,8 @@ use crate::LayerCraftApp;
 use crate::icons::{Icon, paint_icon};
 use crate::theme::ThemePalette;
 use crate::ui_kit::{
-    badge, card, setting_row, small_icon_button, toggle_switch, unit_drag, xy_row, xyz_row,
+    badge, card, secondary_button, setting_row, small_icon_button, toggle_switch, unit_drag,
+    xy_row, xyz_row,
 };
 
 /// Settings and Plate Outliner sidebar tabs.
@@ -288,6 +289,122 @@ fn draw_tab_strip(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) 
 }
 
 fn draw_plate_tab(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    // 0. Build Plates Card
+    let plates = app.session.list_plates();
+    let active_plate_idx = app.session.active_plate_index();
+    let active_plate_id = app.session.active_plate_id();
+    let active_plate_name = app.session.active_plate_name().to_owned();
+    if app.plate_rename_buf.0 != active_plate_id {
+        app.plate_rename_buf = (active_plate_id, active_plate_name.clone());
+    }
+
+    let mut select_plate_idx: Option<usize> = None;
+    let mut remove_plate_idx: Option<usize> = None;
+    let mut add_plate_clicked = false;
+    let mut commit_rename: Option<String> = None;
+
+    card(ui, p, Some("Build Plates"), |ui| {
+        for plate in &plates {
+            ui.horizontal(|ui| {
+                let row_bg = if plate.active {
+                    p.accent_muted
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let row_stroke = if plate.active {
+                    Stroke::new(1.0, p.accent)
+                } else {
+                    Stroke::new(1.0, p.border_subtle)
+                };
+                let row_resp = egui::Frame::new()
+                    .fill(row_bg)
+                    .stroke(row_stroke)
+                    .corner_radius(CornerRadius::same(5))
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.set_width((ui.available_width() - 28.0).max(80.0));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{}. {}", plate.index + 1, plate.name))
+                                    .size(12.0)
+                                    .color(if plate.active {
+                                        p.text_primary
+                                    } else {
+                                        p.text_secondary
+                                    }),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                badge(
+                                    ui,
+                                    p.bg_input,
+                                    p.text_muted,
+                                    &format!("{} obj", plate.object_count),
+                                );
+                                if plate.sliced {
+                                    badge(ui, p.accent_muted, p.success, "sliced");
+                                }
+                            });
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if row_resp.clicked() && !plate.active {
+                    select_plate_idx = Some(plate.index);
+                }
+
+                ui.add_enabled_ui(plates.len() > 1, |ui| {
+                    if small_icon_button(ui, p, Icon::Trash, "Remove build plate").clicked() {
+                        remove_plate_idx = Some(plate.index);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Name:").size(11.5).color(p.text_secondary));
+            let edit_resp = ui.add(
+                egui::TextEdit::singleline(&mut app.plate_rename_buf.1)
+                    .desired_width((ui.available_width() - 102.0).max(60.0)),
+            );
+            if !edit_resp.has_focus()
+                && app.plate_rename_buf.0 == active_plate_id
+                && app.plate_rename_buf.1 != active_plate_name
+                && !edit_resp.lost_focus()
+            {
+                app.plate_rename_buf.1 = active_plate_name.clone();
+            }
+            let enter = edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if enter || (edit_resp.lost_focus() && app.plate_rename_buf.1 != active_plate_name) {
+                commit_rename = Some(app.plate_rename_buf.1.clone());
+            }
+            if secondary_button(ui, p, Some(Icon::AddPlus), "Plate")
+                .on_hover_text("Add a new empty build plate")
+                .clicked()
+            {
+                add_plate_clicked = true;
+            }
+        });
+    });
+
+    if let Some(new_name) = commit_rename {
+        let trimmed = new_name.trim();
+        if !trimmed.is_empty() && trimmed != active_plate_name {
+            app.rename_plate(active_plate_idx, trimmed);
+        }
+        app.plate_rename_buf = (
+            app.session.active_plate_id(),
+            app.session.active_plate_name().to_owned(),
+        );
+    }
+    if add_plate_clicked {
+        app.add_plate(None);
+    } else if let Some(idx) = remove_plate_idx {
+        app.remove_plate(idx);
+    } else if let Some(idx) = select_plate_idx {
+        app.select_plate(idx);
+    }
+
     let entries: Vec<(u64, String, layercraft_mesh::ObjectTransform)> = app
         .session
         .objects

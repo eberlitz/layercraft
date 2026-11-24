@@ -64,6 +64,9 @@ enum Cmd {
         filament: Option<String>,
         #[arg(long)]
         process: Option<String>,
+        /// Build plate to select for multi-plate .3mf files (1-based plate number or plate name).
+        #[arg(long, value_name = "PLATE")]
+        plate: Option<String>,
     },
     /// List available machine, filament, and process JSON profiles.
     Profiles {
@@ -104,6 +107,9 @@ enum Cmd {
         width: u32,
         #[arg(long, default_value_t = 600)]
         height: u32,
+        /// Build plate to select for multi-plate .3mf files (1-based plate number or plate name).
+        #[arg(long, value_name = "PLATE")]
+        plate: Option<String>,
     },
     /// Run the LayerCraft MCP JSON-RPC 2.0 server over stdio.
     Mcp {
@@ -221,6 +227,7 @@ fn run(cli: Cli) -> Result<(), String> {
             machine,
             filament,
             process,
+            plate,
         } => {
             let is_3mf = input
                 .extension()
@@ -241,6 +248,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     serde_json::json!({ "path": in_str }),
                 )
                 .map_err(|e| format!("{}: {e}", input.display()))?;
+                select_cli_plate(&mut session, plate.as_deref())?;
 
                 if let Some(cfg_path) = &config {
                     let txt = std::fs::read_to_string(cfg_path)
@@ -383,25 +391,56 @@ fn run(cli: Cli) -> Result<(), String> {
             single_layer,
             width,
             height,
+            plate,
         } => {
-            let cfg = PrintConfig::default();
-            let raw_mesh =
-                read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
-            let prepared = prepare_for_plate(
-                &raw_mesh,
-                cfg.machine.bed_width_mm,
-                cfg.machine.bed_depth_mm,
-            )
-            .map_err(|e| e.to_string())?;
+            let is_3mf = input
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"));
             let render_mode = match mode {
                 CliRenderMode::Plate => RenderMode::Plate,
                 CliRenderMode::Preview => RenderMode::Preview,
                 CliRenderMode::LayerTopdown => RenderMode::LayerTopDown,
             };
-            let sliced = if render_mode == RenderMode::Plate {
-                None
+            let (prepared, cfg, sliced) = if is_3mf {
+                let mut session = Session::default();
+                let in_str = input.to_string_lossy().into_owned();
+                execute(
+                    &mut session,
+                    "project.load_file",
+                    serde_json::json!({ "path": in_str }),
+                )
+                .map_err(|e| format!("{}: {e}", input.display()))?;
+                select_cli_plate(&mut session, plate.as_deref())?;
+                let sliced = if render_mode == RenderMode::Plate {
+                    None
+                } else {
+                    Some(slice_with_config(&session, &session.config).map_err(|e| e.to_string())?)
+                };
+                let prepared = session
+                    .prepared_mesh
+                    .or(session.mesh)
+                    .ok_or_else(|| format!("{}: no mesh on selected plate", input.display()))?;
+                (prepared, session.config, sliced)
             } else {
-                Some(slice_single_mesh(&prepared, &cfg).map_err(|e| e.to_string())?)
+                if plate.is_some() {
+                    return Err("--plate is only supported when rendering `.3mf` inputs".to_owned());
+                }
+                let cfg = PrintConfig::default();
+                let raw_mesh =
+                    read_mesh_file(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+                let prepared = prepare_for_plate(
+                    &raw_mesh,
+                    cfg.machine.bed_width_mm,
+                    cfg.machine.bed_depth_mm,
+                )
+                .map_err(|e| e.to_string())?;
+                let sliced = if render_mode == RenderMode::Plate {
+                    None
+                } else {
+                    Some(slice_single_mesh(&prepared, &cfg).map_err(|e| e.to_string())?)
+                };
+                (prepared, cfg, sliced)
             };
             let camera_preset = match camera {
                 CliCamera::Isometric => CameraPreset::Isometric,
@@ -512,4 +551,45 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn select_cli_plate(session: &mut Session, plate_arg: Option<&str>) -> Result<(), String> {
+    let Some(spec) = plate_arg.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if execute(
+        session,
+        "plates.select",
+        serde_json::json!({ "name": spec }),
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    if let Ok(num) = spec.parse::<usize>()
+        && num >= 1
+    {
+        if num - 1 < session.plate_count()
+            && execute(
+                session,
+                "plates.select",
+                serde_json::json!({ "index": num - 1 }),
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if execute(session, "plates.select", serde_json::json!({ "id": num })).is_ok() {
+            return Ok(());
+        }
+    }
+    let available: Vec<String> = session
+        .list_plates()
+        .into_iter()
+        .map(|p| format!("{}: {}", p.index + 1, p.name))
+        .collect();
+    Err(format!(
+        "plate `{spec}` not found; available plates: [{}]",
+        available.join(", ")
+    ))
 }

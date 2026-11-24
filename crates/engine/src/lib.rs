@@ -14,8 +14,9 @@ use layercraft_gcode::{
 };
 use layercraft_geom::{Aabb3, GeomError, TriangleMesh};
 use layercraft_io::{
-    IoError, ThreeMfBuildItem, ThreeMfDocument, ThreeMfExportDocument, ThreeMfResourceMesh,
-    read_3mf_document_bytes, read_stl_bytes, write_3mf_document_bytes,
+    IoError, ThreeMfBuildItem, ThreeMfDocument, ThreeMfExportDocument, ThreeMfExportPlate,
+    ThreeMfPart, ThreeMfResourceMesh, read_3mf_document_bytes, read_stl_bytes,
+    write_3mf_document_bytes,
 };
 use layercraft_mesh::{
     MeshError, MeshInspection, ModifierPrimitive, ModifierTransform, ObjectTransform, SampleShape,
@@ -49,6 +50,8 @@ pub enum EngineError {
     ObjectNotFound(u64),
     #[error("plate modifier id {0} not found")]
     ModifierNotFound(u64),
+    #[error("build plate {0} not found")]
+    PlateNotFound(String),
     #[error("plate has not been sliced yet")]
     NotSliced,
     #[error("layer index {index} out of range (plate has {count} layers)")]
@@ -160,6 +163,55 @@ pub struct PlateModifierInfo {
 const MAX_UNDO_HISTORY: usize = 50;
 const PROJECT_FORMAT_VERSION: u32 = 1;
 
+/// Public serializable summary of one logical build plate in a multi-plate session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PlateSummary {
+    pub id: u32,
+    pub index: usize,
+    pub name: String,
+    pub active: bool,
+    pub object_count: usize,
+    pub modifier_count: usize,
+    pub sliced: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StoredPlate {
+    id: u32,
+    name: String,
+    objects: Vec<PlateObjectEntry>,
+    modifiers: Vec<PlateModifierEntry>,
+    mesh: Option<TriangleMesh>,
+    prepared_mesh: Option<TriangleMesh>,
+    sliced: Option<SlicedPlate>,
+    last_gcode: Option<GcodeOutput>,
+}
+
+impl StoredPlate {
+    fn empty(id: u32, name: String) -> Self {
+        Self {
+            id,
+            name,
+            objects: Vec::new(),
+            modifiers: Vec::new(),
+            mesh: None,
+            prepared_mesh: None,
+            sliced: None,
+            last_gcode: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredPlateSnapshot {
+    id: u32,
+    name: String,
+    objects: Vec<PlateObjectEntry>,
+    modifiers: Vec<PlateModifierEntry>,
+    mesh: Option<TriangleMesh>,
+    prepared_mesh: Option<TriangleMesh>,
+}
+
 #[derive(Debug, Clone)]
 struct SessionSnapshot {
     label: String,
@@ -171,6 +223,9 @@ struct SessionSnapshot {
     next_modifier_id: u64,
     mesh: Option<TriangleMesh>,
     prepared_mesh: Option<TriangleMesh>,
+    plate_slots: Vec<StoredPlateSnapshot>,
+    active_plate_idx: usize,
+    next_plate_id: u32,
 }
 
 /// Summary of the bounded session undo/redo history stacks.
@@ -211,6 +266,9 @@ pub struct Session {
     pub prepared_mesh: Option<TriangleMesh>,
     pub sliced: Option<SlicedPlate>,
     pub last_gcode: Option<GcodeOutput>,
+    plate_slots: Vec<StoredPlate>,
+    active_plate_idx: usize,
+    next_plate_id: u32,
     undo_stack: Vec<SessionSnapshot>,
     redo_stack: Vec<SessionSnapshot>,
     suppress_undo_capture: bool,
@@ -230,6 +288,9 @@ impl Default for Session {
             prepared_mesh: None,
             sliced: None,
             last_gcode: None,
+            plate_slots: vec![StoredPlate::empty(1, "Plate 1".to_owned())],
+            active_plate_idx: 0,
+            next_plate_id: 2,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             suppress_undo_capture: false,
@@ -238,7 +299,173 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Total number of logical build plates in this session (always at least 1).
+    pub fn plate_count(&self) -> usize {
+        self.plate_slots.len()
+    }
+
+    /// Zero-based index of the currently active build plate.
+    pub fn active_plate_index(&self) -> usize {
+        self.active_plate_idx
+    }
+
+    /// Persistent numeric ID of the currently active build plate.
+    pub fn active_plate_id(&self) -> u32 {
+        self.plate_slots
+            .get(self.active_plate_idx)
+            .map(|p| p.id)
+            .unwrap_or(1)
+    }
+
+    /// Display name of the currently active build plate.
+    pub fn active_plate_name(&self) -> &str {
+        self.plate_slots
+            .get(self.active_plate_idx)
+            .map(|p| p.name.as_str())
+            .unwrap_or("Plate 1")
+    }
+
+    fn plate_summary_at(&self, index: usize) -> Option<PlateSummary> {
+        let slot = self.plate_slots.get(index)?;
+        let active = index == self.active_plate_idx;
+        let (object_count, modifier_count, sliced) = if active {
+            (
+                self.objects.len(),
+                self.modifiers.len(),
+                self.sliced.is_some(),
+            )
+        } else {
+            (
+                slot.objects.len(),
+                slot.modifiers.len(),
+                slot.sliced.is_some(),
+            )
+        };
+        Some(PlateSummary {
+            id: slot.id,
+            index,
+            name: slot.name.clone(),
+            active,
+            object_count,
+            modifier_count,
+            sliced,
+        })
+    }
+
+    /// Summarize all build plates in this session in plate order.
+    pub fn list_plates(&self) -> Vec<PlateSummary> {
+        (0..self.plate_slots.len())
+            .filter_map(|i| self.plate_summary_at(i))
+            .collect()
+    }
+
+    fn swap_slot_with_live(&mut self, slot_idx: usize) {
+        if let Some(slot) = self.plate_slots.get_mut(slot_idx) {
+            std::mem::swap(&mut slot.objects, &mut self.objects);
+            std::mem::swap(&mut slot.modifiers, &mut self.modifiers);
+            std::mem::swap(&mut slot.mesh, &mut self.mesh);
+            std::mem::swap(&mut slot.prepared_mesh, &mut self.prepared_mesh);
+            std::mem::swap(&mut slot.sliced, &mut self.sliced);
+            std::mem::swap(&mut slot.last_gcode, &mut self.last_gcode);
+        }
+    }
+
+    /// Switch the active build plate in O(1) time without cloning meshes or discarding cached slices.
+    pub fn select_plate(&mut self, index: usize) -> Result<PlateSummary, EngineError> {
+        if index >= self.plate_slots.len() {
+            return Err(EngineError::PlateNotFound(format!("index {index}")));
+        }
+        if index != self.active_plate_idx {
+            let prev_idx = self.active_plate_idx;
+            self.swap_slot_with_live(prev_idx);
+            self.swap_slot_with_live(index);
+            self.active_plate_idx = index;
+        }
+        self.plate_summary_at(index)
+            .ok_or_else(|| EngineError::PlateNotFound(format!("index {index}")))
+    }
+
+    /// Append a new empty build plate, optionally selecting it as active.
+    pub fn add_plate(
+        &mut self,
+        name: Option<&str>,
+        select: bool,
+    ) -> Result<PlateSummary, EngineError> {
+        let id = if self.next_plate_id == 0 {
+            1
+        } else {
+            self.next_plate_id
+        };
+        self.next_plate_id = id + 1;
+        let plate_name = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Plate {id}"));
+        self.plate_slots.push(StoredPlate::empty(id, plate_name));
+        let new_idx = self.plate_slots.len() - 1;
+        if select {
+            self.select_plate(new_idx)
+        } else {
+            self.plate_summary_at(new_idx)
+                .ok_or_else(|| EngineError::PlateNotFound(format!("index {new_idx}")))
+        }
+    }
+
+    /// Rename an existing build plate by zero-based index.
+    pub fn rename_plate(&mut self, index: usize, name: &str) -> Result<PlateSummary, EngineError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidArgument {
+                field: "name",
+                reason: "plate name must not be empty",
+            });
+        }
+        let slot = self
+            .plate_slots
+            .get_mut(index)
+            .ok_or_else(|| EngineError::PlateNotFound(format!("index {index}")))?;
+        slot.name = trimmed.to_owned();
+        self.plate_summary_at(index)
+            .ok_or_else(|| EngineError::PlateNotFound(format!("index {index}")))
+    }
+
+    /// Remove a build plate (at least one plate always remains), switching away first if active.
+    pub fn remove_plate(&mut self, index: usize) -> Result<PlateSummary, EngineError> {
+        if self.plate_slots.len() <= 1 {
+            return Err(EngineError::InvalidArgument {
+                field: "plate",
+                reason: "cannot remove the only build plate",
+            });
+        }
+        if index >= self.plate_slots.len() {
+            return Err(EngineError::PlateNotFound(format!("index {index}")));
+        }
+        if index == self.active_plate_idx {
+            let next_idx = if index > 0 { index - 1 } else { 1 };
+            let _ = self.select_plate(next_idx)?;
+        }
+        self.plate_slots.remove(index);
+        if self.active_plate_idx > index {
+            self.active_plate_idx -= 1;
+        }
+        self.plate_summary_at(self.active_plate_idx)
+            .ok_or_else(|| EngineError::PlateNotFound(format!("index {}", self.active_plate_idx)))
+    }
+
     fn capture_snapshot(&self, label: impl Into<String>) -> SessionSnapshot {
+        let plate_slots = self
+            .plate_slots
+            .iter()
+            .map(|p| StoredPlateSnapshot {
+                id: p.id,
+                name: p.name.clone(),
+                objects: p.objects.clone(),
+                modifiers: p.modifiers.clone(),
+                mesh: p.mesh.clone(),
+                prepared_mesh: p.prepared_mesh.clone(),
+            })
+            .collect();
         SessionSnapshot {
             label: label.into(),
             config: self.config.clone(),
@@ -249,6 +476,9 @@ impl Session {
             next_modifier_id: self.next_modifier_id,
             mesh: self.mesh.clone(),
             prepared_mesh: self.prepared_mesh.clone(),
+            plate_slots,
+            active_plate_idx: self.active_plate_idx,
+            next_plate_id: self.next_plate_id,
         }
     }
 
@@ -261,6 +491,27 @@ impl Session {
         self.next_modifier_id = snap.next_modifier_id;
         self.mesh = snap.mesh;
         self.prepared_mesh = snap.prepared_mesh;
+        self.plate_slots = if snap.plate_slots.is_empty() {
+            vec![StoredPlate::empty(1, "Plate 1".to_owned())]
+        } else {
+            snap.plate_slots
+                .into_iter()
+                .map(|p| StoredPlate {
+                    id: p.id,
+                    name: p.name,
+                    objects: p.objects,
+                    modifiers: p.modifiers,
+                    mesh: p.mesh,
+                    prepared_mesh: p.prepared_mesh,
+                    sliced: None,
+                    last_gcode: None,
+                })
+                .collect()
+        };
+        self.active_plate_idx = snap
+            .active_plate_idx
+            .min(self.plate_slots.len().saturating_sub(1));
+        self.next_plate_id = snap.next_plate_id.max(2);
         self.sliced = None;
         self.last_gcode = None;
     }
@@ -731,12 +982,59 @@ pub struct ProjectExportBytesResult {
     pub modifier_count: usize,
 }
 
+/// Parameters for selecting the active build plate (`plates.select`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SelectPlateParams {
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Parameters for adding a new empty build plate (`plates.add`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AddPlateParams {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_true")]
+    pub select: bool,
+}
+
+/// Parameters for renaming an existing build plate (`plates.rename`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RenamePlateParams {
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub name_match: Option<String>,
+    pub name: String,
+}
+
+/// Parameters for removing a build plate (`plates.remove`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RemovePlateParams {
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Summary returned by `project.load_3mf_bytes` and `project.load_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectLoadResult {
     pub is_layercraft_project: bool,
     pub object_count: usize,
     pub modifier_count: usize,
+    #[serde(default)]
+    pub plate_count: usize,
+    #[serde(default)]
+    pub active_plate_id: u32,
     pub active_profiles: ActiveProfiles,
 }
 
@@ -783,14 +1081,28 @@ struct ProjectModifierRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectPlateRecord {
+    id: u32,
+    name: String,
+    objects: Vec<ProjectObjectRecord>,
+    #[serde(default)]
+    modifiers: Vec<ProjectModifierRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LayerCraftProjectManifest {
     format_version: u32,
     config: PrintConfig,
     #[serde(default)]
     active_profiles: ActiveProfiles,
+    #[serde(default)]
     objects: Vec<ProjectObjectRecord>,
     #[serde(default)]
     modifiers: Vec<ProjectModifierRecord>,
+    #[serde(default)]
+    plates: Vec<ProjectPlateRecord>,
+    #[serde(default)]
+    active_plate_id: Option<u32>,
 }
 
 /// List compact command names and one-line summaries (optionally filtered by prefix).
@@ -1016,6 +1328,36 @@ pub fn command_registry() -> Vec<CommandDescriptor> {
             params_schema: schema_val::<LoadProject3mfBytesParams>(),
             result_schema: schema_val::<ProjectLoadResult>(),
         },
+        CommandDescriptor {
+            name: "plates.list",
+            summary: "List all logical build plates in the session with object/modifier/slice status.",
+            params_schema: schema_val::<EmptyParams>(),
+            result_schema: schema_val::<Vec<PlateSummary>>(),
+        },
+        CommandDescriptor {
+            name: "plates.select",
+            summary: "Switch the active build plate by zero-based index, numeric id, or plate name.",
+            params_schema: schema_val::<SelectPlateParams>(),
+            result_schema: schema_val::<PlateSummary>(),
+        },
+        CommandDescriptor {
+            name: "plates.add",
+            summary: "Add a new empty build plate to the project and optionally switch to it.",
+            params_schema: schema_val::<AddPlateParams>(),
+            result_schema: schema_val::<PlateSummary>(),
+        },
+        CommandDescriptor {
+            name: "plates.rename",
+            summary: "Rename an existing build plate (defaults to the active plate when selector is omitted).",
+            params_schema: schema_val::<RenamePlateParams>(),
+            result_schema: schema_val::<PlateSummary>(),
+        },
+        CommandDescriptor {
+            name: "plates.remove",
+            summary: "Remove a build plate by index, id, or name (at least one plate must remain).",
+            params_schema: schema_val::<RemovePlateParams>(),
+            result_schema: schema_val::<PlateSummary>(),
+        },
     ];
     #[cfg(not(target_arch = "wasm32"))]
     cmds.push(CommandDescriptor {
@@ -1159,32 +1501,15 @@ fn add_plate_object(
     rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
 }
 
-fn add_3mf_document_objects(
-    session: &mut Session,
-    doc: ThreeMfDocument,
-    name_override: Option<String>,
-    append: bool,
-) -> Result<MeshInspection, EngineError> {
-    let mut parts = doc.parts;
+fn build_centered_plate_objects(
+    parts: Vec<ThreeMfPart>,
+    next_object_id: &mut u64,
+    bed_width_mm: f64,
+    bed_depth_mm: f64,
+) -> Result<Vec<PlateObjectEntry>, EngineError> {
     if parts.is_empty() {
-        return Err(EngineError::NoMeshLoaded);
+        return Ok(Vec::new());
     }
-    if parts.len() == 1
-        && let Some(part) = parts.pop()
-    {
-        let label = name_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .unwrap_or(part.name);
-        return add_plate_object(session, label, part.mesh, append);
-    }
-
-    if !append {
-        session.objects.clear();
-    }
-
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
@@ -1203,40 +1528,170 @@ fn add_3mf_document_objects(
         part_entries.push((part.name, part.mesh, [c.x, c.y]));
     }
     if part_entries.is_empty() {
-        return Err(EngineError::NoMeshLoaded);
+        return Ok(Vec::new());
     }
 
     let group_cx = 0.5 * (min_x + max_x);
     let group_cy = 0.5 * (min_y + max_y);
-    let shift_x = 0.5 * session.config.machine.bed_width_mm - group_cx;
-    let shift_y = 0.5 * session.config.machine.bed_depth_mm - group_cy;
+    let shift_x = 0.5 * bed_width_mm - group_cx;
+    let shift_y = 0.5 * bed_depth_mm - group_cy;
 
-    for (name, raw_mesh, center_xy) in part_entries {
-        let id = if session.next_object_id == 0 {
+    let mut entries = Vec::with_capacity(part_entries.len());
+    for (name, raw_mesh, [cx, cy]) in part_entries {
+        let id = if *next_object_id == 0 {
             1
         } else {
-            session.next_object_id
+            *next_object_id
         };
-        session.next_object_id = id + 1;
+        *next_object_id = id + 1;
         let transform = ObjectTransform {
-            position_xy_mm: [center_xy[0] + shift_x, center_xy[1] + shift_y],
+            position_xy_mm: [cx + shift_x, cy + shift_y],
             rotation_deg: [0.0, 0.0, 0.0],
             scale: [1.0, 1.0, 1.0],
         };
-        let prepared = prepare_transformed_object(&raw_mesh, transform)?;
-        session.objects.push(PlateObjectEntry {
+        let prepared_mesh = prepare_transformed_object(&raw_mesh, transform)?;
+        entries.push(PlateObjectEntry {
             id,
             name,
             raw_mesh,
             transform,
-            prepared_mesh: prepared,
+            prepared_mesh,
+        });
+    }
+    Ok(entries)
+}
+
+fn add_3mf_document_objects(
+    session: &mut Session,
+    doc: ThreeMfDocument,
+    name_override: Option<String>,
+    append: bool,
+) -> Result<MeshInspection, EngineError> {
+    let mut parts = doc.parts;
+    let plates_meta = doc.plates;
+    if parts.is_empty() {
+        return Err(EngineError::NoMeshLoaded);
+    }
+
+    let is_single_plate_single_part = plates_meta.len() <= 1 && parts.len() == 1;
+    if (append && parts.len() == 1) || (is_single_plate_single_part && !append) {
+        if is_single_plate_single_part && !append {
+            session.plate_slots = vec![StoredPlate::empty(
+                plates_meta.first().map(|p| p.id).unwrap_or(1),
+                plates_meta
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Plate 1".to_owned()),
+            )];
+            session.active_plate_idx = 0;
+            session.next_plate_id = session
+                .plate_slots
+                .first()
+                .map(|p| p.id.saturating_add(1))
+                .unwrap_or(2);
+            session.modifiers.clear();
+        }
+        if let Some(part) = parts.pop() {
+            let label = name_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or(part.name);
+            return add_plate_object(session, label, part.mesh, append);
+        }
+        return Err(EngineError::NoMeshLoaded);
+    }
+
+    if append {
+        let bed_w = session.config.machine.bed_width_mm;
+        let bed_d = session.config.machine.bed_depth_mm;
+        let mut next_id = session.next_object_id;
+        let entries = build_centered_plate_objects(parts, &mut next_id, bed_w, bed_d)?;
+        if entries.is_empty() {
+            return Err(EngineError::NoMeshLoaded);
+        }
+        session.next_object_id = next_id;
+        session.objects.extend(entries);
+        if session.objects.len() > 1 {
+            auto_arrange_session_objects(session, 6.0)?;
+        }
+        return rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded);
+    }
+
+    let plate_defs: Vec<(u32, String)> = if plates_meta.is_empty() {
+        vec![(1, "Plate 1".to_owned())]
+    } else {
+        plates_meta.into_iter().map(|p| (p.id, p.name)).collect()
+    };
+
+    let mut buckets: Vec<Vec<ThreeMfPart>> = (0..plate_defs.len()).map(|_| Vec::new()).collect();
+    for part in parts {
+        let target_idx = if part.plate_index < buckets.len() {
+            part.plate_index
+        } else {
+            0
+        };
+        if let Some(bucket) = buckets.get_mut(target_idx) {
+            bucket.push(part);
+        }
+    }
+
+    let bed_w = session.config.machine.bed_width_mm;
+    let bed_d = session.config.machine.bed_depth_mm;
+    let mut next_id = session.next_object_id;
+    let mut max_plate_id: u32 = 0;
+    let mut new_slots: Vec<StoredPlate> = Vec::with_capacity(plate_defs.len());
+
+    for ((plate_id, plate_name), bucket) in plate_defs.into_iter().zip(buckets) {
+        max_plate_id = max_plate_id.max(plate_id);
+        let objs = build_centered_plate_objects(bucket, &mut next_id, bed_w, bed_d)?;
+        let (mesh, prepared_mesh) = if objs.is_empty() {
+            (None, None)
+        } else {
+            let raw_list: Vec<TriangleMesh> = objs.iter().map(|o| o.raw_mesh.clone()).collect();
+            let prep_list: Vec<TriangleMesh> =
+                objs.iter().map(|o| o.prepared_mesh.clone()).collect();
+            (
+                Some(TriangleMesh::merge(&raw_list)?),
+                Some(TriangleMesh::merge(&prep_list)?),
+            )
+        };
+        new_slots.push(StoredPlate {
+            id: plate_id,
+            name: plate_name,
+            objects: objs,
+            modifiers: Vec::new(),
+            mesh,
+            prepared_mesh,
+            sliced: None,
+            last_gcode: None,
         });
     }
 
-    if append && session.objects.len() > 1 {
-        auto_arrange_session_objects(session, 6.0)?;
-    }
-    rebuild_plate_mesh(session)?.ok_or(EngineError::NoMeshLoaded)
+    let first_non_empty = new_slots
+        .iter()
+        .position(|p| !p.objects.is_empty())
+        .ok_or(EngineError::NoMeshLoaded)?;
+
+    session.next_object_id = next_id;
+    session.objects.clear();
+    session.modifiers.clear();
+    session.mesh = None;
+    session.prepared_mesh = None;
+    session.sliced = None;
+    session.last_gcode = None;
+    session.plate_slots = new_slots;
+    session.active_plate_idx = first_non_empty;
+    session.next_plate_id = max_plate_id.saturating_add(1).max(2);
+    session.swap_slot_with_live(first_non_empty);
+
+    session
+        .prepared_mesh
+        .as_ref()
+        .or(session.mesh.as_ref())
+        .map(inspect_mesh)
+        .ok_or(EngineError::NoMeshLoaded)
 }
 
 /// Compute the exact 3MF 4×3 row-vector affine matrix matching [`prepare_transformed_object`].
@@ -1316,58 +1771,90 @@ pub fn object_transform_3mf_matrix(
     ])
 }
 
-/// Export the full session (objects, transforms, modifiers, profiles, and settings) as a `.3mf` project archive.
+/// Export the full multi-plate session (all plates, objects, transforms, modifiers, profiles, and settings)
+/// as a `.3mf` project archive.
 pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineError> {
     let mut resources: Vec<ThreeMfResourceMesh> = Vec::new();
-    let mut build_items: Vec<ThreeMfBuildItem> = Vec::with_capacity(session.objects.len());
-    let mut obj_records: Vec<ProjectObjectRecord> = Vec::with_capacity(session.objects.len());
-    let mut mod_records: Vec<ProjectModifierRecord> = Vec::with_capacity(session.modifiers.len());
+    let mut build_items: Vec<ThreeMfBuildItem> = Vec::new();
+    let mut export_plates: Vec<ThreeMfExportPlate> = Vec::with_capacity(session.plate_slots.len());
+    let mut plate_records: Vec<ProjectPlateRecord> = Vec::with_capacity(session.plate_slots.len());
+    let mut active_obj_records: Vec<ProjectObjectRecord> = Vec::new();
+    let mut active_mod_records: Vec<ProjectModifierRecord> = Vec::new();
     let mut next_res_id: u32 = 1;
 
-    for obj in &session.objects {
-        let res_id = next_res_id;
-        next_res_id += 1;
-        resources.push(ThreeMfResourceMesh {
-            id: res_id,
-            name: obj.name.clone(),
-            object_type: "model".to_owned(),
-            mesh: obj.raw_mesh.clone(),
-        });
-        let mat = object_transform_3mf_matrix(&obj.raw_mesh, obj.transform)?;
-        build_items.push(ThreeMfBuildItem {
-            object_id: res_id,
-            transform: Some(mat),
-        });
-        obj_records.push(ProjectObjectRecord {
-            id: obj.id,
-            name: obj.name.clone(),
-            resource_id: res_id,
-            transform: obj.transform,
-        });
-    }
+    for (idx, slot) in session.plate_slots.iter().enumerate() {
+        let is_active = idx == session.active_plate_idx;
+        let (objs, mods) = if is_active {
+            (session.objects.as_slice(), session.modifiers.as_slice())
+        } else {
+            (slot.objects.as_slice(), slot.modifiers.as_slice())
+        };
 
-    for m in &session.modifiers {
-        let resource_id = if m.primitive.is_none() {
+        let mut plate_obj_records = Vec::with_capacity(objs.len());
+        let mut plate_instances = Vec::with_capacity(objs.len());
+        for obj in objs {
             let res_id = next_res_id;
             next_res_id += 1;
             resources.push(ThreeMfResourceMesh {
                 id: res_id,
-                name: m.name.clone(),
-                object_type: "other".to_owned(),
-                mesh: m.raw_mesh.clone(),
+                name: obj.name.clone(),
+                object_type: "model".to_owned(),
+                mesh: obj.raw_mesh.clone(),
             });
-            Some(res_id)
-        } else {
-            None
-        };
-        mod_records.push(ProjectModifierRecord {
-            id: m.id,
-            name: m.name.clone(),
-            role: m.role,
-            primitive: m.primitive,
-            resource_id,
-            transform: m.transform,
-            overrides: m.overrides.clone(),
+            let mat = object_transform_3mf_matrix(&obj.raw_mesh, obj.transform)?;
+            build_items.push(ThreeMfBuildItem {
+                object_id: res_id,
+                transform: Some(mat),
+            });
+            plate_instances.push((res_id, 0));
+            plate_obj_records.push(ProjectObjectRecord {
+                id: obj.id,
+                name: obj.name.clone(),
+                resource_id: res_id,
+                transform: obj.transform,
+            });
+        }
+
+        let mut plate_mod_records = Vec::with_capacity(mods.len());
+        for m in mods {
+            let resource_id = if m.primitive.is_none() {
+                let res_id = next_res_id;
+                next_res_id += 1;
+                resources.push(ThreeMfResourceMesh {
+                    id: res_id,
+                    name: m.name.clone(),
+                    object_type: "other".to_owned(),
+                    mesh: m.raw_mesh.clone(),
+                });
+                Some(res_id)
+            } else {
+                None
+            };
+            plate_mod_records.push(ProjectModifierRecord {
+                id: m.id,
+                name: m.name.clone(),
+                role: m.role,
+                primitive: m.primitive,
+                resource_id,
+                transform: m.transform,
+                overrides: m.overrides.clone(),
+            });
+        }
+
+        if is_active {
+            active_obj_records = plate_obj_records.clone();
+            active_mod_records = plate_mod_records.clone();
+        }
+        export_plates.push(ThreeMfExportPlate {
+            id: slot.id,
+            name: slot.name.clone(),
+            instances: plate_instances,
+        });
+        plate_records.push(ProjectPlateRecord {
+            id: slot.id,
+            name: slot.name.clone(),
+            objects: plate_obj_records,
+            modifiers: plate_mod_records,
         });
     }
 
@@ -1375,53 +1862,30 @@ pub fn export_project_3mf_bytes(session: &Session) -> Result<Vec<u8>, EngineErro
         format_version: PROJECT_FORMAT_VERSION,
         config: session.config.clone(),
         active_profiles: session.active_profiles.clone(),
-        objects: obj_records,
-        modifiers: mod_records,
+        objects: active_obj_records,
+        modifiers: active_mod_records,
+        plates: plate_records,
+        active_plate_id: Some(session.active_plate_id()),
     };
     let project_json = serde_json::to_string_pretty(&manifest)?;
     let doc = ThreeMfExportDocument {
         resources,
         build_items,
+        plates: export_plates,
         project_json: Some(project_json),
     };
     Ok(write_3mf_document_bytes(&doc)?)
 }
 
-/// Load a LayerCraft `.3mf` project archive (or fall back to multi-part `.3mf` import if no manifest is present).
-pub fn load_project_3mf_bytes(
-    session: &mut Session,
-    bytes: &[u8],
-    fallback_name: Option<&str>,
-) -> Result<ProjectLoadResult, EngineError> {
-    let doc = read_3mf_document_bytes(bytes)?;
-    let Some(project_json) = doc.project_json.as_deref() else {
-        session.modifiers.clear();
-        let override_name = fallback_name.map(str::to_owned);
-        add_3mf_document_objects(session, doc, override_name, false)?;
-        return Ok(ProjectLoadResult {
-            is_layercraft_project: false,
-            object_count: session.objects.len(),
-            modifier_count: 0,
-            active_profiles: session.active_profiles.clone(),
-        });
-    };
-
-    let manifest: LayerCraftProjectManifest = serde_json::from_str(project_json)
-        .map_err(|e| EngineError::InvalidProject(format!("invalid project manifest JSON: {e}")))?;
-    if manifest.format_version != PROJECT_FORMAT_VERSION {
-        return Err(EngineError::InvalidProject(format!(
-            "unsupported project format version {}",
-            manifest.format_version
-        )));
-    }
-    manifest.config.validate()?;
-
-    let resource_map: HashMap<u32, &ThreeMfResourceMesh> =
-        doc.resources.iter().map(|r| (r.id, r)).collect();
-
-    let mut new_objects = Vec::with_capacity(manifest.objects.len());
-    let mut max_obj_id = 0u64;
-    for rec in manifest.objects {
+fn load_manifest_plate_records(
+    objects: Vec<ProjectObjectRecord>,
+    modifiers: Vec<ProjectModifierRecord>,
+    resource_map: &HashMap<u32, &ThreeMfResourceMesh>,
+    max_obj_id: &mut u64,
+    max_mod_id: &mut u64,
+) -> Result<(Vec<PlateObjectEntry>, Vec<PlateModifierEntry>), EngineError> {
+    let mut new_objects = Vec::with_capacity(objects.len());
+    for rec in objects {
         let res = resource_map.get(&rec.resource_id).ok_or_else(|| {
             EngineError::InvalidProject(format!(
                 "missing 3MF resource {} for object `{}`",
@@ -1429,7 +1893,7 @@ pub fn load_project_3mf_bytes(
             ))
         })?;
         let prepared_mesh = prepare_transformed_object(&res.mesh, rec.transform)?;
-        max_obj_id = max_obj_id.max(rec.id);
+        *max_obj_id = (*max_obj_id).max(rec.id);
         new_objects.push(PlateObjectEntry {
             id: rec.id,
             name: rec.name,
@@ -1439,9 +1903,8 @@ pub fn load_project_3mf_bytes(
         });
     }
 
-    let mut new_modifiers = Vec::with_capacity(manifest.modifiers.len());
-    let mut max_mod_id = 0u64;
-    for rec in manifest.modifiers {
+    let mut new_modifiers = Vec::with_capacity(modifiers.len());
+    for rec in modifiers {
         rec.overrides.validate()?;
         let raw_mesh = if let Some(prim) = rec.primitive {
             build_modifier_primitive(prim)?
@@ -1460,7 +1923,7 @@ pub fn load_project_3mf_bytes(
             )));
         };
         let prepared_mesh = prepare_modifier_mesh(&raw_mesh, rec.transform)?;
-        max_mod_id = max_mod_id.max(rec.id);
+        *max_mod_id = (*max_mod_id).max(rec.id);
         new_modifiers.push(PlateModifierEntry {
             id: rec.id,
             name: rec.name,
@@ -1472,19 +1935,140 @@ pub fn load_project_3mf_bytes(
             overrides: rec.overrides,
         });
     }
+    Ok((new_objects, new_modifiers))
+}
 
-    session.config = manifest.config;
-    session.active_profiles = manifest.active_profiles;
-    session.objects = new_objects;
-    session.next_object_id = max_obj_id + 1;
-    session.modifiers = new_modifiers;
-    session.next_modifier_id = max_mod_id + 1;
-    let _ = rebuild_plate_mesh(session)?;
+/// Load a LayerCraft `.3mf` project archive (or fall back to multi-plate `.3mf` import if no manifest is present).
+pub fn load_project_3mf_bytes(
+    session: &mut Session,
+    bytes: &[u8],
+    fallback_name: Option<&str>,
+) -> Result<ProjectLoadResult, EngineError> {
+    let doc = read_3mf_document_bytes(bytes)?;
+    let Some(project_json) = doc.project_json.as_deref() else {
+        session.modifiers.clear();
+        let use_fallback = doc.plates.len() <= 1
+            && doc.parts.len() == 1
+            && doc
+                .parts
+                .first()
+                .is_some_and(|p| p.name.starts_with("Part "));
+        let override_name = if use_fallback {
+            fallback_name.map(str::to_owned)
+        } else {
+            None
+        };
+        add_3mf_document_objects(session, doc, override_name, false)?;
+        return Ok(ProjectLoadResult {
+            is_layercraft_project: false,
+            object_count: session.objects.len(),
+            modifier_count: session.modifiers.len(),
+            plate_count: session.plate_count(),
+            active_plate_id: session.active_plate_id(),
+            active_profiles: session.active_profiles.clone(),
+        });
+    };
+
+    let manifest: LayerCraftProjectManifest = serde_json::from_str(project_json)
+        .map_err(|e| EngineError::InvalidProject(format!("invalid project manifest JSON: {e}")))?;
+    if manifest.format_version != PROJECT_FORMAT_VERSION {
+        return Err(EngineError::InvalidProject(format!(
+            "unsupported project format version {}",
+            manifest.format_version
+        )));
+    }
+    manifest.config.validate()?;
+
+    let resource_map: HashMap<u32, &ThreeMfResourceMesh> =
+        doc.resources.iter().map(|r| (r.id, r)).collect();
+
+    let mut max_obj_id = 0u64;
+    let mut max_mod_id = 0u64;
+
+    if manifest.plates.is_empty() {
+        let (new_objects, new_modifiers) = load_manifest_plate_records(
+            manifest.objects,
+            manifest.modifiers,
+            &resource_map,
+            &mut max_obj_id,
+            &mut max_mod_id,
+        )?;
+        session.config = manifest.config;
+        session.active_profiles = manifest.active_profiles;
+        session.objects = new_objects;
+        session.next_object_id = max_obj_id + 1;
+        session.modifiers = new_modifiers;
+        session.next_modifier_id = max_mod_id + 1;
+        session.plate_slots = vec![StoredPlate::empty(1, "Plate 1".to_owned())];
+        session.active_plate_idx = 0;
+        session.next_plate_id = 2;
+        let _ = rebuild_plate_mesh(session)?;
+    } else {
+        let mut max_plate_id = 0u32;
+        let mut new_slots = Vec::with_capacity(manifest.plates.len());
+        for plate in manifest.plates {
+            max_plate_id = max_plate_id.max(plate.id);
+            let (objs, mods) = load_manifest_plate_records(
+                plate.objects,
+                plate.modifiers,
+                &resource_map,
+                &mut max_obj_id,
+                &mut max_mod_id,
+            )?;
+            let (mesh, prepared_mesh) = if objs.is_empty() {
+                (None, None)
+            } else {
+                let raw_list: Vec<TriangleMesh> = objs.iter().map(|o| o.raw_mesh.clone()).collect();
+                let prep_list: Vec<TriangleMesh> =
+                    objs.iter().map(|o| o.prepared_mesh.clone()).collect();
+                (
+                    Some(TriangleMesh::merge(&raw_list)?),
+                    Some(TriangleMesh::merge(&prep_list)?),
+                )
+            };
+            let trimmed_name = plate.name.trim();
+            let plate_name = if trimmed_name.is_empty() {
+                format!("Plate {}", plate.id)
+            } else {
+                trimmed_name.to_owned()
+            };
+            new_slots.push(StoredPlate {
+                id: plate.id,
+                name: plate_name,
+                objects: objs,
+                modifiers: mods,
+                mesh,
+                prepared_mesh,
+                sliced: None,
+                last_gcode: None,
+            });
+        }
+        let target_idx = manifest
+            .active_plate_id
+            .and_then(|aid| new_slots.iter().position(|p| p.id == aid))
+            .unwrap_or(0);
+        session.config = manifest.config;
+        session.active_profiles = manifest.active_profiles;
+        session.objects.clear();
+        session.modifiers.clear();
+        session.mesh = None;
+        session.prepared_mesh = None;
+        session.sliced = None;
+        session.last_gcode = None;
+        session.next_object_id = max_obj_id + 1;
+        session.next_modifier_id = max_mod_id + 1;
+        session.plate_slots = new_slots;
+        session.active_plate_idx = target_idx;
+        session.next_plate_id = max_plate_id.saturating_add(1).max(2);
+        session.swap_slot_with_live(target_idx);
+    }
 
     Ok(ProjectLoadResult {
         is_layercraft_project: true,
         object_count: session.objects.len(),
         modifier_count: session.modifiers.len(),
+        plate_count: session.plate_count(),
+        active_plate_id: session.active_plate_id(),
         active_profiles: session.active_profiles.clone(),
     })
 }
@@ -1579,6 +2163,10 @@ fn apply_session_config(session: &mut Session, new_config: PrintConfig) -> Resul
         session.sliced = None;
         session.last_gcode = None;
     }
+    for slot in &mut session.plate_slots {
+        slot.sliced = None;
+        slot.last_gcode = None;
+    }
     Ok(())
 }
 
@@ -1663,8 +2251,59 @@ fn undo_label_for_command(name: &str) -> Option<&'static str> {
         "config.set" | "config.patch" => Some("Update settings"),
         "profile.apply" => Some("Apply profiles"),
         "project.load_3mf_bytes" | "project.load_file" => Some("Load project"),
+        "plates.add" => Some("Add plate"),
+        "plates.rename" => Some("Rename plate"),
+        "plates.remove" => Some("Remove plate"),
         _ => None,
     }
+}
+
+fn resolve_plate_index(
+    session: &Session,
+    index: Option<usize>,
+    id: Option<u32>,
+    name: Option<&str>,
+) -> Result<usize, EngineError> {
+    if let Some(i) = index {
+        if i < session.plate_count() {
+            return Ok(i);
+        }
+        return Err(EngineError::PlateNotFound(format!("index {i}")));
+    }
+    if let Some(pid) = id {
+        if let Some(pos) = session.plate_slots.iter().position(|p| p.id == pid) {
+            return Ok(pos);
+        }
+        return Err(EngineError::PlateNotFound(format!("id {pid}")));
+    }
+    if let Some(raw_name) = name {
+        let trimmed = raw_name.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidArgument {
+                field: "name",
+                reason: "must not be empty",
+            });
+        }
+        if let Some(pos) = session
+            .plate_slots
+            .iter()
+            .position(|p| p.name.trim() == trimmed)
+        {
+            return Ok(pos);
+        }
+        if let Some(pos) = session
+            .plate_slots
+            .iter()
+            .position(|p| p.name.trim().eq_ignore_ascii_case(trimmed))
+        {
+            return Ok(pos);
+        }
+        return Err(EngineError::PlateNotFound(trimmed.to_owned()));
+    }
+    Err(EngineError::InvalidArgument {
+        field: "plate",
+        reason: "must specify `index`, `id`, or `name`",
+    })
 }
 
 /// Execute a sequence of engine commands, optionally rolling back `session` on failure
@@ -2376,6 +3015,48 @@ fn execute_inner(session: &mut Session, name: &str, params: Value) -> Result<Val
             let res = load_project_3mf_bytes(session, &bytes, fallback)?;
             Ok(serde_json::to_value(res)?)
         }
+        "plates.list" => {
+            let _: EmptyParams = if params.is_null() {
+                EmptyParams {}
+            } else {
+                serde_json::from_value(params)?
+            };
+            Ok(serde_json::to_value(session.list_plates())?)
+        }
+        "plates.select" => {
+            let p: SelectPlateParams = serde_json::from_value(params)?;
+            let idx = resolve_plate_index(session, p.index, p.id, p.name.as_deref())?;
+            let summary = session.select_plate(idx)?;
+            Ok(serde_json::to_value(summary)?)
+        }
+        "plates.add" => {
+            let p: AddPlateParams = if params.is_null() {
+                AddPlateParams {
+                    name: None,
+                    select: true,
+                }
+            } else {
+                serde_json::from_value(params)?
+            };
+            let summary = session.add_plate(p.name.as_deref(), p.select)?;
+            Ok(serde_json::to_value(summary)?)
+        }
+        "plates.rename" => {
+            let p: RenamePlateParams = serde_json::from_value(params)?;
+            let idx = if p.index.is_none() && p.id.is_none() && p.name_match.is_none() {
+                session.active_plate_index()
+            } else {
+                resolve_plate_index(session, p.index, p.id, p.name_match.as_deref())?
+            };
+            let summary = session.rename_plate(idx, &p.name)?;
+            Ok(serde_json::to_value(summary)?)
+        }
+        "plates.remove" => {
+            let p: RemovePlateParams = serde_json::from_value(params)?;
+            let idx = resolve_plate_index(session, p.index, p.id, p.name.as_deref())?;
+            let summary = session.remove_plate(idx)?;
+            Ok(serde_json::to_value(summary)?)
+        }
         other => Err(EngineError::UnknownCommand(other.to_owned())),
     }
 }
@@ -3043,6 +3724,7 @@ mod tests {
                     transform: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 60.0, 15.0, 0.0]),
                 },
             ],
+            plates: Vec::new(),
             project_json: None,
         };
         let bytes = write_3mf_document_bytes(&doc_out).unwrap();
@@ -3284,5 +3966,163 @@ mod tests {
         execute(&mut sess, "session.undo", Value::Null).unwrap();
         assert_eq!(sess.objects.len(), 1);
         assert_eq!(sess.config.process.wall_loops, default_walls);
+    }
+
+    #[test]
+    fn multiplate_3mf_import_switch_and_project_roundtrip() {
+        let cube = build_sample_shape(SampleShape::Cube20).unwrap();
+        let cyl = build_sample_shape(SampleShape::Cylinder).unwrap();
+        let block = build_sample_shape(SampleShape::SteppedBlock).unwrap();
+
+        let multi_doc = ThreeMfExportDocument {
+            resources: vec![
+                ThreeMfResourceMesh {
+                    id: 1,
+                    name: "BaseCube.stl".to_owned(),
+                    object_type: "model".to_owned(),
+                    mesh: cube,
+                },
+                ThreeMfResourceMesh {
+                    id: 2,
+                    name: "WallLeft.stl".to_owned(),
+                    object_type: "model".to_owned(),
+                    mesh: cyl,
+                },
+                ThreeMfResourceMesh {
+                    id: 3,
+                    name: "WallRight.stl".to_owned(),
+                    object_type: "model".to_owned(),
+                    mesh: block,
+                },
+            ],
+            build_items: vec![
+                ThreeMfBuildItem {
+                    object_id: 1,
+                    transform: Some([
+                        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 100.0, 100.0, 0.0,
+                    ]),
+                },
+                ThreeMfBuildItem {
+                    object_id: 2,
+                    transform: Some([
+                        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 720.0, 50.0, 0.0,
+                    ]),
+                },
+                ThreeMfBuildItem {
+                    object_id: 3,
+                    transform: Some([
+                        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 780.0, 50.0, 0.0,
+                    ]),
+                },
+            ],
+            plates: vec![
+                ThreeMfExportPlate {
+                    id: 1,
+                    name: "01_Base".to_owned(),
+                    instances: vec![(1, 0)],
+                },
+                ThreeMfExportPlate {
+                    id: 2,
+                    name: "Walls".to_owned(),
+                    instances: vec![(2, 0), (3, 0)],
+                },
+            ],
+            project_json: None,
+        };
+        let raw_3mf = write_3mf_document_bytes(&multi_doc).unwrap();
+
+        let mut sess = Session::default();
+        let loaded: ProjectLoadResult = serde_json::from_value(
+            execute(
+                &mut sess,
+                "project.load_3mf_bytes",
+                serde_json::json!({ "bytes": raw_3mf, "name": "Fallback.3mf" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!loaded.is_layercraft_project);
+        assert_eq!(loaded.plate_count, 2);
+        assert_eq!(sess.plate_count(), 2);
+        assert_eq!(sess.active_plate_name(), "01_Base");
+        assert_eq!(sess.objects.len(), 1);
+        assert_eq!(sess.objects[0].name, "BaseCube.stl");
+
+        // Switch to Plate 2 ("Walls") and confirm both walls are independently bed-centered.
+        let p2: PlateSummary = serde_json::from_value(
+            execute(
+                &mut sess,
+                "plates.select",
+                serde_json::json!({ "name": "Walls" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p2.index, 1);
+        assert_eq!(p2.object_count, 2);
+        assert_eq!(sess.objects.len(), 2);
+        assert_eq!(sess.objects[0].name, "WallLeft.stl");
+        assert_eq!(sess.objects[1].name, "WallRight.stl");
+        let walls_bb = sess.prepared_mesh.as_ref().unwrap().aabb().unwrap();
+        assert!(walls_bb.min.x >= 0.0 && walls_bb.max.x <= 250.0);
+        assert!(walls_bb.min.y >= 0.0 && walls_bb.max.y <= 250.0);
+
+        // Slice Plate 2, switch back to Plate 1, and confirm Plate 2 keeps its cached slice.
+        execute(&mut sess, "slice.run", Value::Null).unwrap();
+        assert!(sess.sliced.is_some());
+        execute(
+            &mut sess,
+            "plates.select",
+            serde_json::json!({ "index": 0 }),
+        )
+        .unwrap();
+        assert!(sess.sliced.is_none());
+        let plates_list: Vec<PlateSummary> =
+            serde_json::from_value(execute(&mut sess, "plates.list", Value::Null).unwrap())
+                .unwrap();
+        assert!(!plates_list[0].sliced);
+        assert!(plates_list[1].sliced);
+
+        // Add & rename a 3rd plate, switch to plate 2 again, export LayerCraft project, reload!
+        execute(
+            &mut sess,
+            "plates.add",
+            serde_json::json!({ "name": "Spare", "select": false }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plates.rename",
+            serde_json::json!({ "index": 2, "name": "Extras" }),
+        )
+        .unwrap();
+        execute(
+            &mut sess,
+            "plates.select",
+            serde_json::json!({ "index": 1 }),
+        )
+        .unwrap();
+        let proj_bytes = export_project_3mf_bytes(&sess).unwrap();
+
+        let mut reloaded = Session::default();
+        let reload_res = load_project_3mf_bytes(&mut reloaded, &proj_bytes, None).unwrap();
+        assert!(reload_res.is_layercraft_project);
+        assert_eq!(reload_res.plate_count, 3);
+        assert_eq!(reloaded.plate_count(), 3);
+        assert_eq!(reloaded.active_plate_name(), "Walls");
+        assert_eq!(reloaded.objects.len(), 2);
+        assert_eq!(reloaded.list_plates()[2].name, "Extras");
+
+        // Undo remove plate restores it cleanly.
+        execute(
+            &mut reloaded,
+            "plates.remove",
+            serde_json::json!({ "index": 2 }),
+        )
+        .unwrap();
+        assert_eq!(reloaded.plate_count(), 2);
+        execute(&mut reloaded, "session.undo", Value::Null).unwrap();
+        assert_eq!(reloaded.plate_count(), 3);
+        assert_eq!(reloaded.list_plates()[2].name, "Extras");
     }
 }

@@ -93,6 +93,7 @@ pub struct LayerCraftApp {
     pub(crate) pending_config_undo: Option<PrintConfig>,
     pub(crate) drag_undo_active: bool,
     pub(crate) pointer_active: bool,
+    pub(crate) plate_rename_buf: (u32, String),
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) last_slice_ms: Option<f64>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -153,6 +154,7 @@ impl LayerCraftApp {
             pending_config_undo: None,
             drag_undo_active: false,
             pointer_active: false,
+            plate_rename_buf: (0, String::new()),
             #[cfg(not(target_arch = "wasm32"))]
             last_slice_ms: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -290,7 +292,26 @@ impl LayerCraftApp {
             self.layer_move_step = 0;
             self.playback_playing = false;
             self.frame_camera(CameraPreset::Isometric);
-            self.status_message = format!("Loaded project via MCP ({command}).");
+            self.status_message = if self.session.plate_count() > 1 {
+                format!(
+                    "Loaded {} plates via MCP ({command}).",
+                    self.session.plate_count()
+                )
+            } else {
+                format!("Loaded project via MCP ({command}).")
+            };
+        } else if command.starts_with("plates.") {
+            self.max_layer = 0;
+            self.layer_move_step = 0;
+            self.playback_playing = false;
+            if self.session.sliced.is_none() {
+                self.view_mode = ViewMode::Prepare;
+            }
+            self.status_message = format!(
+                "Plate `{}` ({} object(s)) via MCP.",
+                self.session.active_plate_name(),
+                self.session.objects.len()
+            );
         } else if command == "session.undo" || command == "session.redo" {
             if self.session.sliced.is_none() {
                 self.view_mode = ViewMode::Prepare;
@@ -316,7 +337,11 @@ impl LayerCraftApp {
         }
 
         self.rebuild_scene();
-        if sliced_just_now {
+        if sliced_just_now
+            || (command == "plates.select"
+                && self.session.sliced.is_some()
+                && self.view_mode == ViewMode::Preview)
+        {
             let layers = self.scene.layer_ranges.len();
             self.set_active_layer(layers.saturating_sub(1));
         }
@@ -441,6 +466,147 @@ impl LayerCraftApp {
         }
     }
 
+    /// Switch active build plate by zero-based index.
+    pub fn select_plate(&mut self, index: usize) {
+        self.cancel_pending_slice();
+        match execute(
+            &mut self.session,
+            "plates.select",
+            serde_json::json!({ "index": index }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.playback_playing = false;
+                self.layer_move_step = 0;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+                if self.session.sliced.is_none() {
+                    self.view_mode = ViewMode::Prepare;
+                    self.max_layer = 0;
+                }
+                self.status_message = format!(
+                    "Active plate: `{}` ({} object(s)).",
+                    self.session.active_plate_name(),
+                    self.session.objects.len()
+                );
+                self.rebuild_scene();
+                if self.session.sliced.is_some() && self.view_mode == ViewMode::Preview {
+                    let layers = self.scene.layer_ranges.len();
+                    self.set_active_layer(layers.saturating_sub(1));
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed selecting plate: {e}"));
+            }
+        }
+    }
+
+    /// Add a new empty build plate and switch to it.
+    pub fn add_plate(&mut self, name: Option<&str>) {
+        self.cancel_pending_slice();
+        match execute(
+            &mut self.session,
+            "plates.add",
+            serde_json::json!({ "name": name, "select": true }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.selected_object_id = None;
+                self.selected_modifier_id = None;
+                self.view_mode = ViewMode::Prepare;
+                self.max_layer = 0;
+                self.layer_move_step = 0;
+                self.playback_playing = false;
+                self.status_message =
+                    format!("Added plate `{}`.", self.session.active_plate_name());
+                self.rebuild_scene();
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed adding plate: {e}"));
+            }
+        }
+    }
+
+    /// Rename a build plate by zero-based index.
+    pub fn rename_plate(&mut self, index: usize, name: &str) {
+        match execute(
+            &mut self.session,
+            "plates.rename",
+            serde_json::json!({ "index": index, "name": name }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.status_message =
+                    format!("Renamed plate to `{}`.", self.session.active_plate_name());
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed renaming plate: {e}"));
+            }
+        }
+    }
+
+    /// Remove a build plate by zero-based index (keeps at least one plate).
+    pub fn remove_plate(&mut self, index: usize) {
+        self.cancel_pending_slice();
+        match execute(
+            &mut self.session,
+            "plates.remove",
+            serde_json::json!({ "index": index }),
+        ) {
+            Ok(_) => {
+                self.last_error = None;
+                self.playback_playing = false;
+                self.layer_move_step = 0;
+                self.selected_object_id = self.session.objects.last().map(|o| o.id);
+                self.selected_modifier_id = self.session.modifiers.last().map(|m| m.id);
+                if self.session.sliced.is_none() {
+                    self.view_mode = ViewMode::Prepare;
+                    self.max_layer = 0;
+                }
+                self.status_message = format!(
+                    "Removed plate; active plate is `{}` ({} object(s)).",
+                    self.session.active_plate_name(),
+                    self.session.objects.len()
+                );
+                self.rebuild_scene();
+                if self.session.sliced.is_some() && self.view_mode == ViewMode::Preview {
+                    let layers = self.scene.layer_ranges.len();
+                    self.set_active_layer(layers.saturating_sub(1));
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed removing plate: {e}"));
+            }
+        }
+    }
+
+    fn default_gcode_filename(&self) -> String {
+        if self.session.plate_count() <= 1 && self.session.active_plate_name() == "Plate 1" {
+            return "layercraft_out.gcode".to_owned();
+        }
+        let mut slug: String = self
+            .session
+            .active_plate_name()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        while slug.contains("__") {
+            slug = slug.replace("__", "_");
+        }
+        let trimmed = slug.trim_matches('_');
+        if trimmed.is_empty() {
+            format!("plate_{}.gcode", self.session.active_plate_id())
+        } else {
+            format!("{trimmed}.gcode")
+        }
+    }
+
     /// Load a mesh or LayerCraft `.3mf` project from raw STL or 3MF bytes via `layercraft-engine`.
     pub fn load_mesh_bytes(&mut self, name: &str, bytes: Vec<u8>) {
         self.cancel_pending_slice();
@@ -453,6 +619,10 @@ impl LayerCraftApp {
             ) {
                 Ok(val) => {
                     let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
+                    let plate_count = res
+                        .as_ref()
+                        .map(|r| r.plate_count)
+                        .unwrap_or_else(|| self.session.plate_count());
                     self.last_error = None;
                     if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
                         self.selected_machine_profile =
@@ -461,10 +631,25 @@ impl LayerCraftApp {
                             self.session.active_profiles.filament.clone();
                         self.selected_process_profile =
                             self.session.active_profiles.process.clone();
+                        if plate_count > 1 {
+                            self.status_message = format!(
+                                "Loaded project `{name}` ({plate_count} plates, active `{}`: {} object(s), {} modifier(s)).",
+                                self.session.active_plate_name(),
+                                self.session.objects.len(),
+                                self.session.modifiers.len()
+                            );
+                        } else {
+                            self.status_message = format!(
+                                "Loaded project `{name}` ({} object(s), {} modifier(s)).",
+                                self.session.objects.len(),
+                                self.session.modifiers.len()
+                            );
+                        }
+                    } else if plate_count > 1 {
                         self.status_message = format!(
-                            "Loaded project `{name}` ({} object(s), {} modifier(s)).",
-                            self.session.objects.len(),
-                            self.session.modifiers.len()
+                            "Loaded `{name}` ({plate_count} plates, active `{}`: {} object(s)).",
+                            self.session.active_plate_name(),
+                            self.session.objects.len()
                         );
                     } else {
                         self.status_message = format!(
@@ -475,6 +660,9 @@ impl LayerCraftApp {
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
+                    self.max_layer = 0;
+                    self.layer_move_step = 0;
+                    self.playback_playing = false;
                     self.frame_camera(CameraPreset::Isometric);
                     self.rebuild_scene();
                 }
@@ -1178,6 +1366,10 @@ impl LayerCraftApp {
             ) {
                 Ok(val) => {
                     let res = serde_json::from_value::<ProjectLoadResult>(val).ok();
+                    let plate_count = res
+                        .as_ref()
+                        .map(|r| r.plate_count)
+                        .unwrap_or_else(|| self.session.plate_count());
                     self.last_error = None;
                     if res.as_ref().is_some_and(|r| r.is_layercraft_project) {
                         self.selected_machine_profile =
@@ -1186,10 +1378,25 @@ impl LayerCraftApp {
                             self.session.active_profiles.filament.clone();
                         self.selected_process_profile =
                             self.session.active_profiles.process.clone();
+                        if plate_count > 1 {
+                            self.status_message = format!(
+                                "Loaded project `{path}` ({plate_count} plates, active `{}`: {} object(s), {} modifier(s)).",
+                                self.session.active_plate_name(),
+                                self.session.objects.len(),
+                                self.session.modifiers.len()
+                            );
+                        } else {
+                            self.status_message = format!(
+                                "Loaded project `{path}` ({} object(s), {} modifier(s)).",
+                                self.session.objects.len(),
+                                self.session.modifiers.len()
+                            );
+                        }
+                    } else if plate_count > 1 {
                         self.status_message = format!(
-                            "Loaded project `{path}` ({} object(s), {} modifier(s)).",
-                            self.session.objects.len(),
-                            self.session.modifiers.len()
+                            "Loaded `{path}` ({plate_count} plates, active `{}`: {} object(s)).",
+                            self.session.active_plate_name(),
+                            self.session.objects.len()
                         );
                     } else {
                         self.status_message = format!(
@@ -1200,6 +1407,9 @@ impl LayerCraftApp {
                     self.selected_object_id = self.session.objects.last().map(|o| o.id);
                     self.selected_modifier_id = None;
                     self.view_mode = ViewMode::Prepare;
+                    self.max_layer = 0;
+                    self.layer_move_step = 0;
+                    self.playback_playing = false;
                     self.frame_camera(CameraPreset::Isometric);
                     self.rebuild_scene();
                 }
@@ -1319,6 +1529,7 @@ impl LayerCraftApp {
     }
 
     pub(crate) fn export_gcode_action(&mut self) {
+        let filename = self.default_gcode_filename();
         let Some(g) = &self.session.last_gcode else {
             return;
         };
@@ -1327,7 +1538,7 @@ impl LayerCraftApp {
         {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Export G-code")
-                .set_file_name("layercraft_out.gcode")
+                .set_file_name(&filename)
                 .add_filter("G-code", &["gcode", "gco", "g"])
                 .save_file()
             {
@@ -1345,11 +1556,10 @@ impl LayerCraftApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            match trigger_browser_download("layercraft_out.gcode", &g.gcode) {
+            match trigger_browser_download(&filename, &g.gcode) {
                 Ok(()) => {
                     self.last_error = None;
-                    self.status_message =
-                        "Triggered browser download `layercraft_out.gcode`.".to_owned();
+                    self.status_message = format!("Triggered browser download `{filename}`.");
                 }
                 Err(e) => {
                     self.last_error = Some(format!("Download failed: {e}"));
@@ -1712,6 +1922,7 @@ impl LayerCraftApp {
 
         toolbar::draw_header_bar(self, ui, &palette);
         toolbar::draw_ribbon_bar(self, ui, &palette);
+        toolbar::draw_plates_bar(self, ui, &palette);
         self.draw_status_bar(ui, &palette);
 
         let cfg_before_sidebar = self.session.config.clone();
@@ -1962,5 +2173,36 @@ mod tests {
         assert_eq!(app2.session.modifiers.len(), 1);
         assert!((app2.session.objects[0].transform.position_xy_mm[0] - 85.0).abs() < 1e-6);
         assert!((app2.session.config.process.sparse_infill_density - 0.44).abs() < 1e-6);
+    }
+
+    #[test]
+    fn multiplate_app_add_select_and_remove_plates() {
+        let mut app = LayerCraftApp::new(Some(SampleShape::Cube20));
+        assert_eq!(app.session.plate_count(), 1);
+        assert_eq!(app.session.active_plate_name(), "Plate 1");
+
+        app.add_plate(Some("Walls"));
+        assert!(app.last_error.is_none());
+        assert_eq!(app.session.plate_count(), 2);
+        assert_eq!(app.session.active_plate_index(), 1);
+        assert_eq!(app.session.active_plate_name(), "Walls");
+        assert!(app.session.objects.is_empty());
+
+        app.load_sample(SampleShape::Cylinder);
+        assert_eq!(app.session.objects.len(), 1);
+        assert_eq!(app.default_gcode_filename(), "Walls.gcode");
+
+        app.rename_plate(1, "Outer Walls");
+        assert_eq!(app.session.active_plate_name(), "Outer Walls");
+        assert_eq!(app.default_gcode_filename(), "Outer_Walls.gcode");
+
+        app.select_plate(0);
+        assert_eq!(app.session.active_plate_index(), 0);
+        assert_eq!(app.session.active_plate_name(), "Plate 1");
+        assert_eq!(app.session.objects.len(), 1);
+
+        app.remove_plate(1);
+        assert_eq!(app.session.plate_count(), 1);
+        assert!(app.last_error.is_none());
     }
 }

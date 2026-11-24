@@ -8,7 +8,6 @@ pub enum Icon {
     BrandMark,
     #[cfg(not(target_arch = "wasm32"))]
     OpenFile,
-    #[cfg(not(target_arch = "wasm32"))]
     AddPlus,
     SaveProject,
     Undo,
@@ -82,7 +81,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([pt(0.90, 0.84), pt(0.10, 0.84)], stroke);
             painter.line_segment([pt(0.10, 0.84), pt(0.10, 0.22)], stroke);
         }
-        #[cfg(not(target_arch = "wasm32"))]
         Icon::AddPlus => {
             painter.line_segment([pt(0.50, 0.15), pt(0.50, 0.85)], stroke);
             painter.line_segment([pt(0.15, 0.50), pt(0.85, 0.50)], stroke);

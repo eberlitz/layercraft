@@ -29,7 +29,8 @@ Like SolidCraft, `layercraft-cli mcp` automatically detects a running **LayerCra
 
 1. **Check status & discover commands:** Call `version` and, if needed, `list_commands` + `describe_command` for any unfamiliar operation.
 2. **Load geometry & presets (`batch`):**
-   - Load STL/3MF files with `plate.add_mesh_file`, arrange multiple objects with `plate.auto_arrange`, and apply printer/filament/process presets via `profile.apply`.
+   - Load STL/3MF files with `plate.add_mesh_file` (or multi-plate `.3mf` projects with `project.load_file`), arrange multiple objects with `plate.auto_arrange`, and apply printer/filament/process presets via `profile.apply`.
+   - Manage multi-plate `.3mf` projects with `plates.list`, `plates.select` (`index`, `id`, or `name`), `plates.add`, `plates.rename`, and `plates.remove` (inspect all plates at once via `inspect_plate`).
    - Use `config_patch` for quick overrides (layer height, infill density, wall generator, supports, brim, thumbnails).
 3. **Slice & run DFM diagnostics:**
    - Call `analyze_printability` (automatically slices if needed). Review `overall_risk`, `issues`, `floating_islands`, `overhang_triangle_area_mm2`, `thin_wall_dropped_layers`, `bed_contact_area_mm2`, and `by_feature`.
