@@ -17,15 +17,7 @@ pub enum Icon {
     Export,
     SliceLayers,
     BoxShape,
-    CylinderShape,
-    ShieldOff,
-    ShieldPlus,
     TabPlate,
-    TabQuality,
-    TabStrength,
-    TabSpeed,
-    TabSupport,
-    TabFinish,
     TabMachine,
     ThemeDark,
     ThemeLight,
@@ -42,7 +34,11 @@ pub enum Icon {
     Pause,
     #[cfg(not(target_arch = "wasm32"))]
     SendPrinter,
-    Import,
+    Home,
+    SelectCursor,
+    Search,
+    MoreDots,
+    Code,
 }
 
 /// Paint `icon` centered cleanly inside `rect` with `color`.
@@ -147,33 +143,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.line_segment([a, b], stroke);
             }
         }
-        Icon::CylinderShape => {
-            let rx = r.width() * 0.34;
-            let ry = r.height() * 0.14;
-            let top_c = pt(0.50, 0.26);
-            let bot_c = pt(0.50, 0.76);
-            // Draw upper/lower ellipses approximated with clean polygons + side verticals.
-            let mut top_pts = Vec::with_capacity(16);
-            let mut bot_pts = Vec::with_capacity(9);
-            for i in 0..16 {
-                let a = (i as f32 / 16.0) * std::f32::consts::TAU;
-                top_pts.push(pos2(top_c.x + rx * a.cos(), top_c.y + ry * a.sin()));
-            }
-            for i in 0..=8 {
-                let a = (i as f32 / 8.0) * std::f32::consts::PI;
-                bot_pts.push(pos2(bot_c.x + rx * a.cos(), bot_c.y + ry * a.sin()));
-            }
-            painter.add(egui::Shape::closed_line(top_pts, stroke));
-            painter.add(egui::Shape::line(bot_pts, stroke));
-            painter.line_segment(
-                [pos2(top_c.x - rx, top_c.y), pos2(bot_c.x - rx, bot_c.y)],
-                stroke,
-            );
-            painter.line_segment(
-                [pos2(top_c.x + rx, top_c.y), pos2(bot_c.x + rx, bot_c.y)],
-                stroke,
-            );
-        }
         Icon::ArrangeGrid | Icon::TabPlate => {
             let gap = 0.08;
             let s = 0.36;
@@ -205,14 +174,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([pt(0.14, 0.86), pt(0.86, 0.86)], stroke);
             painter.line_segment([pt(0.86, 0.86), pt(0.86, 0.62)], stroke);
         }
-        Icon::Import => {
-            painter.line_segment([pt(0.50, 0.14), pt(0.50, 0.62)], stroke);
-            painter.line_segment([pt(0.30, 0.42), pt(0.50, 0.62)], stroke);
-            painter.line_segment([pt(0.70, 0.42), pt(0.50, 0.62)], stroke);
-            painter.line_segment([pt(0.14, 0.62), pt(0.14, 0.86)], stroke);
-            painter.line_segment([pt(0.14, 0.86), pt(0.86, 0.86)], stroke);
-            painter.line_segment([pt(0.86, 0.86), pt(0.86, 0.62)], stroke);
-        }
         Icon::SliceLayers | Icon::Layers => {
             for y in [0.22, 0.50, 0.78] {
                 painter.line_segment([pt(0.12, y), pt(0.88, y)], stroke);
@@ -223,69 +184,6 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             );
             painter.line_segment(
                 [pt(0.24, 0.64), pt(0.76, 0.64)],
-                Stroke::new(w * 0.8, color),
-            );
-        }
-        Icon::ShieldOff => {
-            let poly = vec![
-                pt(0.50, 0.10),
-                pt(0.84, 0.24),
-                pt(0.78, 0.62),
-                pt(0.50, 0.90),
-                pt(0.22, 0.62),
-                pt(0.16, 0.24),
-            ];
-            painter.add(egui::Shape::closed_line(poly, stroke));
-            painter.line_segment([pt(0.26, 0.74), pt(0.74, 0.26)], stroke);
-        }
-        Icon::ShieldPlus => {
-            let poly = vec![
-                pt(0.50, 0.10),
-                pt(0.84, 0.24),
-                pt(0.78, 0.62),
-                pt(0.50, 0.90),
-                pt(0.22, 0.62),
-                pt(0.16, 0.24),
-            ];
-            painter.add(egui::Shape::closed_line(poly, stroke));
-            painter.line_segment([pt(0.50, 0.32), pt(0.50, 0.66)], stroke);
-            painter.line_segment([pt(0.33, 0.49), pt(0.67, 0.49)], stroke);
-        }
-        Icon::TabQuality => {
-            for i in 0..4 {
-                let y = 0.20 + i as f32 * 0.20;
-                painter.line_segment([pt(0.12, y), pt(0.88, y)], stroke);
-            }
-        }
-        Icon::TabStrength => {
-            let outer = Rect::from_min_max(pt(0.12, 0.12), pt(0.88, 0.88));
-            painter.rect_stroke(outer, CornerRadius::same(2), stroke, StrokeKind::Inside);
-            painter.line_segment([pt(0.22, 0.78), pt(0.78, 0.22)], stroke);
-            painter.line_segment([pt(0.22, 0.22), pt(0.78, 0.78)], stroke);
-        }
-        Icon::TabSpeed => {
-            painter.line_segment([pt(0.16, 0.50), pt(0.68, 0.50)], stroke);
-            painter.line_segment([pt(0.54, 0.26), pt(0.84, 0.50)], stroke);
-            painter.line_segment([pt(0.54, 0.74), pt(0.84, 0.50)], stroke);
-            painter.line_segment([pt(0.12, 0.28), pt(0.36, 0.28)], stroke);
-            painter.line_segment([pt(0.12, 0.72), pt(0.36, 0.72)], stroke);
-        }
-        Icon::TabSupport => {
-            painter.line_segment([pt(0.14, 0.20), pt(0.86, 0.20)], stroke);
-            painter.line_segment([pt(0.14, 0.84), pt(0.86, 0.84)], stroke);
-            painter.line_segment([pt(0.50, 0.84), pt(0.50, 0.20)], stroke);
-            painter.line_segment([pt(0.50, 0.58), pt(0.26, 0.20)], stroke);
-            painter.line_segment([pt(0.50, 0.58), pt(0.74, 0.20)], stroke);
-        }
-        Icon::TabFinish => {
-            painter.line_segment([pt(0.50, 0.12), pt(0.50, 0.88)], stroke);
-            painter.line_segment([pt(0.12, 0.50), pt(0.88, 0.50)], stroke);
-            painter.line_segment(
-                [pt(0.24, 0.24), pt(0.76, 0.76)],
-                Stroke::new(w * 0.8, color),
-            );
-            painter.line_segment(
-                [pt(0.24, 0.76), pt(0.76, 0.24)],
                 Stroke::new(w * 0.8, color),
             );
         }
@@ -395,6 +293,45 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ];
             painter.add(egui::Shape::closed_line(outline, stroke));
             painter.line_segment([pt(0.42, 0.58), pt(0.88, 0.14)], stroke);
+        }
+        Icon::Home => {
+            painter.line_segment([pt(0.10, 0.48), pt(0.50, 0.14)], stroke);
+            painter.line_segment([pt(0.50, 0.14), pt(0.90, 0.48)], stroke);
+            painter.line_segment([pt(0.22, 0.40), pt(0.22, 0.86)], stroke);
+            painter.line_segment([pt(0.22, 0.86), pt(0.78, 0.86)], stroke);
+            painter.line_segment([pt(0.78, 0.86), pt(0.78, 0.40)], stroke);
+            painter.line_segment([pt(0.42, 0.86), pt(0.42, 0.58)], stroke);
+            painter.line_segment([pt(0.42, 0.58), pt(0.58, 0.58)], stroke);
+            painter.line_segment([pt(0.58, 0.58), pt(0.58, 0.86)], stroke);
+        }
+        Icon::SelectCursor => {
+            let arrow = vec![
+                pt(0.20, 0.12),
+                pt(0.82, 0.54),
+                pt(0.52, 0.58),
+                pt(0.66, 0.86),
+                pt(0.54, 0.91),
+                pt(0.40, 0.62),
+                pt(0.20, 0.80),
+            ];
+            painter.add(egui::Shape::closed_line(arrow, stroke));
+        }
+        Icon::Search => {
+            painter.circle_stroke(pt(0.43, 0.43), r.width() * 0.25, stroke);
+            painter.line_segment([pt(0.62, 0.62), pt(0.88, 0.88)], stroke);
+        }
+        Icon::MoreDots => {
+            let rad = (w * 0.78).max(1.25);
+            painter.circle_filled(pt(0.22, 0.50), rad, color);
+            painter.circle_filled(pt(0.50, 0.50), rad, color);
+            painter.circle_filled(pt(0.78, 0.50), rad, color);
+        }
+        Icon::Code => {
+            painter.line_segment([pt(0.36, 0.26), pt(0.14, 0.50)], stroke);
+            painter.line_segment([pt(0.14, 0.50), pt(0.36, 0.74)], stroke);
+            painter.line_segment([pt(0.64, 0.26), pt(0.86, 0.50)], stroke);
+            painter.line_segment([pt(0.86, 0.50), pt(0.64, 0.74)], stroke);
+            painter.line_segment([pt(0.54, 0.22), pt(0.46, 0.78)], stroke);
         }
     }
 }

@@ -1,7 +1,9 @@
 //! Shared desktop and WebAssembly `egui` + `wgpu` slicer application (`LayerCraftApp`).
 
+mod home;
 mod icons;
 pub mod prefs;
+pub mod recent_projects;
 mod sidebar;
 mod theme;
 mod toolbar;
@@ -46,6 +48,7 @@ pub use theme::ThemeMode;
 /// Active workspace view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
+    Home,
     Prepare,
     Preview,
 }
@@ -233,6 +236,10 @@ type PendingWebDrops =
     std::rc::Rc<std::cell::RefCell<Vec<(WebFilePickMode, String, Result<Vec<u8>, String>)>>>;
 
 #[cfg(target_arch = "wasm32")]
+type PendingBrowserRecent =
+    std::rc::Rc<std::cell::RefCell<Option<(String, String, Result<Option<Vec<u8>>, String>)>>>;
+
+#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WebFilePickMode {
     OpenReplace,
@@ -266,10 +273,10 @@ struct PendingWebSliceJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingDiscardAction {
     ClearPlate,
+    NewEmptyProject,
     LoadSample(SampleShape),
     OpenFileDialog,
-    #[cfg(not(target_arch = "wasm32"))]
-    OpenRecentPath(String),
+    OpenRecentId(String),
 }
 
 #[derive(Debug, Clone)]
@@ -311,8 +318,11 @@ pub struct LayerCraftApp {
     pub(crate) styles_installed: bool,
     pub(crate) sidebar_open: bool,
     pub(crate) sidebar_tab: SidebarTab,
-    pub(crate) ribbon_collapsed: bool,
+    pub(crate) last_settings_tab: SidebarTab,
+    pub(crate) settings_search: String,
+    pub(crate) home_search: String,
     pub(crate) show_legend_hud: bool,
+    pub(crate) show_all_legend_roles: bool,
     pub show_gcode_viewer: bool,
     pub gcode_viewer_all_layers: bool,
     pub(crate) gcode_index: GcodeLayerIndex,
@@ -327,6 +337,11 @@ pub struct LayerCraftApp {
     pub(crate) printer_draft: PrinterProfile,
     pub tool_mode: ViewportToolMode,
     pub prefs: prefs::AppPreferences,
+    pub recent_projects: recent_projects::RecentProjectsStore,
+    pub(crate) recent_thumb_textures:
+        std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    pub(crate) current_recent_id: Option<String>,
+    pub(crate) current_project_title: Option<String>,
     pub printability_report: Option<PrintabilityReport>,
     pub project_dirty: bool,
     pub(crate) pending_discard_action: Option<PendingDiscardAction>,
@@ -360,6 +375,8 @@ pub struct LayerCraftApp {
     file_picker_cb: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
     #[cfg(target_arch = "wasm32")]
     pending_drops: PendingWebDrops,
+    #[cfg(target_arch = "wasm32")]
+    pending_browser_recent: PendingBrowserRecent,
 }
 
 impl Default for LayerCraftApp {
@@ -390,6 +407,17 @@ impl LayerCraftApp {
         let loaded_prefs = prefs::AppPreferences::load_from_disk();
         #[cfg(test)]
         let loaded_prefs = prefs::AppPreferences::default();
+
+        #[cfg(not(test))]
+        let loaded_recent = {
+            let mut store = recent_projects::RecentProjectsStore::load_from_disk();
+            if store.migrate_legacy_recent_files(&loaded_prefs.recent_files) {
+                let _ = store.save_to_disk();
+            }
+            store
+        };
+        #[cfg(test)]
+        let loaded_recent = recent_projects::RecentProjectsStore::default();
 
         let initial_theme = match loaded_prefs
             .theme_mode
@@ -488,8 +516,11 @@ impl LayerCraftApp {
             styles_installed: false,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Plate,
-            ribbon_collapsed: false,
+            last_settings_tab: SidebarTab::Quality,
+            settings_search: String::new(),
+            home_search: String::new(),
             show_legend_hud: true,
+            show_all_legend_roles: false,
             show_gcode_viewer: false,
             gcode_viewer_all_layers: false,
             gcode_index: GcodeLayerIndex::default(),
@@ -504,6 +535,10 @@ impl LayerCraftApp {
             printer_draft: initial_printer_draft,
             tool_mode: ViewportToolMode::Select,
             prefs: loaded_prefs,
+            recent_projects: loaded_recent,
+            recent_thumb_textures: std::collections::HashMap::new(),
+            current_recent_id: None,
+            current_project_title: initial_sample.map(|s| s.label().to_owned()),
             printability_report: None,
             project_dirty: false,
             pending_discard_action: None,
@@ -537,6 +572,8 @@ impl LayerCraftApp {
             file_picker_cb: None,
             #[cfg(target_arch = "wasm32")]
             pending_drops: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_browser_recent: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         if let Some(sample) = initial_sample {
             app.load_sample(sample);
@@ -545,6 +582,16 @@ impl LayerCraftApp {
         } else {
             app.rebuild_scene();
         }
+        app
+    }
+
+    /// Construct a new Studio session starting on the Home / Recent Projects hub.
+    pub fn new_home() -> Self {
+        let mut app = Self::new(None);
+        app.view_mode = ViewMode::Home;
+        app.status_message =
+            "Open a recent project, drop a .3mf or .stl file, or pick a Quick Start shape."
+                .to_owned();
         app
     }
 
@@ -1070,6 +1117,16 @@ impl LayerCraftApp {
 
     /// Load or append a mesh or `.3mf` file from raw bytes (`append: false` replaces, `append: true` adds to active plate).
     pub fn load_mesh_bytes_with_mode(&mut self, name: &str, bytes: Vec<u8>, append: bool) {
+        self.load_mesh_bytes_inner(name, bytes, append, true);
+    }
+
+    fn load_mesh_bytes_inner(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        append: bool,
+        record_recent: bool,
+    ) {
         self.cancel_pending_slice();
         let is_3mf = name.to_ascii_lowercase().ends_with(".3mf");
         if is_3mf {
@@ -1125,6 +1182,8 @@ impl LayerCraftApp {
                             );
                         }
                         self.project_dirty = !res.as_ref().is_some_and(|r| r.is_layercraft_project);
+                        self.current_project_title =
+                            Some(recent_projects::display_title_from_name(name));
                     } else {
                         self.status_message = format!(
                             "Added `{name}` to plate ({} object(s)).",
@@ -1143,6 +1202,13 @@ impl LayerCraftApp {
                     self.playback_playing = false;
                     self.frame_camera(CameraPreset::Isometric);
                     self.rebuild_scene();
+                    #[cfg(target_arch = "wasm32")]
+                    if !append && record_recent {
+                        let fmt = recent_projects::infer_file_format(name);
+                        self.record_recent_browser(name, &fmt);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = record_recent;
                 }
                 Err(e) => {
                     self.last_error = Some(format!("Failed to load `{name}`: {e}"));
@@ -1160,6 +1226,10 @@ impl LayerCraftApp {
                 self.last_error = None;
                 self.printability_report = None;
                 self.project_dirty = true;
+                if !append {
+                    self.current_project_title =
+                        Some(recent_projects::display_title_from_name(name));
+                }
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -1171,6 +1241,13 @@ impl LayerCraftApp {
                 self.append_repair_warning_to_status();
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
+                #[cfg(target_arch = "wasm32")]
+                if !append && record_recent {
+                    let fmt = recent_projects::infer_file_format(name);
+                    self.record_recent_browser(name, &fmt);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = record_recent;
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed to load `{name}`: {e}"));
@@ -1330,6 +1407,10 @@ impl LayerCraftApp {
                 self.last_error = None;
                 self.printability_report = None;
                 self.project_dirty = true;
+                if !append {
+                    self.current_recent_id = None;
+                    self.current_project_title = Some(shape.label().to_owned());
+                }
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -1992,6 +2073,7 @@ impl LayerCraftApp {
                 self.refresh_printability_after_slice();
                 self.rebuild_scene();
                 self.set_active_layer(layers.saturating_sub(1));
+                self.update_current_recent_after_slice();
             }
             WebSliceOutcome::Error { job_id, message } => {
                 if job_id != self.next_slice_job_id {
@@ -2044,6 +2126,7 @@ impl LayerCraftApp {
                 self.refresh_printability_after_slice();
                 self.rebuild_scene();
                 self.set_active_layer(layers.saturating_sub(1));
+                self.update_current_recent_after_slice();
             }
             Err(SliceJobError::Cancelled) => {
                 self.last_error = None;
@@ -2090,6 +2173,7 @@ impl LayerCraftApp {
         self.refresh_printability_after_slice();
         self.rebuild_scene();
         self.set_active_layer(layers.saturating_sub(1));
+        self.update_current_recent_after_slice();
     }
 
     pub(crate) fn frame_camera(&mut self, preset: CameraPreset) {
@@ -2376,6 +2460,7 @@ impl LayerCraftApp {
                     self.playback_playing = false;
                     self.frame_camera(CameraPreset::Isometric);
                     self.rebuild_scene();
+                    self.record_recent_native(std::path::Path::new(path));
                 }
                 Err(e) => {
                     self.last_error = Some(format!("Failed loading `{path}`: {e}"));
@@ -2393,10 +2478,6 @@ impl LayerCraftApp {
                 self.last_error = None;
                 self.printability_report = None;
                 self.project_dirty = true;
-                if !append {
-                    self.prefs.push_recent_file(path);
-                    self.sync_and_save_prefs();
-                }
                 self.selected_object_id = self.session.objects.last().map(|o| o.id);
                 self.selected_modifier_id = None;
                 self.view_mode = ViewMode::Prepare;
@@ -2404,6 +2485,11 @@ impl LayerCraftApp {
                 self.append_repair_warning_to_status();
                 self.frame_camera(CameraPreset::Isometric);
                 self.rebuild_scene();
+                if !append {
+                    self.prefs.push_recent_file(path);
+                    self.sync_and_save_prefs();
+                    self.record_recent_native(std::path::Path::new(path));
+                }
             }
             Err(e) => {
                 self.last_error = Some(format!("Failed loading `{path}`: {e}"));
@@ -2435,6 +2521,7 @@ impl LayerCraftApp {
                         let p_str = path.to_string_lossy().into_owned();
                         self.prefs.push_recent_file(&p_str);
                         self.sync_and_save_prefs();
+                        self.record_recent_native(&path);
                         self.status_message = format!("Saved project `{}`.", path.display());
                     }
                     Err(e) => {
@@ -2454,12 +2541,346 @@ impl LayerCraftApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.project_dirty = false;
+                    let title = self.active_project_title();
+                    self.record_recent_browser(&title, "3mf");
                     self.status_message =
                         "Triggered browser download `layercraft_project.3mf`.".to_owned();
                 }
                 Err(e) => {
                     self.last_error = Some(format!("Download failed: {e}"));
                 }
+            }
+        }
+    }
+
+    /// Active project title for header pill & Home cards.
+    pub(crate) fn active_project_title(&self) -> String {
+        if let Some(title) = self.current_project_title.as_deref()
+            && !title.trim().is_empty()
+        {
+            return title.to_owned();
+        }
+        if let Some(first) = self.session.objects.first() {
+            let trimmed = recent_projects::display_title_from_name(&first.name);
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        "Untitled Project".to_owned()
+    }
+
+    /// Clear current plate into a clean blank workspace in Prepare view.
+    pub(crate) fn new_empty_project_action(&mut self) {
+        self.clear_plate_action();
+        self.current_recent_id = None;
+        self.current_project_title = None;
+        self.view_mode = ViewMode::Prepare;
+        self.status_message =
+            "Started new empty project — drop an .stl/.3mf file or add a calibration shape."
+                .to_owned();
+    }
+
+    fn format_estimated_time(secs: f64) -> String {
+        let total = secs.max(0.0).round() as u64;
+        let hours = total / 3_600;
+        let mins = (total % 3_600) / 60;
+        let rem_secs = total % 60;
+        if hours > 0 {
+            format!("{hours}h {mins:02}m")
+        } else if mins > 0 {
+            format!("{mins}m {rem_secs:02}s")
+        } else {
+            format!("{rem_secs}s")
+        }
+    }
+
+    fn total_project_object_count(&self) -> usize {
+        let total: usize = self
+            .session
+            .list_plates()
+            .iter()
+            .map(|p| p.object_count)
+            .sum();
+        total.max(self.session.objects.len())
+    }
+
+    fn render_session_thumbnail_b64(&self) -> Option<String> {
+        let single_or_prepared = if self.session.objects.is_empty() {
+            self.session.prepared_mesh.as_deref().cloned()
+        } else if self.session.objects.len() == 1 {
+            self.session
+                .objects
+                .first()
+                .map(|o| layercraft_geom::TriangleMesh::clone(&o.prepared_mesh))
+        } else {
+            let tris: Vec<layercraft_geom::Triangle> = self
+                .session
+                .objects
+                .iter()
+                .flat_map(|o| o.prepared_mesh.triangles.iter().copied())
+                .collect();
+            layercraft_geom::TriangleMesh::new(tris).ok()
+        };
+        recent_projects::render_plate_thumbnail_b64(
+            single_or_prepared.as_ref(),
+            self.session.sliced.as_ref(),
+            &self.session.config,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn record_recent_native(&mut self, path: &std::path::Path) {
+        let path_str = path.to_string_lossy().into_owned();
+        let id = recent_projects::native_entry_id(path);
+        let name = recent_projects::display_title_from_name(&path_str);
+        let format = recent_projects::infer_file_format(&path_str);
+        let entry = recent_projects::RecentProjectEntry {
+            id: id.clone(),
+            name: name.clone(),
+            format,
+            source: recent_projects::RecentProjectSource::NativePath,
+            path: Some(path_str),
+            storage_key: None,
+            last_opened_unix_secs: recent_projects::now_unix_secs(),
+            object_count: self.total_project_object_count(),
+            plate_count: self.session.plate_count().max(1),
+            printer_name: self.selected_machine_profile.clone(),
+            estimated_time: self
+                .session
+                .last_gcode
+                .as_ref()
+                .map(|g| Self::format_estimated_time(g.stats.estimated_time_s)),
+            thumbnail_png_b64: self.render_session_thumbnail_b64(),
+        };
+        self.recent_projects.upsert(entry);
+        self.recent_thumb_textures.remove(&id);
+        self.current_recent_id = Some(id);
+        self.current_project_title = Some(name);
+        #[cfg(not(test))]
+        {
+            let _ = self.recent_projects.save_to_disk();
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn record_recent_browser(&mut self, display_name: &str, format: &str) {
+        let Ok(bytes) = export_project_3mf_bytes(&self.session) else {
+            return;
+        };
+        if bytes.len() > recent_projects::MAX_BROWSER_PROJECT_BLOB_BYTES {
+            return;
+        }
+        let now = recent_projects::now_unix_secs();
+        let name = recent_projects::display_title_from_name(display_name);
+        let key = match self.current_recent_id.as_deref() {
+            Some(existing) if existing.starts_with("web:") => existing.to_owned(),
+            _ => format!("web:{}-{now}", slugify_printer_id(&name)),
+        };
+        let entry = recent_projects::RecentProjectEntry {
+            id: key.clone(),
+            name: name.clone(),
+            format: format.to_ascii_lowercase(),
+            source: recent_projects::RecentProjectSource::BrowserIndexedDb,
+            path: None,
+            storage_key: Some(key.clone()),
+            last_opened_unix_secs: now,
+            object_count: self.total_project_object_count(),
+            plate_count: self.session.plate_count().max(1),
+            printer_name: self.selected_machine_profile.clone(),
+            estimated_time: self
+                .session
+                .last_gcode
+                .as_ref()
+                .map(|g| Self::format_estimated_time(g.stats.estimated_time_s)),
+            thumbnail_png_b64: self.render_session_thumbnail_b64(),
+        };
+        self.recent_projects.upsert(entry);
+        self.recent_thumb_textures.remove(&key);
+        self.current_recent_id = Some(key.clone());
+        self.current_project_title = Some(name);
+        #[cfg(not(test))]
+        {
+            let _ = self.recent_projects.save_to_disk();
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = recent_projects::idb_put_project_bytes(&key, &bytes).await;
+        });
+    }
+
+    fn update_current_recent_after_slice(&mut self) {
+        let Some(cur_id) = self.current_recent_id.clone() else {
+            return;
+        };
+        let est = self
+            .session
+            .last_gcode
+            .as_ref()
+            .map(|g| Self::format_estimated_time(g.stats.estimated_time_s));
+        let printer_name = self.selected_machine_profile.clone();
+        let object_count = self.total_project_object_count();
+        let plate_count = self.session.plate_count().max(1);
+        let thumb = self.render_session_thumbnail_b64();
+        let mut updated = false;
+        if let Some(entry) = self
+            .recent_projects
+            .entries
+            .iter_mut()
+            .find(|e| e.id == cur_id)
+        {
+            entry.estimated_time = est;
+            entry.printer_name = printer_name;
+            entry.object_count = object_count;
+            entry.plate_count = plate_count;
+            entry.last_opened_unix_secs = recent_projects::now_unix_secs();
+            if thumb.is_some() {
+                entry.thumbnail_png_b64 = thumb;
+            }
+            updated = true;
+        }
+        if updated {
+            self.recent_thumb_textures.remove(&cur_id);
+            #[cfg(not(test))]
+            {
+                let _ = self.recent_projects.save_to_disk();
+            }
+        }
+    }
+
+    /// Re-open a stored recent project entry by ID.
+    pub(crate) fn open_recent_project(&mut self, id: &str) {
+        let Some(entry) = self
+            .recent_projects
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+        else {
+            self.last_error = Some("Recent project entry no longer exists.".to_owned());
+            return;
+        };
+
+        match entry.source {
+            recent_projects::RecentProjectSource::NativePath => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some(path_str) = entry.path else {
+                        self.last_error =
+                            Some("Recent project entry is missing a path.".to_owned());
+                        return;
+                    };
+                    if std::path::Path::new(&path_str).exists() {
+                        self.load_native_path_with_mode(&path_str, false);
+                    } else {
+                        self.last_error = Some(format!(
+                            "File not found on disk: `{path_str}`. You can remove it from Recent Projects."
+                        ));
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.last_error = Some(
+                        "Local filesystem projects cannot be reopened from the browser build."
+                            .to_owned(),
+                    );
+                }
+            }
+            recent_projects::RecentProjectSource::BrowserIndexedDb => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let Some(key) = entry.storage_key.or_else(|| Some(entry.id.clone())) else {
+                        self.last_error =
+                            Some("Browser project entry is missing storage key.".to_owned());
+                        return;
+                    };
+                    let id_clone = entry.id.clone();
+                    let name_clone = entry.name.clone();
+                    let pending_slot = std::rc::Rc::clone(&self.pending_browser_recent);
+                    let ctx_opt = self.last_ctx.clone();
+                    self.last_error = None;
+                    self.status_message =
+                        format!("Restoring `{}` from browser cache...", entry.name);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let res = recent_projects::idb_get_project_bytes(&key).await;
+                        if let Ok(mut guard) = pending_slot.try_borrow_mut() {
+                            *guard = Some((id_clone, name_clone, res));
+                        }
+                        if let Some(ctx) = ctx_opt {
+                            ctx.request_repaint();
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.last_error = Some(
+                        "Browser IndexedDB projects are only available in web builds.".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remove a single entry from Recent Projects (and IndexedDB in WASM).
+    pub(crate) fn remove_recent_project(&mut self, id: &str) {
+        if let Some(removed) = self.recent_projects.remove(id) {
+            self.recent_thumb_textures.remove(id);
+            if self.current_recent_id.as_deref() == Some(id) {
+                self.current_recent_id = None;
+            }
+            #[cfg(not(test))]
+            {
+                let _ = self.recent_projects.save_to_disk();
+            }
+            #[cfg(target_arch = "wasm32")]
+            if let Some(key) = removed.storage_key {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = recent_projects::idb_delete_project_bytes(&key).await;
+                });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = removed;
+        }
+    }
+
+    /// Clear all Recent Projects entries (and browser IndexedDB cache in WASM).
+    pub(crate) fn clear_recent_projects(&mut self) {
+        self.recent_projects.clear();
+        self.recent_thumb_textures.clear();
+        self.current_recent_id = None;
+        #[cfg(not(test))]
+        {
+            let _ = self.recent_projects.save_to_disk();
+        }
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async {
+            let _ = recent_projects::idb_clear_project_bytes().await;
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_pending_browser_recent(&mut self) {
+        let ready = self
+            .pending_browser_recent
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut g| g.take());
+        let Some((id, name, res)) = ready else {
+            return;
+        };
+        match res {
+            Ok(Some(bytes)) => {
+                self.current_recent_id = Some(id.clone());
+                self.load_mesh_bytes_inner(&format!("{name}.3mf"), bytes, false, false);
+                self.current_recent_id = Some(id);
+                self.current_project_title = Some(name);
+                self.project_dirty = false;
+            }
+            Ok(None) => {
+                self.last_error = Some(format!(
+                    "Cached browser project data for `{name}` was not found in IndexedDB."
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed opening cached project `{name}`: {e}"));
             }
         }
     }
@@ -3249,7 +3670,7 @@ impl LayerCraftApp {
 
                 let (draw_mesh, draw_ghost, toolpath_range, travel_range, nozzle_pos) =
                     match self.view_mode {
-                        ViewMode::Prepare => (true, false, 0..0, 0..0, None),
+                        ViewMode::Home | ViewMode::Prepare => (true, false, 0..0, 0..0, None),
                         ViewMode::Preview => {
                             let n = self.scene.layer_ranges.len();
                             if n == 0 {
@@ -3373,6 +3794,7 @@ impl LayerCraftApp {
         {
             self.last_ctx = Some(ui.ctx().clone());
             self.poll_pending_web_slice(ui.ctx());
+            self.poll_pending_browser_recent();
         }
 
         self.pointer_active = ui.ctx().egui_is_using_pointer();
@@ -3413,7 +3835,7 @@ impl LayerCraftApp {
                 self.save_project_action();
             }
 
-            if ui.input(|i| i.key_pressed(egui::Key::F)) {
+            if self.view_mode != ViewMode::Home && ui.input(|i| i.key_pressed(egui::Key::F)) {
                 self.frame_camera(CameraPreset::Isometric);
             }
             if self.view_mode == ViewMode::Preview && !self.scene.layer_ranges.is_empty() {
@@ -3463,26 +3885,34 @@ impl LayerCraftApp {
         }
 
         toolbar::draw_header_bar(self, ui, &palette);
-        toolbar::draw_ribbon_bar(self, ui, &palette);
-        toolbar::draw_plates_bar(self, ui, &palette);
         self.draw_status_bar(ui, &palette);
 
-        let cfg_before_sidebar = self.session.config.clone();
-        sidebar::draw_sidebar(self, ui, &palette);
-        if self.session.config != cfg_before_sidebar {
-            self.printability_report = None;
-            self.project_dirty = true;
-            if self.pending_config_undo.is_none() {
-                self.pending_config_undo = Some(cfg_before_sidebar);
+        if self.view_mode == ViewMode::Home {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(palette.bg_panel))
+                .show(ui, |ui| {
+                    home::draw_home_page(self, ui, &palette);
+                });
+        } else {
+            let cfg_before_sidebar = self.session.config.clone();
+            sidebar::draw_sidebar(self, ui, &palette);
+            if self.session.config != cfg_before_sidebar {
+                self.printability_report = None;
+                self.project_dirty = true;
+                if self.pending_config_undo.is_none() {
+                    self.pending_config_undo = Some(cfg_before_sidebar);
+                }
             }
-        }
-        if !ui.ctx().egui_is_using_pointer()
-            && !ui.ctx().egui_wants_keyboard_input()
-            && let Some(prev_cfg) = self.pending_config_undo.take()
-            && self.session.config != prev_cfg
-        {
-            self.session
-                .push_config_undo_snapshot("Edit settings", prev_cfg);
+            if !ui.ctx().egui_is_using_pointer()
+                && !ui.ctx().egui_wants_keyboard_input()
+                && let Some(prev_cfg) = self.pending_config_undo.take()
+                && self.session.config != prev_cfg
+            {
+                self.session
+                    .push_config_undo_snapshot("Edit settings", prev_cfg);
+            }
+
+            self.viewport_panel(ui, &palette);
         }
 
         if let Some(rect) = ui.ctx().input(|i| i.viewport().inner_rect) {
@@ -3500,7 +3930,6 @@ impl LayerCraftApp {
             }
         }
 
-        self.viewport_panel(ui, &palette);
         #[cfg(not(target_arch = "wasm32"))]
         self.draw_printer_upload_dialog(ui.ctx(), &palette);
         self.draw_save_preset_dialog(ui.ctx(), &palette);
@@ -3765,12 +4194,10 @@ impl LayerCraftApp {
     fn execute_discard_action(&mut self, action: PendingDiscardAction) {
         match action {
             PendingDiscardAction::ClearPlate => self.clear_plate_action(),
+            PendingDiscardAction::NewEmptyProject => self.new_empty_project_action(),
             PendingDiscardAction::LoadSample(shape) => self.load_sample_with_mode(shape, false),
             PendingDiscardAction::OpenFileDialog => self.open_file_dialog(false),
-            #[cfg(not(target_arch = "wasm32"))]
-            PendingDiscardAction::OpenRecentPath(path) => {
-                self.load_native_path_with_mode(&path, false)
-            }
+            PendingDiscardAction::OpenRecentId(id) => self.open_recent_project(&id),
         }
     }
 
@@ -4394,5 +4821,72 @@ mod tests {
             ";LAYER_CHANGE"
         );
         assert!(app.gcode_index.active_move_line(0, 1, 10).is_some());
+    }
+
+    #[test]
+    fn ui_home_page_and_recent_projects_workflow() {
+        let mut app = LayerCraftApp::new_home();
+        assert_eq!(app.view_mode, ViewMode::Home);
+
+        // Seed a recent project entry with an actual rendered 3D plate thumbnail
+        let sample_mesh = layercraft_mesh::build_sample_shape(SampleShape::Dome).unwrap();
+        let thumb_b64 = recent_projects::render_plate_thumbnail_b64(
+            Some(&sample_mesh),
+            None,
+            &app.session.config,
+        );
+        assert!(thumb_b64.is_some());
+
+        app.recent_projects
+            .upsert(recent_projects::RecentProjectEntry {
+                id: "native:/tmp/dome_test.3mf".to_owned(),
+                name: "dome_test".to_owned(),
+                format: "3mf".to_owned(),
+                source: recent_projects::RecentProjectSource::NativePath,
+                path: Some("/tmp/dome_test.3mf".to_owned()),
+                storage_key: None,
+                last_opened_unix_secs: recent_projects::now_unix_secs(),
+                object_count: 1,
+                plate_count: 1,
+                printer_name: Some("Prusa CORE One".to_owned()),
+                estimated_time: Some("24m 10s".to_owned()),
+                thumbnail_png_b64: thumb_b64,
+            });
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        // Render Home in Dark mode & Light mode + search filter
+        app.set_theme_mode(ThemeMode::Dark);
+        let mut out = ctx.run_ui(raw_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        assert!(
+            app.recent_thumb_textures
+                .contains_key("native:/tmp/dome_test.3mf")
+        );
+
+        app.home_search = "dome".to_owned();
+        app.set_theme_mode(ThemeMode::Light);
+        let mut out = ctx.run_ui(raw_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
+        // Transition to Prepare with sample + Settings live search + Preview frame
+        app.load_sample(SampleShape::Dome);
+        assert_eq!(app.view_mode, ViewMode::Prepare);
+        app.sidebar_tab = SidebarTab::Quality;
+        app.settings_search = "arachne".to_owned();
+        let mut out = ctx.run_ui(raw_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
+        app.run_slice();
+        assert_eq!(app.view_mode, ViewMode::Preview);
+        let mut out = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        out.textures_delta.clear();
     }
 }

@@ -30,7 +30,7 @@ fn main() {
                     if let Some(rs) = cc.wgpu_render_state.as_ref() {
                         install_renderer(rs);
                     }
-                    Ok(Box::new(LayerCraftApp::default()))
+                    Ok(Box::new(LayerCraftApp::new_home()))
                 }),
             )
             .await;

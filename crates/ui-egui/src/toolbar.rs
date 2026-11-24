@@ -1,209 +1,101 @@
-//! Two-tier top application chrome: slim header bar + collapsible contextual ribbon.
+//! Sleek single-row 44px Studio top bar: workspace switcher, File menu, Project/Plate selector, and primary CTA.
 
 use egui::{Align, CornerRadius, Margin, Popup, RichText, Stroke, StrokeKind, pos2, vec2};
-use layercraft_config::ModifierRole;
-use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_viewport::ColorMode;
 
 use crate::icons::{Icon, paint_icon};
+use crate::recent_projects::{format_relative_time, now_unix_secs};
 use crate::theme::{ThemeMode, ThemePalette};
-use crate::ui_kit::{
-    badge, icon_button, primary_button, ribbon_button, ribbon_dropdown_button, secondary_button,
-    v_divider,
-};
-use crate::{LayerCraftApp, ViewMode};
+use crate::ui_kit::{icon_button, primary_button, secondary_button, v_divider};
+use crate::{LayerCraftApp, PendingDiscardAction, ViewMode};
 
-/// Top header bar containing brand identity, Prepare/Preview mode switch, theme, and primary CTA.
+/// Top 44px application header bar.
 pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
     let resp = egui::Panel::top("layercraft_header")
         .frame(
             egui::Frame::NONE
                 .fill(p.bg_chrome)
-                .inner_margin(Margin::symmetric(12, 6)),
+                .inner_margin(Margin::symmetric(14, 7)),
         )
         .show(ui, |ui| {
-            let avail_w = ui.available_width();
-            ui.horizontal(|ui| {
-                ui.set_min_height(28.0);
-                ui.spacing_mut().item_spacing.x = if avail_w < 540.0 { 5.0 } else { 8.0 };
+            let avail_w = ui.available_width().max(120.0);
+            let (row_rect, _) = ui.allocate_exact_size(vec2(avail_w, 30.0), egui::Sense::hover());
 
-                // Brand mark & title
-                let (mark_rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::hover());
-                paint_icon(ui.painter(), mark_rect, Icon::BrandMark, p.accent);
-                if avail_w >= 540.0 {
-                    ui.label(
-                        RichText::new("LayerCraft")
-                            .size(14.5)
-                            .strong()
-                            .color(p.text_primary),
-                    );
-                    v_divider(ui, p);
-                }
+            let left_resp = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(row_rect)
+                    .layout(egui::Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = if avail_w < 680.0 { 6.0 } else { 8.0 };
 
-                if icon_button(
-                    ui,
-                    p,
-                    Icon::SidebarToggle,
-                    if app.sidebar_open {
-                        "Hide settings sidebar"
-                    } else {
-                        "Show settings sidebar"
-                    },
-                    app.sidebar_open,
-                )
-                .clicked()
-                {
-                    app.sidebar_open = !app.sidebar_open;
-                }
+                    // Clickable brand mark -> returns to Home hub
+                    let (mark_rect, mark_resp) =
+                        ui.allocate_exact_size(vec2(24.0, 24.0), egui::Sense::click());
+                    if ui.is_rect_visible(mark_rect) {
+                        if mark_resp.hovered() {
+                            ui.painter().rect(
+                                mark_rect,
+                                CornerRadius::same(6),
+                                p.bg_hover,
+                                Stroke::new(1.0, p.border_subtle),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        paint_icon(
+                            ui.painter(),
+                            mark_rect.shrink(3.0),
+                            Icon::BrandMark,
+                            p.accent,
+                        );
+                    }
+                    if mark_resp
+                        .on_hover_text("Return to LayerCraft Home")
+                        .clicked()
+                    {
+                        app.view_mode = ViewMode::Home;
+                    }
 
-                // Prepare / Preview segmented pill switcher
-                draw_view_mode_switcher(app, ui, p);
+                    // Home | Prepare | Preview segmented pill switcher
+                    draw_view_mode_switcher(app, ui, p);
 
-                // Compact active printer & layer height chip
-                if avail_w >= 860.0 {
-                    let machine_short = app
-                        .selected_machine_profile
-                        .as_deref()
-                        .map(|s| s.strip_prefix("LayerCraft ").unwrap_or(s))
-                        .unwrap_or("Default Printer");
-                    let summary = format!(
-                        "{machine_short} · {:.2} mm",
-                        app.session.config.process.layer_height_mm
-                    );
-                    badge(ui, p.bg_card, p.text_secondary, &summary);
-                }
+                    // File menu popover
+                    draw_file_menu(app, ui, p);
+                },
+            );
 
-                // Right-aligned primary actions & theme/ribbon controls
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let right_resp = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(row_rect)
+                    .layout(egui::Layout::right_to_left(Align::Center)),
+                |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    let slicing = app.is_slicing();
-                    let slicing_label = if slicing {
-                        match app.slice_progress_snapshot() {
-                            Some((done, total)) if total > 0 => format!("Slicing {done}/{total}..."),
-                            _ => "Slicing...".to_owned(),
-                        }
-                    } else {
-                        String::new()
-                    };
+                    draw_right_actions(app, ui, p, avail_w);
+                },
+            );
 
-                    match app.view_mode {
-                        ViewMode::Prepare => {
-                            let label = if slicing {
-                                slicing_label.as_str()
-                            } else if avail_w < 640.0 {
-                                "Slice"
-                            } else {
-                                "Slice Plate"
-                            };
-                            ui.add_enabled_ui(!slicing, |ui| {
-                                if primary_button(ui, p, Icon::SliceLayers, label).clicked() {
-                                    app.start_slice_action(ui.ctx());
-                                }
-                            });
-                            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
-                                app.cancel_slice_action();
-                            }
-                        }
-                        ViewMode::Preview => {
-                            let binary_mode = app.session.config.machine.binary_gcode;
-                            let export_label = if avail_w < 640.0 {
-                                if binary_mode { ".bgcode" } else { "G-code" }
-                            } else if cfg!(target_arch = "wasm32") {
-                                if binary_mode {
-                                    "Download .bgcode"
-                                } else {
-                                    "Download G-code"
-                                }
-                            } else if binary_mode {
-                                "Export .bgcode"
-                            } else {
-                                "Export G-code"
-                            };
-                            let has_gcode = app.session.last_gcode.is_some();
-                            if has_gcode
-                                && primary_button(ui, p, Icon::Export, export_label).clicked()
-                            {
-                                app.export_gcode_action();
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            if has_gcode {
-                                let send_lbl = if avail_w < 720.0 {
-                                    "Send"
-                                } else {
-                                    "Send to Printer"
-                                };
-                                ui.add_enabled_ui(!app.is_printer_busy(), |ui| {
-                                    if secondary_button(ui, p, Some(Icon::SendPrinter), send_lbl)
-                                        .on_hover_text(
-                                            "Upload .bgcode or G-code directly to a printer over LAN",
-                                        )
-                                        .clicked()
-                                    {
-                                        app.open_upload_dialog();
-                                    }
-                                });
-                            }
-                            let reslice_label = if slicing {
-                                slicing_label.as_str()
-                            } else {
-                                "Re-slice"
-                            };
-                            ui.add_enabled_ui(!slicing, |ui| {
-                                if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label)
-                                    .clicked()
-                                {
-                                    app.start_slice_action(ui.ctx());
-                                }
-                            });
-                            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
-                                app.cancel_slice_action();
-                            }
-                        }
-                    }
-
-                    if avail_w >= 540.0 {
-                        v_divider(ui, p);
-                    }
-
-                    let theme_icon = match app.theme_mode {
-                        ThemeMode::Dark => Icon::ThemeDark,
-                        ThemeMode::Light => Icon::ThemeLight,
-                        ThemeMode::System => Icon::ThemeSystem,
-                    };
-                    if icon_button(
-                        ui,
-                        p,
-                        theme_icon,
-                        &format!("Theme: {} (click to cycle)", app.theme_mode.label()),
-                        false,
-                    )
-                    .clicked()
-                    {
-                        app.cycle_theme_mode();
-                    }
-
-                    let ribbon_icon = if app.ribbon_collapsed {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronUp
-                    };
-                    if icon_button(
-                        ui,
-                        p,
-                        ribbon_icon,
-                        if app.ribbon_collapsed {
-                            "Expand ribbon toolbar"
-                        } else {
-                            "Collapse ribbon toolbar"
+            // Center Project + Plate selector pill (hidden on Home or ultra-narrow viewports)
+            if app.view_mode != ViewMode::Home {
+                let left_bound = left_resp.response.rect.right() + 12.0;
+                let right_bound = right_resp.response.rect.left() - 12.0;
+                let max_span = (right_bound - left_bound).max(0.0);
+                if max_span >= 140.0 {
+                    let target_w = max_span.min(340.0);
+                    let ideal_left = (row_rect.center().x - target_w * 0.5)
+                        .clamp(left_bound, (right_bound - target_w).max(left_bound));
+                    let center_rect = egui::Rect::from_min_size(
+                        pos2(ideal_left, row_rect.top()),
+                        vec2(target_w.min(max_span), row_rect.height()),
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new().max_rect(center_rect).layout(
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        ),
+                        |ui| {
+                            draw_project_plate_pill(app, ui, p, center_rect.width());
                         },
-                        !app.ribbon_collapsed,
-                    )
-                    .clicked()
-                    {
-                        app.ribbon_collapsed = !app.ribbon_collapsed;
-                    }
-                });
-            });
+                    );
+                }
+            }
         })
         .response;
 
@@ -215,6 +107,8 @@ pub fn draw_header_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePale
 }
 
 fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    let mut target_mode: Option<ViewMode> = None;
+
     egui::Frame::NONE
         .fill(p.bg_input)
         .stroke(Stroke::new(1.0, p.border_subtle))
@@ -224,6 +118,7 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (mode, label) in [
+                    (ViewMode::Home, "Home"),
                     (ViewMode::Prepare, "Prepare"),
                     (ViewMode::Preview, "Preview"),
                 ] {
@@ -231,11 +126,12 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                     let text_col = if active { p.text_primary } else { p.text_muted };
                     let galley = ui.painter().layout_no_wrap(
                         label.to_owned(),
-                        egui::TextStyle::Button.resolve(ui.style()),
+                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
                         text_col,
                     );
+                    let icon_extra = if mode == ViewMode::Home { 16.0 } else { 0.0 };
                     let (seg_rect, seg_resp) = ui.allocate_exact_size(
-                        vec2(galley.size().x + 20.0, 22.0),
+                        vec2(galley.size().x + 18.0 + icon_extra, 22.0),
                         egui::Sense::click(),
                     );
                     if ui.is_rect_visible(seg_rect) {
@@ -257,435 +153,486 @@ fn draw_view_mode_switcher(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &Theme
                             ui.painter()
                                 .rect_filled(seg_rect, CornerRadius::same(5), p.bg_hover);
                         }
-                        let pos = pos2(
-                            seg_rect.center().x - galley.size().x * 0.5,
-                            seg_rect.center().y - galley.size().y * 0.5,
-                        );
-                        ui.painter().galley(pos, galley, text_col);
+                        if mode == ViewMode::Home {
+                            let ir = egui::Rect::from_center_size(
+                                pos2(seg_rect.left() + 14.0, seg_rect.center().y),
+                                vec2(12.0, 12.0),
+                            );
+                            paint_icon(
+                                ui.painter(),
+                                ir,
+                                Icon::Home,
+                                if active { p.accent } else { p.text_muted },
+                            );
+                            let pos = pos2(
+                                ir.right() + 4.0,
+                                seg_rect.center().y - galley.size().y * 0.5,
+                            );
+                            ui.painter().galley(pos, galley, text_col);
+                        } else {
+                            let pos = pos2(
+                                seg_rect.center().x - galley.size().x * 0.5,
+                                seg_rect.center().y - galley.size().y * 0.5,
+                            );
+                            ui.painter().galley(pos, galley, text_col);
+                        }
                     }
-                    if seg_resp.clicked() {
-                        app.view_mode = mode;
+                    if seg_resp.clicked() && !active {
+                        target_mode = Some(mode);
                     }
                 }
             });
         });
+
+    if let Some(mode) = target_mode {
+        match mode {
+            ViewMode::Preview => {
+                if app.session.sliced.is_none() && !app.session.objects.is_empty() {
+                    app.run_slice();
+                } else {
+                    app.view_mode = ViewMode::Preview;
+                }
+            }
+            other => app.view_mode = other,
+        }
+    }
 }
 
-/// Collapsible contextual action ribbon directly beneath the header bar.
-pub fn draw_ribbon_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
-    if app.ribbon_collapsed {
-        return;
+fn draw_file_menu(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
+    let font_id = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let galley = ui
+        .painter()
+        .layout_no_wrap("File".to_owned(), font_id, p.text_secondary);
+    let width = galley.size().x + 26.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() || resp.is_pointer_button_down_on() {
+            p.bg_hover
+        } else {
+            p.bg_chrome
+        };
+        let stroke = if resp.hovered() {
+            Stroke::new(1.0, p.border_subtle)
+        } else {
+            Stroke::NONE
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(6),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        let col = if resp.hovered() {
+            p.text_primary
+        } else {
+            p.text_secondary
+        };
+        ui.painter().galley(
+            pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5),
+            galley,
+            col,
+        );
+        let chev = egui::Rect::from_center_size(
+            pos2(rect.right() - 9.0, rect.center().y),
+            vec2(10.0, 10.0),
+        );
+        paint_icon(ui.painter(), chev, Icon::ChevronDown, p.text_muted);
     }
-    let resp = egui::Panel::top("layercraft_ribbon")
-        .frame(
-            egui::Frame::NONE
-                .fill(p.bg_panel)
-                .inner_margin(Margin::symmetric(12, 5)),
-        )
-        .show(ui, |ui| {
-            egui::ScrollArea::horizontal()
-                .id_salt("layercraft_ribbon_scroll")
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(26.0);
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        match app.view_mode {
-                            ViewMode::Prepare => draw_prepare_ribbon(app, ui, p),
-                            ViewMode::Preview => draw_preview_ribbon(app, ui, p),
-                        }
-                    });
-                });
-        })
-        .response;
 
-    let r = resp.rect;
-    ui.painter().line_segment(
-        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
-        Stroke::new(1.0, p.border_subtle),
-    );
+    let menu_resp = resp.on_hover_text("Project files, exports, profiles, and recent items");
+    Popup::menu(&menu_resp).show(|ui| {
+        ui.set_min_width(230.0);
+
+        if ui.button("Open File...  (STL / 3MF)").clicked() {
+            app.request_discard_or_run(PendingDiscardAction::OpenFileDialog);
+            ui.close();
+        }
+        if ui.button("Add Model to Plate...").clicked() {
+            app.open_file_dialog(true);
+            ui.close();
+        }
+        if ui.button("New Empty Plate").clicked() {
+            app.request_discard_or_run(PendingDiscardAction::NewEmptyProject);
+            ui.close();
+        }
+
+        ui.separator();
+
+        let save_lbl = if app.project_dirty {
+            "Save Project (.3mf)*   Ctrl+S"
+        } else {
+            "Save Project (.3mf)   Ctrl+S"
+        };
+        if ui.button(save_lbl).clicked() {
+            app.save_project_action();
+            ui.close();
+        }
+
+        let has_gcode = app.session.last_gcode.is_some();
+        ui.add_enabled_ui(has_gcode, |ui| {
+            if ui.button("Export G-code (.gcode)").clicked() {
+                app.export_gcode_with_format(false);
+                ui.close();
+            }
+            if ui.button("Export Binary G-code (.bgcode)").clicked() {
+                app.export_gcode_with_format(true);
+                ui.close();
+            }
+        });
+
+        ui.separator();
+
+        if ui.button("Import Profile JSON...").clicked() {
+            app.import_profile_file_dialog();
+            ui.close();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if ui.button("Load Profile Folder...").clicked() {
+            app.import_profile_dir_dialog();
+            ui.close();
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("Recent Projects")
+                .size(10.5)
+                .color(p.text_muted),
+        );
+        if app.recent_projects.entries.is_empty() {
+            ui.label(
+                RichText::new("No recent projects yet")
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
+        } else {
+            let now = now_unix_secs();
+            let recent_snapshot: Vec<(String, String, String)> = app
+                .recent_projects
+                .entries
+                .iter()
+                .take(5)
+                .map(|e| {
+                    (
+                        e.id.clone(),
+                        format!(
+                            "{}  [{} · {}]",
+                            e.name,
+                            e.format.to_ascii_uppercase(),
+                            format_relative_time(e.last_opened_unix_secs, now)
+                        ),
+                        e.path.clone().unwrap_or_else(|| e.name.clone()),
+                    )
+                })
+                .collect();
+            for (id, label, tip) in recent_snapshot {
+                if ui.button(&label).on_hover_text(tip).clicked() {
+                    app.request_discard_or_run(PendingDiscardAction::OpenRecentId(id));
+                    ui.close();
+                }
+            }
+        }
+        ui.separator();
+        if ui.button("View All Recent on Home").clicked() {
+            app.view_mode = ViewMode::Home;
+            ui.close();
+        }
+    });
 }
 
-/// Compact build plate switcher strip shown whenever the project has multiple plates.
-pub fn draw_plates_bar(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
-    if app.session.plate_count() <= 1 {
-        return;
-    }
+fn draw_project_plate_pill(
+    app: &mut LayerCraftApp,
+    ui: &mut egui::Ui,
+    p: &ThemePalette,
+    max_width: f32,
+) {
     let plates = app.session.list_plates();
+    let total_plates = plates.len().max(1);
+    let active_plate = plates.iter().find(|pl| pl.active);
+    let active_idx = active_plate.map(|pl| pl.index).unwrap_or(0);
+    let active_name = active_plate.map(|pl| pl.name.as_str()).unwrap_or("Plate 1");
+    let is_sliced = active_plate.is_some_and(|pl| pl.sliced);
+
+    let title = app.active_project_title();
+    let dirty_mark = if app.project_dirty { "*" } else { "" };
+    let full_label = format!(
+        "{title}{dirty_mark}  ·  {active_name} ({}/{total_plates})",
+        active_idx + 1
+    );
+
+    let font_id = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let mut display_label = full_label.clone();
+    let mut galley =
+        ui.painter()
+            .layout_no_wrap(display_label.clone(), font_id.clone(), p.text_primary);
+    let extra_w = 34.0;
+    if galley.size().x + extra_w > max_width {
+        display_label = format!("{title}{dirty_mark} · P{}/{total_plates}", active_idx + 1);
+        galley = ui
+            .painter()
+            .layout_no_wrap(display_label, font_id, p.text_primary);
+    }
+
+    let pill_w = (galley.size().x + extra_w).min(max_width).max(110.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(pill_w, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() || resp.is_pointer_button_down_on() {
+            p.bg_hover
+        } else {
+            p.bg_card
+        };
+        let stroke = Stroke::new(
+            1.0,
+            if resp.hovered() {
+                p.border_strong
+            } else {
+                p.border_subtle
+            },
+        );
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(7),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+
+        let dot_col = if is_sliced { p.success } else { p.text_muted };
+        ui.painter()
+            .circle_filled(pos2(rect.left() + 11.0, rect.center().y), 3.0, dot_col);
+
+        let avail_text_w = (rect.width() - 34.0).max(20.0);
+        let text_x = rect.left() + 19.0;
+        let clipped_rect = egui::Rect::from_min_max(
+            pos2(text_x, rect.top()),
+            pos2(text_x + avail_text_w, rect.bottom()),
+        );
+        ui.painter().with_clip_rect(clipped_rect).galley(
+            pos2(text_x, rect.center().y - galley.size().y * 0.5),
+            galley,
+            p.text_primary,
+        );
+
+        let chev = egui::Rect::from_center_size(
+            pos2(rect.right() - 10.0, rect.center().y),
+            vec2(10.0, 10.0),
+        );
+        paint_icon(ui.painter(), chev, Icon::ChevronDown, p.text_muted);
+    }
+
+    let pill_menu = resp.on_hover_text(format!(
+        "{full_label} — click to switch, add, or remove build plates"
+    ));
     let mut select_idx: Option<usize> = None;
     let mut add_requested = false;
+    let mut remove_idx: Option<usize> = None;
 
-    let resp = egui::Panel::top("layercraft_plates_bar")
-        .frame(
-            egui::Frame::NONE
-                .fill(p.bg_chrome)
-                .inner_margin(Margin::symmetric(12, 3)),
-        )
-        .show(ui, |ui| {
-            egui::ScrollArea::horizontal()
-                .id_salt("layercraft_plates_scroll")
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(22.0);
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        ui.label(RichText::new("Plates:").size(11.0).color(p.text_muted));
-
-                        for plate in &plates {
-                            let label = format!(
-                                "{}. {} ({})",
-                                plate.index + 1,
-                                plate.name,
-                                plate.object_count
-                            );
-                            let fill = if plate.active {
-                                p.accent_muted
-                            } else {
-                                p.bg_card
-                            };
-                            let stroke = if plate.active {
-                                Stroke::new(1.0, p.accent)
-                            } else {
-                                Stroke::new(1.0, p.border_subtle)
-                            };
-                            let text_col = if plate.active {
-                                p.text_primary
-                            } else {
-                                p.text_secondary
-                            };
-                            let btn_resp = egui::Frame::new()
-                                .fill(fill)
-                                .stroke(stroke)
-                                .corner_radius(CornerRadius::same(5))
-                                .inner_margin(Margin::symmetric(8, 2))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        if plate.sliced {
-                                            let (dot_r, _) = ui.allocate_exact_size(
-                                                vec2(6.0, 12.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().circle_filled(
-                                                dot_r.center(),
-                                                2.5,
-                                                p.success,
-                                            );
-                                        }
-                                        ui.label(
-                                            RichText::new(&label)
-                                                .size(11.5)
-                                                .strong()
-                                                .color(text_col),
-                                        );
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-                            if btn_resp
-                                .on_hover_text(format!(
-                                    "Switch to `{}` ({} object(s){})",
-                                    plate.name,
-                                    plate.object_count,
-                                    if plate.sliced { ", sliced" } else { "" }
-                                ))
-                                .clicked()
-                                && !plate.active
-                            {
-                                select_idx = Some(plate.index);
-                            }
-                        }
-
-                        if icon_button(ui, p, Icon::AddPlus, "Add new empty build plate", false)
-                            .clicked()
-                        {
-                            add_requested = true;
+    Popup::menu(&pill_menu).show(|ui| {
+        ui.set_min_width(240.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Build Plates")
+                    .size(11.0)
+                    .strong()
+                    .color(p.text_muted),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("+ Add Plate").clicked() {
+                    add_requested = true;
+                    ui.close();
+                }
+            });
+        });
+        ui.separator();
+        for plate in &plates {
+            ui.horizontal(|ui| {
+                let status_dot = if plate.sliced { "● " } else { "○ " };
+                let row_lbl = format!(
+                    "{status_dot}{}. {}  ({} obj)",
+                    plate.index + 1,
+                    plate.name,
+                    plate.object_count
+                );
+                if ui.selectable_label(plate.active, row_lbl).clicked() && !plate.active {
+                    select_idx = Some(plate.index);
+                    ui.close();
+                }
+                if total_plates > 1 {
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Remove plate").clicked() {
+                            remove_idx = Some(plate.index);
+                            ui.close();
                         }
                     });
-                });
-        })
-        .response;
-
-    let r = resp.rect;
-    ui.painter().line_segment(
-        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
-        Stroke::new(1.0, p.border_subtle),
-    );
+                }
+            });
+        }
+    });
 
     if let Some(idx) = select_idx {
         app.select_plate(idx);
     } else if add_requested {
         app.add_plate(None);
+    } else if let Some(idx) = remove_idx {
+        app.remove_plate(idx);
     }
 }
 
-fn draw_prepare_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
-    if ribbon_button(ui, p, Icon::OpenFile, "Open", false)
-        .on_hover_text("Open STL or 3MF model/project (replaces current plate)")
-        .clicked()
-    {
-        app.request_discard_or_run(crate::PendingDiscardAction::OpenFileDialog);
-    }
-    if ribbon_button(ui, p, Icon::AddPlus, "Add File", false)
-        .on_hover_text("Add STL or 3MF model to plate")
-        .clicked()
-    {
-        app.open_file_dialog(true);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let has_recent = !app.prefs.recent_files.is_empty();
-        ui.add_enabled_ui(has_recent, |ui| {
-            let recent_resp = ribbon_dropdown_button(ui, p, Icon::OpenFile, "Recent")
-                .on_hover_text("Re-open a recent STL or 3MF file");
-            Popup::menu(&recent_resp).show(|ui| {
-                ui.set_min_width(240.0);
-                let recent_snapshot = app.prefs.recent_files.clone();
-                for path_str in &recent_snapshot {
-                    let display = std::path::Path::new(path_str)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(path_str.as_str());
-                    if ui.button(display).on_hover_text(path_str).clicked() {
-                        app.request_discard_or_run(crate::PendingDiscardAction::OpenRecentPath(
-                            path_str.clone(),
-                        ));
-                        ui.close();
-                    }
-                }
-                if !recent_snapshot.is_empty() {
-                    ui.separator();
-                    if ui.small_button("Clear Recent").clicked() {
-                        app.prefs.recent_files.clear();
-                        app.sync_and_save_prefs();
-                        ui.close();
-                    }
+fn draw_right_actions(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette, avail_w: f32) {
+    let slicing = app.is_slicing();
+    let slicing_label = if slicing {
+        match app.slice_progress_snapshot() {
+            Some((done, total)) if total > 0 => format!("Slicing {done}/{total}..."),
+            _ => "Slicing...".to_owned(),
+        }
+    } else {
+        String::new()
+    };
+
+    // Primary CTA rendered first in right_to_left so it sits at far right
+    match app.view_mode {
+        ViewMode::Home => {
+            if primary_button(ui, p, Icon::OpenFile, "Open File").clicked() {
+                app.request_discard_or_run(PendingDiscardAction::OpenFileDialog);
+            }
+        }
+        ViewMode::Prepare => {
+            let label = if slicing {
+                slicing_label.as_str()
+            } else if avail_w < 720.0 {
+                "Slice"
+            } else {
+                "Slice Plate"
+            };
+            ui.add_enabled_ui(!slicing, |ui| {
+                if primary_button(ui, p, Icon::SliceLayers, label).clicked() {
+                    app.start_slice_action(ui.ctx());
                 }
             });
-        });
-    }
-
-    let save_label = if app.project_dirty {
-        "Save .3mf*"
-    } else {
-        "Save .3mf"
-    };
-    if ribbon_button(ui, p, Icon::SaveProject, save_label, app.project_dirty)
-        .on_hover_text(
-            "Save full LayerCraft project (.3mf with objects, modifiers & settings) (Ctrl+S)",
-        )
-        .clicked()
-    {
-        app.save_project_action();
-    }
-
-    let hist = app.session.history_status();
-    let undo_tip = match &hist.undo_label {
-        Some(lbl) => format!("Undo `{lbl}` (Ctrl+Z)"),
-        None => "Nothing to undo (Ctrl+Z)".to_owned(),
-    };
-    ui.add_enabled_ui(hist.can_undo, |ui| {
-        if ribbon_button(ui, p, Icon::Undo, "Undo", false)
-            .on_hover_text(undo_tip)
-            .clicked()
-        {
-            app.undo_action();
+            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
+                app.cancel_slice_action();
+            }
         }
-    });
-    let redo_tip = match &hist.redo_label {
-        Some(lbl) => format!("Redo `{lbl}` (Ctrl+Shift+Z)"),
-        None => "Nothing to redo (Ctrl+Shift+Z)".to_owned(),
-    };
-    ui.add_enabled_ui(hist.can_redo, |ui| {
-        if ribbon_button(ui, p, Icon::Redo, "Redo", false)
-            .on_hover_text(redo_tip)
-            .clicked()
-        {
-            app.redo_action();
-        }
-    });
-
-    v_divider(ui, p);
-
-    let sample_resp = ribbon_dropdown_button(ui, p, Icon::SampleCube, "Samples")
-        .on_hover_text("Load or add built-in calibration meshes");
-    Popup::menu(&sample_resp).show(|ui| {
-        ui.set_min_width(185.0);
-        for shape in SampleShape::ALL {
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(app.selected_sample == shape, shape.label())
-                    .clicked()
-                {
-                    app.request_discard_or_run(crate::PendingDiscardAction::LoadSample(shape));
-                    ui.close();
+        ViewMode::Preview => {
+            let binary_mode = app.session.config.machine.binary_gcode;
+            let export_label = if avail_w < 720.0 {
+                if binary_mode { ".bgcode" } else { "G-code" }
+            } else if cfg!(target_arch = "wasm32") {
+                if binary_mode {
+                    "Download .bgcode"
+                } else {
+                    "Download G-code"
                 }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .small_button("+")
-                        .on_hover_text("Add to existing plate")
+            } else if binary_mode {
+                "Export .bgcode"
+            } else {
+                "Export G-code"
+            };
+            let has_gcode = app.session.last_gcode.is_some();
+            if has_gcode && primary_button(ui, p, Icon::Export, export_label).clicked() {
+                app.export_gcode_action();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if has_gcode {
+                let send_lbl = if avail_w < 840.0 {
+                    "Send"
+                } else {
+                    "Send to Printer"
+                };
+                ui.add_enabled_ui(!app.is_printer_busy(), |ui| {
+                    if secondary_button(ui, p, Some(Icon::SendPrinter), send_lbl)
+                        .on_hover_text("Upload .bgcode or G-code directly to a printer over LAN")
                         .clicked()
                     {
-                        app.load_sample_with_mode(shape, true);
-                        ui.close();
+                        app.open_upload_dialog();
                     }
                 });
+            }
+            let reslice_label = if slicing {
+                slicing_label.as_str()
+            } else {
+                "Re-slice"
+            };
+            ui.add_enabled_ui(!slicing, |ui| {
+                if secondary_button(ui, p, Some(Icon::SliceLayers), reslice_label).clicked() {
+                    app.start_slice_action(ui.ctx());
+                }
             });
-        }
-    });
-
-    let can_arrange = app.session.objects.len() > 1;
-    ui.add_enabled_ui(can_arrange, |ui| {
-        if ribbon_button(ui, p, Icon::ArrangeGrid, "Arrange", false)
-            .on_hover_text("Auto-arrange objects onto build plate")
-            .clicked()
-        {
-            app.auto_arrange_plate();
-        }
-    });
-
-    ui.add_enabled_ui(!app.session.objects.is_empty(), |ui| {
-        if ribbon_button(ui, p, Icon::Trash, "Clear", false)
-            .on_hover_text("Clear objects and modifiers from active build plate")
-            .clicked()
-        {
-            app.request_discard_or_run(crate::PendingDiscardAction::ClearPlate);
-        }
-    });
-
-    v_divider(ui, p);
-
-    ui.label(RichText::new("Modifiers:").size(11.0).color(p.text_muted));
-    if ribbon_button(ui, p, Icon::BoxShape, "+ Box", false)
-        .on_hover_text("Add box parameter modifier volume")
-        .clicked()
-    {
-        app.add_modifier_primitive(
-            ModifierPrimitive::Box {
-                width_mm: 12.0,
-                depth_mm: 12.0,
-                height_mm: 10.0,
-            },
-            ModifierRole::Modifier,
-        );
-    }
-    if ribbon_button(ui, p, Icon::CylinderShape, "+ Cyl", false)
-        .on_hover_text("Add cylinder parameter modifier volume")
-        .clicked()
-    {
-        app.add_modifier_primitive(
-            ModifierPrimitive::Cylinder {
-                radius_mm: 6.0,
-                height_mm: 10.0,
-                segments: 32,
-            },
-            ModifierRole::Modifier,
-        );
-    }
-    if ribbon_button(ui, p, Icon::ShieldOff, "+ Blocker", false)
-        .on_hover_text("Add support blocker box")
-        .clicked()
-    {
-        app.add_modifier_primitive(
-            ModifierPrimitive::Box {
-                width_mm: 12.0,
-                depth_mm: 12.0,
-                height_mm: 10.0,
-            },
-            ModifierRole::SupportBlocker,
-        );
-    }
-    if ribbon_button(ui, p, Icon::ShieldPlus, "+ Enforcer", false)
-        .on_hover_text("Add support enforcer box")
-        .clicked()
-    {
-        app.add_modifier_primitive(
-            ModifierPrimitive::Box {
-                width_mm: 12.0,
-                depth_mm: 12.0,
-                height_mm: 10.0,
-            },
-            ModifierRole::SupportEnforcer,
-        );
-    }
-    if ribbon_button(ui, p, Icon::BoxShape, "+ Cutout", false)
-        .on_hover_text("Add negative part cutout box")
-        .clicked()
-    {
-        app.add_modifier_primitive(
-            ModifierPrimitive::Box {
-                width_mm: 12.0,
-                depth_mm: 12.0,
-                height_mm: 10.0,
-            },
-            ModifierRole::NegativePart,
-        );
-    }
-
-    v_divider(ui, p);
-    if ribbon_button(ui, p, Icon::Import, "Import JSON", false)
-        .on_hover_text("Import OrcaSlicer/Bambu JSON profile")
-        .clicked()
-    {
-        app.import_profile_file_dialog();
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if ribbon_button(ui, p, Icon::OpenFile, "Profile Dir", false)
-            .on_hover_text("Load all JSON profiles in a folder")
-            .clicked()
-        {
-            app.import_profile_dir_dialog();
+            if slicing && secondary_button(ui, p, None, "Cancel").clicked() {
+                app.cancel_slice_action();
+            }
         }
     }
-}
 
-fn draw_preview_ribbon(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {
-    ui.label(RichText::new("Color by:").size(11.0).color(p.text_muted));
-    let mut mode_changed = false;
-    for mode in ColorMode::ALL {
-        let active = app.color_mode == mode;
-        if ribbon_button(ui, p, Icon::Layers, mode.label(), active).clicked() && !active {
-            app.color_mode = mode;
-            mode_changed = true;
-        }
-    }
-    if mode_changed {
-        app.rebuild_scene();
-    }
-
-    v_divider(ui, p);
-
-    if ribbon_button(ui, p, Icon::Layers, "Single Layer", app.single_layer_only).clicked() {
-        app.single_layer_only = !app.single_layer_only;
-    }
-    if ribbon_button(ui, p, Icon::Ghost, "Ghost Mesh", app.show_ghost_mesh).clicked() {
-        app.show_ghost_mesh = !app.show_ghost_mesh;
-    }
-    if ribbon_button(ui, p, Icon::ArrangeGrid, "Grid", app.show_bed_grid).clicked() {
-        app.show_bed_grid = !app.show_bed_grid;
-        app.rebuild_scene();
-    }
-    if ribbon_button(ui, p, Icon::Legend, "Summary & Legend", app.show_legend_hud).clicked() {
-        app.show_legend_hud = !app.show_legend_hud;
-    }
-    if ribbon_button(ui, p, Icon::Legend, "G-code", app.show_gcode_viewer).clicked() {
-        app.show_gcode_viewer = !app.show_gcode_viewer;
-    }
-
-    if app.session.last_gcode.is_some() {
+    if avail_w >= 560.0 {
         v_divider(ui, p);
-        if ribbon_button(ui, p, Icon::Export, ".bgcode", false)
-            .on_hover_text("Export or download Prusa Binary G-code (.bgcode)")
-            .clicked()
+    }
+
+    let theme_icon = match app.theme_mode {
+        ThemeMode::Dark => Icon::ThemeDark,
+        ThemeMode::Light => Icon::ThemeLight,
+        ThemeMode::System => Icon::ThemeSystem,
+    };
+    if icon_button(
+        ui,
+        p,
+        theme_icon,
+        &format!("Theme: {} (click to cycle)", app.theme_mode.label()),
+        false,
+    )
+    .clicked()
+    {
+        app.cycle_theme_mode();
+    }
+
+    if app.view_mode != ViewMode::Home {
+        if icon_button(
+            ui,
+            p,
+            Icon::SidebarToggle,
+            if app.sidebar_open {
+                "Hide right inspector"
+            } else {
+                "Show right inspector"
+            },
+            app.sidebar_open,
+        )
+        .clicked()
         {
-            app.export_gcode_with_format(true);
+            app.sidebar_open = !app.sidebar_open;
         }
-        if ribbon_button(ui, p, Icon::Export, ".gcode", false)
-            .on_hover_text("Export or download plain-text G-code (.gcode)")
-            .clicked()
+
+        let hist = app.session.history_status();
+        let redo_tip = match &hist.redo_label {
+            Some(lbl) => format!("Redo `{lbl}` (Ctrl+Shift+Z)"),
+            None => "Nothing to redo (Ctrl+Shift+Z)".to_owned(),
+        };
+        ui.add_enabled_ui(hist.can_redo, |ui| {
+            if icon_button(ui, p, Icon::Redo, &redo_tip, false).clicked() {
+                app.redo_action();
+            }
+        });
+
+        let undo_tip = match &hist.undo_label {
+            Some(lbl) => format!("Undo `{lbl}` (Ctrl+Z)"),
+            None => "Nothing to undo (Ctrl+Z)".to_owned(),
+        };
+        ui.add_enabled_ui(hist.can_undo, |ui| {
+            if icon_button(ui, p, Icon::Undo, &undo_tip, false).clicked() {
+                app.undo_action();
+            }
+        });
+
+        // Subtle color-mode quick indicator when in Preview on wide screens
+        if app.view_mode == ViewMode::Preview
+            && app.color_mode != ColorMode::Feature
+            && avail_w >= 960.0
         {
-            app.export_gcode_with_format(false);
+            ui.label(
+                RichText::new(app.color_mode.label())
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
         }
     }
 }

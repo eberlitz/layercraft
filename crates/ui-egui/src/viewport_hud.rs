@@ -1,9 +1,11 @@
 //! Floating 3D viewport overlays: Orientation Gizmo, Preview Summary/Legend, Vertical Layer Scrubber, Bottom Pill, Drag-Drop Overlay.
 
 use egui::{
-    Align, Align2, Area, Color32, Context, CornerRadius, Id, Margin, Order, Rect, RichText, Sense,
-    Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
+    Align, Align2, Area, Color32, Context, CornerRadius, Id, Margin, Order, Popup, Rect, RichText,
+    Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
+use layercraft_config::ModifierRole;
+use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_slice::ExtrusionRole;
 use layercraft_viewport::{
     CameraPreset, ColorMode, MoveKind, color_ramp_sample, compute_color_mode_range, role_color,
@@ -12,8 +14,8 @@ use layercraft_viewport::{
 use crate::icons::Icon;
 use crate::theme::ThemePalette;
 use crate::ui_kit::badge;
-use crate::ui_kit::{hud_frame, icon_button, ribbon_button};
-use crate::{LayerCraftApp, ViewMode};
+use crate::ui_kit::{floating_rail_frame, hud_frame, icon_button, rail_tool_button, ribbon_button};
+use crate::{LayerCraftApp, PendingDiscardAction, ViewMode, ViewportToolMode};
 
 /// Draw all floating HUD elements inside `viewport_rect` without permanently docking panels over the canvas.
 pub fn draw_viewport_hud(
@@ -22,27 +24,232 @@ pub fn draw_viewport_hud(
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
-    if viewport_rect.width() < 80.0 || viewport_rect.height() < 80.0 {
+    if app.view_mode == ViewMode::Home
+        || viewport_rect.width() < 80.0
+        || viewport_rect.height() < 80.0
+    {
         return;
     }
 
     draw_orientation_gizmo(app, ctx, viewport_rect, p);
-    draw_bottom_view_pill(app, ctx, viewport_rect, p);
 
-    if app.view_mode == ViewMode::Preview {
-        if app.show_legend_hud {
-            draw_preview_summary_hud(app, ctx, viewport_rect, p);
+    match app.view_mode {
+        ViewMode::Home => {}
+        ViewMode::Prepare => {
+            draw_prepare_tool_rail(app, ctx, viewport_rect, p);
+            draw_bottom_view_pill(app, ctx, viewport_rect, p);
         }
-        if app.show_gcode_viewer {
-            draw_gcode_viewer_hud(app, ctx, viewport_rect, p);
+        ViewMode::Preview => {
+            if app.show_legend_hud {
+                draw_preview_summary_hud(app, ctx, viewport_rect, p);
+            }
+            if app.show_gcode_viewer {
+                draw_gcode_viewer_hud(app, ctx, viewport_rect, p);
+            }
+            draw_vertical_layer_scrubber(app, ctx, viewport_rect, p);
+            draw_preview_bottom_dock(app, ctx, viewport_rect, p);
         }
-        draw_vertical_layer_scrubber(app, ctx, viewport_rect, p);
-        draw_horizontal_move_scrubber(app, ctx, viewport_rect, p);
     }
 
     if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
         draw_drag_drop_overlay(ctx, viewport_rect, p);
     }
+}
+
+fn draw_prepare_tool_rail(
+    app: &mut LayerCraftApp,
+    ctx: &Context,
+    viewport_rect: Rect,
+    p: &ThemePalette,
+) {
+    Area::new(Id::unique("layercraft_hud_prepare_rail"))
+        .order(Order::Foreground)
+        .pivot(Align2::LEFT_TOP)
+        .fixed_pos(viewport_rect.left_top() + vec2(12.0, 12.0))
+        .constrain_to(viewport_rect)
+        .show(ctx, |ui| {
+            floating_rail_frame(p).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+
+                    if rail_tool_button(
+                        ui,
+                        p,
+                        Icon::SelectCursor,
+                        app.tool_mode == ViewportToolMode::Select,
+                        "Select & inspect objects on build plate",
+                    )
+                    .clicked()
+                    {
+                        app.tool_mode = ViewportToolMode::Select;
+                    }
+
+                    if rail_tool_button(
+                        ui,
+                        p,
+                        Icon::AddPlus,
+                        false,
+                        "Add STL or 3MF model to plate",
+                    )
+                    .clicked()
+                    {
+                        app.open_file_dialog(true);
+                    }
+
+                    let can_arrange = app.session.objects.len() > 1;
+                    ui.add_enabled_ui(can_arrange, |ui| {
+                        if rail_tool_button(
+                            ui,
+                            p,
+                            Icon::ArrangeGrid,
+                            false,
+                            "Auto-arrange objects onto build plate",
+                        )
+                        .clicked()
+                        {
+                            app.auto_arrange_plate();
+                        }
+                    });
+
+                    let mod_resp = rail_tool_button(
+                        ui,
+                        p,
+                        Icon::BoxShape,
+                        false,
+                        "Add modifier volume, support blocker/enforcer, or cutout",
+                    );
+                    Popup::menu(&mod_resp).show(|ui| {
+                        ui.set_min_width(185.0);
+                        ui.label(
+                            RichText::new("Add Volume")
+                                .size(10.5)
+                                .strong()
+                                .color(p.text_muted),
+                        );
+                        ui.separator();
+                        if ui.button("+ Box Modifier").clicked() {
+                            app.add_modifier_primitive(
+                                ModifierPrimitive::Box {
+                                    width_mm: 12.0,
+                                    depth_mm: 12.0,
+                                    height_mm: 10.0,
+                                },
+                                ModifierRole::Modifier,
+                            );
+                            ui.close();
+                        }
+                        if ui.button("+ Cylinder Modifier").clicked() {
+                            app.add_modifier_primitive(
+                                ModifierPrimitive::Cylinder {
+                                    radius_mm: 6.0,
+                                    height_mm: 10.0,
+                                    segments: 32,
+                                },
+                                ModifierRole::Modifier,
+                            );
+                            ui.close();
+                        }
+                        if ui.button("+ Support Blocker").clicked() {
+                            app.add_modifier_primitive(
+                                ModifierPrimitive::Box {
+                                    width_mm: 12.0,
+                                    depth_mm: 12.0,
+                                    height_mm: 10.0,
+                                },
+                                ModifierRole::SupportBlocker,
+                            );
+                            ui.close();
+                        }
+                        if ui.button("+ Support Enforcer").clicked() {
+                            app.add_modifier_primitive(
+                                ModifierPrimitive::Box {
+                                    width_mm: 12.0,
+                                    depth_mm: 12.0,
+                                    height_mm: 10.0,
+                                },
+                                ModifierRole::SupportEnforcer,
+                            );
+                            ui.close();
+                        }
+                        if ui.button("+ Negative Cutout").clicked() {
+                            app.add_modifier_primitive(
+                                ModifierPrimitive::Box {
+                                    width_mm: 12.0,
+                                    depth_mm: 12.0,
+                                    height_mm: 10.0,
+                                },
+                                ModifierRole::NegativePart,
+                            );
+                            ui.close();
+                        }
+                    });
+
+                    let sample_resp = rail_tool_button(
+                        ui,
+                        p,
+                        Icon::SampleCube,
+                        false,
+                        "Load or add built-in calibration sample",
+                    );
+                    Popup::menu(&sample_resp).show(|ui| {
+                        ui.set_min_width(195.0);
+                        ui.label(
+                            RichText::new("Calibration Shapes")
+                                .size(10.5)
+                                .strong()
+                                .color(p.text_muted),
+                        );
+                        ui.separator();
+                        for shape in SampleShape::ALL {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(app.selected_sample == shape, shape.label())
+                                    .clicked()
+                                {
+                                    app.request_discard_or_run(PendingDiscardAction::LoadSample(
+                                        shape,
+                                    ));
+                                    ui.close();
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .small_button("+")
+                                        .on_hover_text("Add to existing plate")
+                                        .clicked()
+                                    {
+                                        app.load_sample_with_mode(shape, true);
+                                        ui.close();
+                                    }
+                                });
+                            });
+                        }
+                    });
+
+                    let (div_r, _) = ui.allocate_exact_size(vec2(32.0, 5.0), Sense::hover());
+                    ui.painter().line_segment(
+                        [
+                            pos2(div_r.left() + 4.0, div_r.center().y),
+                            pos2(div_r.right() - 4.0, div_r.center().y),
+                        ],
+                        Stroke::new(1.0, p.border_subtle),
+                    );
+
+                    ui.add_enabled_ui(!app.session.objects.is_empty(), |ui| {
+                        if rail_tool_button(
+                            ui,
+                            p,
+                            Icon::Trash,
+                            false,
+                            "Clear objects and modifiers from active plate",
+                        )
+                        .clicked()
+                        {
+                            app.request_discard_or_run(PendingDiscardAction::ClearPlate);
+                        }
+                    });
+                });
+            });
+        });
 }
 
 fn draw_orientation_gizmo(
@@ -191,7 +398,7 @@ fn draw_preview_summary_hud(
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
-    let Some(g) = &app.session.last_gcode else {
+    let Some(stats) = app.session.last_gcode.as_ref().map(|g| g.stats.clone()) else {
         return;
     };
 
@@ -218,8 +425,8 @@ fn draw_preview_summary_hud(
                 });
 
                 ui.add_space(4.0);
-                let mins = (g.stats.estimated_time_s / 60.0).floor() as u64;
-                let secs = (g.stats.estimated_time_s % 60.0).round() as u64;
+                let mins = (stats.estimated_time_s / 60.0).floor() as u64;
+                let secs = (stats.estimated_time_s % 60.0).round() as u64;
                 egui::Grid::new("hud_summary_grid")
                     .num_columns(2)
                     .spacing([14.0, 4.0])
@@ -231,13 +438,13 @@ fn draw_preview_summary_hud(
                             "Filament",
                             &format!(
                                 "{:.1} g · {:.1} m",
-                                g.stats.filament_weight_g,
-                                g.stats.filament_length_mm / 1000.0
+                                stats.filament_weight_g,
+                                stats.filament_length_mm / 1000.0
                             ),
                         );
                         ui.end_row();
-                        metric_cell(ui, p, "Layers", &format!("{}", g.stats.layer_count));
-                        metric_cell(ui, p, "Height", &format!("{:.2} mm", g.stats.max_z_mm));
+                        metric_cell(ui, p, "Layers", &format!("{}", stats.layer_count));
+                        metric_cell(ui, p, "Height", &format!("{:.2} mm", stats.max_z_mm));
                         ui.end_row();
                     });
 
@@ -245,16 +452,34 @@ fn draw_preview_summary_hud(
                 ui.separator();
                 ui.add_space(4.0);
 
+                // Integrated Color Mode selector inside summary HUD
+                let mut color_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Color by").size(10.5).color(p.text_secondary));
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("hud_color_mode")
+                            .width(142.0)
+                            .selected_text(app.color_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in ColorMode::ALL {
+                                    if ui
+                                        .selectable_value(&mut app.color_mode, mode, mode.label())
+                                        .changed()
+                                    {
+                                        color_changed = true;
+                                    }
+                                }
+                            });
+                    });
+                });
+                if color_changed {
+                    app.rebuild_scene();
+                }
+                ui.add_space(5.0);
+
                 match app.color_mode {
                     ColorMode::Feature => {
-                        ui.label(
-                            RichText::new("FEATURE LEGEND")
-                                .size(10.0)
-                                .strong()
-                                .color(p.text_muted),
-                        );
-                        ui.add_space(2.0);
-                        for role in [
+                        let all_roles = [
                             ExtrusionRole::OuterWall,
                             ExtrusionRole::InnerWall,
                             ExtrusionRole::OverhangWall,
@@ -270,7 +495,51 @@ fn draw_preview_summary_hud(
                             ExtrusionRole::SupportInterface,
                             ExtrusionRole::Skirt,
                             ExtrusionRole::Brim,
-                        ] {
+                        ];
+                        let any_positive = all_roles.iter().any(|r| {
+                            stats
+                                .features
+                                .get(r.label())
+                                .is_some_and(|fs| fs.volume_mm3 > 0.0)
+                        });
+                        let show_all = app.show_all_legend_roles || !any_positive;
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("FEATURE LEGEND")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(p.text_muted),
+                            );
+                            if any_positive {
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    let toggle_txt = if app.show_all_legend_roles {
+                                        "Active only"
+                                    } else {
+                                        "Show all"
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(toggle_txt)
+                                                    .size(10.0)
+                                                    .color(p.accent),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.show_all_legend_roles = !app.show_all_legend_roles;
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(2.0);
+                        for role in all_roles {
+                            let vol_opt = stats.features.get(role.label()).map(|fs| fs.volume_mm3);
+                            if !show_all && !vol_opt.is_some_and(|v| v > 0.0) {
+                                continue;
+                            }
                             let c = role_color(role);
                             let col = Color32::from_rgb(
                                 (c[0] * 255.0) as u8,
@@ -284,12 +553,12 @@ fn draw_preview_summary_hud(
                                 ui.label(
                                     RichText::new(role.label()).size(11.0).color(p.text_primary),
                                 );
-                                if let Some(fs) = g.stats.features.get(role.label()) {
+                                if let Some(vol) = vol_opt {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(Align::Center),
                                         |ui| {
                                             ui.label(
-                                                RichText::new(format!("{:.1} mm³", fs.volume_mm3))
+                                                RichText::new(format!("{vol:.1} mm³"))
                                                     .size(10.5)
                                                     .color(p.text_muted),
                                             );
@@ -611,213 +880,289 @@ fn draw_vertical_layer_scrubber(
     }
 }
 
-fn draw_horizontal_move_scrubber(
+fn draw_preview_bottom_dock(
     app: &mut LayerCraftApp,
     ctx: &Context,
     viewport_rect: Rect,
     p: &ThemePalette,
 ) {
     let total_layers = app.scene.layer_ranges.len();
-    if total_layers == 0 {
-        return;
-    }
-    let layer_idx = app.max_layer.min(total_layers - 1);
-    let step_count = app
-        .scene
-        .layer_steps
-        .get(layer_idx)
-        .map(Vec::len)
-        .unwrap_or(0);
-    if step_count == 0 {
-        return;
-    }
-    let cur_step = app.layer_move_step.min(step_count);
-    let active_step_info = if cur_step == 0 {
-        app.scene
+    let step_info = if total_layers > 0 {
+        let layer_idx = app.max_layer.min(total_layers - 1);
+        let step_count = app
+            .scene
             .layer_steps
             .get(layer_idx)
-            .and_then(|s| s.first())
-            .copied()
+            .map(Vec::len)
+            .unwrap_or(0);
+        if step_count > 0 {
+            let cur_step = app.layer_move_step.min(step_count);
+            let active_step_info = if cur_step == 0 {
+                app.scene
+                    .layer_steps
+                    .get(layer_idx)
+                    .and_then(|s| s.first())
+                    .copied()
+            } else {
+                app.scene
+                    .layer_steps
+                    .get(layer_idx)
+                    .and_then(|s| s.get(cur_step - 1))
+                    .copied()
+            };
+            Some((step_count, cur_step, active_step_info))
+        } else {
+            None
+        }
     } else {
-        app.scene
-            .layer_steps
-            .get(layer_idx)
-            .and_then(|s| s.get(cur_step - 1))
-            .copied()
+        None
     };
 
-    let track_w = (viewport_rect.width() * 0.34).clamp(130.0, 320.0);
-    Area::new(Id::unique("layercraft_hud_move_scrubber"))
+    let track_w = (viewport_rect.width() * 0.28).clamp(120.0, 290.0);
+    Area::new(Id::unique("layercraft_hud_preview_dock"))
         .order(Order::Foreground)
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(pos2(
             viewport_rect.center().x,
-            viewport_rect.bottom() - 54.0,
+            viewport_rect.bottom() - 12.0,
         ))
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
-            hud_frame(p)
-                .inner_margin(Margin::symmetric(10, 6))
+            floating_rail_frame(p)
+                .inner_margin(Margin::symmetric(12, 7))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        let play_icon = if app.playback_playing {
-                            Icon::Pause
-                        } else {
-                            Icon::Play
-                        };
-                        let play_tip = if app.playback_playing {
-                            "Pause toolpath playback (Space)"
-                        } else {
-                            "Play layer toolpath moves (Space)"
-                        };
-                        if icon_button(ui, p, play_icon, play_tip, app.playback_playing).clicked() {
-                            if app.playback_playing {
-                                app.playback_playing = false;
-                                app.last_playback_time_s = None;
-                            } else {
-                                if app.layer_move_step >= step_count {
-                                    app.layer_move_step = 0;
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        if let Some((step_count, cur_step, active_step_info)) = step_info {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                let play_icon = if app.playback_playing {
+                                    Icon::Pause
+                                } else {
+                                    Icon::Play
+                                };
+                                let play_tip = if app.playback_playing {
+                                    "Pause toolpath playback (Space)"
+                                } else {
+                                    "Play layer toolpath moves (Space)"
+                                };
+                                if icon_button(ui, p, play_icon, play_tip, app.playback_playing)
+                                    .clicked()
+                                {
+                                    if app.playback_playing {
+                                        app.playback_playing = false;
+                                        app.last_playback_time_s = None;
+                                    } else {
+                                        if app.layer_move_step >= step_count {
+                                            app.layer_move_step = 0;
+                                        }
+                                        app.playback_playing = true;
+                                        app.playback_accum = 0.0;
+                                        app.last_playback_time_s = None;
+                                    }
                                 }
-                                app.playback_playing = true;
-                                app.playback_accum = 0.0;
-                                app.last_playback_time_s = None;
-                            }
+
+                                let speed_label = format!("{}×", app.playback_speed as u32);
+                                let (sp_rect, sp_resp) =
+                                    ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
+                                if ui.is_rect_visible(sp_rect) {
+                                    let bg = if sp_resp.hovered() {
+                                        p.bg_hover
+                                    } else {
+                                        p.bg_card
+                                    };
+                                    ui.painter().rect(
+                                        sp_rect,
+                                        CornerRadius::same(4),
+                                        bg,
+                                        Stroke::new(1.0, p.border_subtle),
+                                        StrokeKind::Inside,
+                                    );
+                                    ui.painter().text(
+                                        sp_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        &speed_label,
+                                        egui::FontId::proportional(10.5),
+                                        p.text_secondary,
+                                    );
+                                }
+                                if sp_resp
+                                    .on_hover_text("Cycle playback speed (1× / 2× / 5× / 10×)")
+                                    .clicked()
+                                {
+                                    app.playback_speed = if app.playback_speed < 1.5 {
+                                        2.0
+                                    } else if app.playback_speed < 3.5 {
+                                        5.0
+                                    } else if app.playback_speed < 8.0 {
+                                        10.0
+                                    } else {
+                                        1.0
+                                    };
+                                }
+
+                                if scrubber_step_button(ui, p, "<", "Previous move (Left Arrow)")
+                                    .clicked()
+                                {
+                                    app.playback_playing = false;
+                                    app.last_playback_time_s = None;
+                                    if app.layer_move_step > 0 {
+                                        app.layer_move_step -= 1;
+                                    }
+                                }
+
+                                let (track_rect, track_resp) = ui.allocate_exact_size(
+                                    vec2(track_w, 20.0),
+                                    Sense::click_and_drag(),
+                                );
+
+                                if track_resp.hovered() {
+                                    let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                                    if wheel > 4.0 && app.layer_move_step < step_count {
+                                        app.layer_move_step += 1;
+                                    } else if wheel < -4.0 && app.layer_move_step > 0 {
+                                        app.layer_move_step -= 1;
+                                    }
+                                }
+
+                                if (track_resp.clicked() || track_resp.dragged())
+                                    && let Some(ptr) = track_resp.interact_pointer_pos()
+                                {
+                                    app.playback_playing = false;
+                                    app.last_playback_time_s = None;
+                                    let frac = ((ptr.x - track_rect.left()) / track_rect.width())
+                                        .clamp(0.0, 1.0);
+                                    let next = (frac * (step_count as f32)).round() as usize;
+                                    app.layer_move_step = next.min(step_count);
+                                }
+
+                                let frac = if step_count == 0 {
+                                    1.0
+                                } else {
+                                    (cur_step as f32) / (step_count as f32)
+                                };
+                                let rail = Rect::from_center_size(
+                                    track_rect.center(),
+                                    vec2(track_rect.width(), 5.0),
+                                );
+                                ui.painter()
+                                    .rect_filled(rail, CornerRadius::same(3), p.bg_input);
+
+                                let thumb_x = track_rect.left() + frac * track_rect.width();
+                                let active_rail = Rect::from_min_max(
+                                    pos2(rail.left(), rail.top()),
+                                    pos2(thumb_x, rail.bottom()),
+                                );
+                                ui.painter().rect_filled(
+                                    active_rail,
+                                    CornerRadius::same(3),
+                                    p.accent,
+                                );
+
+                                let knob = pos2(thumb_x, track_rect.center().y);
+                                ui.painter().circle(
+                                    knob,
+                                    6.0,
+                                    p.text_primary,
+                                    Stroke::new(2.0, p.accent),
+                                );
+
+                                if scrubber_step_button(ui, p, ">", "Next move (Right Arrow)")
+                                    .clicked()
+                                {
+                                    app.playback_playing = false;
+                                    app.last_playback_time_s = None;
+                                    if app.layer_move_step < step_count {
+                                        app.layer_move_step += 1;
+                                    }
+                                }
+
+                                ui.add_space(4.0);
+                                if let Some(step) = active_step_info {
+                                    let c = step.kind.color();
+                                    let dot_col = Color32::from_rgb(
+                                        (c[0] * 255.0) as u8,
+                                        (c[1] * 255.0) as u8,
+                                        (c[2] * 255.0) as u8,
+                                    );
+                                    let (dot_r, _) =
+                                        ui.allocate_exact_size(vec2(8.0, 12.0), Sense::hover());
+                                    ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
+
+                                    let desc = if cur_step == 0 {
+                                        format!("0/{step_count} · Start")
+                                    } else if matches!(step.kind, MoveKind::Extrusion(_)) {
+                                        format!(
+                                            "{cur_step}/{step_count} · {} · {:.1} mm³/s · Fan {}%",
+                                            step.kind.label(),
+                                            step.flow_mm3_s,
+                                            step.fan_percent
+                                        )
+                                    } else {
+                                        format!(
+                                            "{cur_step}/{step_count} · {} · Fan {}%",
+                                            step.kind.label(),
+                                            step.fan_percent
+                                        )
+                                    };
+                                    ui.label(RichText::new(desc).size(11.0).color(p.text_primary));
+                                }
+                            });
+                            ui.separator();
                         }
 
-                        let speed_label = format!("{}×", app.playback_speed as u32);
-                        let (sp_rect, sp_resp) =
-                            ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
-                        if ui.is_rect_visible(sp_rect) {
-                            let bg = if sp_resp.hovered() {
-                                p.bg_hover
-                            } else {
-                                p.bg_card
-                            };
-                            ui.painter().rect(
-                                sp_rect,
-                                CornerRadius::same(4),
-                                bg,
-                                Stroke::new(1.0, p.border_subtle),
-                                StrokeKind::Inside,
-                            );
-                            ui.painter().text(
-                                sp_rect.center(),
-                                Align2::CENTER_CENTER,
-                                &speed_label,
-                                egui::FontId::proportional(10.5),
-                                p.text_secondary,
-                            );
-                        }
-                        if sp_resp
-                            .on_hover_text("Cycle playback speed (1× / 2× / 5× / 10×)")
+                        // Canonical Preview view toggles row
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if icon_button(
+                                ui,
+                                p,
+                                Icon::FitFrame,
+                                "Frame build plate & part (F)",
+                                false,
+                            )
                             .clicked()
-                        {
-                            app.playback_speed = if app.playback_speed < 1.5 {
-                                2.0
-                            } else if app.playback_speed < 3.5 {
-                                5.0
-                            } else if app.playback_speed < 8.0 {
-                                10.0
-                            } else {
-                                1.0
-                            };
-                        }
-
-                        if scrubber_step_button(ui, p, "<", "Previous move (Left Arrow)").clicked()
-                        {
-                            app.playback_playing = false;
-                            app.last_playback_time_s = None;
-                            if app.layer_move_step > 0 {
-                                app.layer_move_step -= 1;
+                            {
+                                app.frame_camera(CameraPreset::Isometric);
                             }
-                        }
-
-                        let (track_rect, track_resp) =
-                            ui.allocate_exact_size(vec2(track_w, 20.0), Sense::click_and_drag());
-
-                        if track_resp.hovered() {
-                            let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-                            if wheel > 4.0 && app.layer_move_step < step_count {
-                                app.layer_move_step += 1;
-                            } else if wheel < -4.0 && app.layer_move_step > 0 {
-                                app.layer_move_step -= 1;
+                            if ribbon_button(ui, p, Icon::Layers, "Single", app.single_layer_only)
+                                .on_hover_text("Show only the currently selected layer")
+                                .clicked()
+                            {
+                                app.single_layer_only = !app.single_layer_only;
                             }
-                        }
-
-                        if (track_resp.clicked() || track_resp.dragged())
-                            && let Some(ptr) = track_resp.interact_pointer_pos()
-                        {
-                            app.playback_playing = false;
-                            app.last_playback_time_s = None;
-                            let frac =
-                                ((ptr.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
-                            let next = (frac * (step_count as f32)).round() as usize;
-                            app.layer_move_step = next.min(step_count);
-                        }
-
-                        let frac = if step_count == 0 {
-                            1.0
-                        } else {
-                            (cur_step as f32) / (step_count as f32)
-                        };
-                        let rail = Rect::from_center_size(
-                            track_rect.center(),
-                            vec2(track_rect.width(), 5.0),
-                        );
-                        ui.painter()
-                            .rect_filled(rail, CornerRadius::same(3), p.bg_input);
-
-                        let thumb_x = track_rect.left() + frac * track_rect.width();
-                        let active_rail = Rect::from_min_max(
-                            pos2(rail.left(), rail.top()),
-                            pos2(thumb_x, rail.bottom()),
-                        );
-                        ui.painter()
-                            .rect_filled(active_rail, CornerRadius::same(3), p.accent);
-
-                        let knob = pos2(thumb_x, track_rect.center().y);
-                        ui.painter()
-                            .circle(knob, 6.5, p.text_primary, Stroke::new(2.0, p.accent));
-
-                        if scrubber_step_button(ui, p, ">", "Next move (Right Arrow)").clicked() {
-                            app.playback_playing = false;
-                            app.last_playback_time_s = None;
-                            if app.layer_move_step < step_count {
-                                app.layer_move_step += 1;
+                            if ribbon_button(ui, p, Icon::Travel, "Travels", app.show_travels)
+                                .on_hover_text("Toggle travel move lines (T)")
+                                .clicked()
+                            {
+                                app.show_travels = !app.show_travels;
                             }
-                        }
-
-                        ui.add_space(4.0);
-                        if let Some(step) = active_step_info {
-                            let c = step.kind.color();
-                            let dot_col = Color32::from_rgb(
-                                (c[0] * 255.0) as u8,
-                                (c[1] * 255.0) as u8,
-                                (c[2] * 255.0) as u8,
-                            );
-                            let (dot_r, _) =
-                                ui.allocate_exact_size(vec2(8.0, 12.0), Sense::hover());
-                            ui.painter().circle_filled(dot_r.center(), 3.5, dot_col);
-
-                            let desc = if cur_step == 0 {
-                                format!("0/{step_count} · Start")
-                            } else if matches!(step.kind, MoveKind::Extrusion(_)) {
-                                format!(
-                                    "{cur_step}/{step_count} · {} · {:.1} mm³/s · Fan {}%",
-                                    step.kind.label(),
-                                    step.flow_mm3_s,
-                                    step.fan_percent
-                                )
-                            } else {
-                                format!(
-                                    "{cur_step}/{step_count} · {} · Fan {}%",
-                                    step.kind.label(),
-                                    step.fan_percent
-                                )
-                            };
-                            ui.label(RichText::new(desc).size(11.0).color(p.text_primary));
-                        }
+                            if ribbon_button(ui, p, Icon::Ghost, "Ghost", app.show_ghost_mesh)
+                                .on_hover_text("Show translucent source mesh overlay")
+                                .clicked()
+                            {
+                                app.show_ghost_mesh = !app.show_ghost_mesh;
+                            }
+                            if ribbon_button(ui, p, Icon::ArrangeGrid, "Grid", app.show_bed_grid)
+                                .on_hover_text("Toggle build plate grid")
+                                .clicked()
+                            {
+                                app.show_bed_grid = !app.show_bed_grid;
+                                app.rebuild_scene();
+                            }
+                            if ribbon_button(ui, p, Icon::Legend, "Legend", app.show_legend_hud)
+                                .on_hover_text("Show summary & feature legend card")
+                                .clicked()
+                            {
+                                app.show_legend_hud = !app.show_legend_hud;
+                            }
+                            if ribbon_button(ui, p, Icon::Code, "G-code", app.show_gcode_viewer)
+                                .on_hover_text("Toggle live synchronized G-code viewer")
+                                .clicked()
+                            {
+                                app.show_gcode_viewer = !app.show_gcode_viewer;
+                            }
+                        });
                     });
                 });
         });
@@ -871,7 +1216,7 @@ fn draw_gcode_viewer_hud(
     Area::new(Id::unique("layercraft_hud_gcode_viewer"))
         .order(Order::Foreground)
         .pivot(Align2::LEFT_BOTTOM)
-        .fixed_pos(viewport_rect.left_bottom() + vec2(12.0, -54.0))
+        .fixed_pos(viewport_rect.left_bottom() + vec2(12.0, -86.0))
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
             hud_frame(p)
@@ -1002,7 +1347,7 @@ fn draw_bottom_view_pill(
         ))
         .constrain_to(viewport_rect)
         .show(ctx, |ui| {
-            hud_frame(p)
+            floating_rail_frame(p)
                 .inner_margin(Margin::symmetric(10, 5))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1012,45 +1357,22 @@ fn draw_bottom_view_pill(
                         {
                             app.frame_camera(CameraPreset::Isometric);
                         }
-
-                        if app.view_mode == ViewMode::Prepare {
-                            if ribbon_button(ui, p, Icon::ArrangeGrid, "Grid", app.show_bed_grid)
-                                .clicked()
-                            {
-                                app.show_bed_grid = !app.show_bed_grid;
-                                app.rebuild_scene();
-                            }
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} obj · {} mod",
-                                    app.session.objects.len(),
-                                    app.session.modifiers.len()
-                                ))
-                                .size(11.0)
-                                .color(p.text_secondary),
-                            );
-                        } else {
-                            if ribbon_button(ui, p, Icon::Layers, "Single", app.single_layer_only)
-                                .clicked()
-                            {
-                                app.single_layer_only = !app.single_layer_only;
-                            }
-                            if ribbon_button(ui, p, Icon::Travel, "Travels", app.show_travels)
-                                .clicked()
-                            {
-                                app.show_travels = !app.show_travels;
-                            }
-                            if ribbon_button(ui, p, Icon::Ghost, "Ghost", app.show_ghost_mesh)
-                                .clicked()
-                            {
-                                app.show_ghost_mesh = !app.show_ghost_mesh;
-                            }
-                            if ribbon_button(ui, p, Icon::Legend, "Legend", app.show_legend_hud)
-                                .clicked()
-                            {
-                                app.show_legend_hud = !app.show_legend_hud;
-                            }
+                        if ribbon_button(ui, p, Icon::ArrangeGrid, "Grid", app.show_bed_grid)
+                            .on_hover_text("Toggle build plate grid")
+                            .clicked()
+                        {
+                            app.show_bed_grid = !app.show_bed_grid;
+                            app.rebuild_scene();
                         }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} obj · {} mod",
+                                app.session.objects.len(),
+                                app.session.modifiers.len()
+                            ))
+                            .size(11.0)
+                            .color(p.text_secondary),
+                        );
                     });
                 });
         });

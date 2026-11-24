@@ -20,6 +20,8 @@ layercraft-mesh.workspace = true
 layercraft-slice.workspace = true
 layercraft-viewport.workspace = true
 layercraft-viewport-gpu.workspace = true
+base64.workspace = true
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 web-time.workspace = true
@@ -31,4 +33,4 @@ rfd.workspace = true
 js-sys.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlAnchorElement", "HtmlInputElement", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "EventTarget", "Storage", "Worker", "MessageEvent", "ErrorEvent"] }
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "HtmlAnchorElement", "HtmlInputElement", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "EventTarget", "Storage", "Worker", "MessageEvent", "ErrorEvent", "DomStringList", "IdbFactory", "IdbOpenDbRequest", "IdbDatabase", "IdbTransaction", "IdbTransactionMode", "IdbObjectStore", "IdbRequest", "IdbVersionChangeEvent"] }

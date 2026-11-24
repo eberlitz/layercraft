@@ -15,8 +15,8 @@ pub fn card(ui: &mut Ui, p: &ThemePalette, title: Option<&str>, body: impl FnOnc
     egui::Frame::NONE
         .fill(p.bg_card)
         .stroke(Stroke::new(1.0, p.border_subtle))
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if let Some(t) = title {
@@ -26,7 +26,7 @@ pub fn card(ui: &mut Ui, p: &ThemePalette, title: Option<&str>, body: impl FnOnc
                         .strong()
                         .color(p.text_muted),
                 );
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             }
             body(ui);
         });
@@ -37,13 +37,28 @@ pub fn hud_frame(p: &ThemePalette) -> egui::Frame {
     egui::Frame::NONE
         .fill(p.bg_hud)
         .stroke(Stroke::new(1.0, p.border_strong))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(12, 9))
         .shadow(Shadow {
-            offset: [0, 4],
-            blur: 12,
+            offset: [0, 6],
+            blur: 16,
             spread: 0,
-            color: Color32::from_black_alpha(if p.dark { 90 } else { 32 }),
+            color: Color32::from_black_alpha(if p.dark { 105 } else { 36 }),
+        })
+}
+
+/// Compact translucent pill/rail container used by floating viewport docks.
+pub fn floating_rail_frame(p: &ThemePalette) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(p.bg_hud)
+        .stroke(Stroke::new(1.0, p.border_strong))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(5))
+        .shadow(Shadow {
+            offset: [0, 6],
+            blur: 16,
+            spread: 0,
+            color: Color32::from_black_alpha(if p.dark { 110 } else { 34 }),
         })
 }
 
@@ -194,59 +209,6 @@ pub fn ribbon_button(
             rect.center().y - galley.size().y * 0.5,
         );
         ui.painter().galley(text_pos, galley, fg);
-    }
-    resp
-}
-
-/// Ribbon button with leading icon, text label, and painted vector dropdown chevron.
-pub fn ribbon_dropdown_button(ui: &mut Ui, p: &ThemePalette, icon: Icon, label: &str) -> Response {
-    let font_id = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font_id, p.text_primary);
-    let icon_sz = 14.0;
-    let chev_sz = 10.0;
-    let gap = 5.0;
-    let pad_x = 8.0;
-    let width = pad_x * 2.0 + icon_sz + gap + galley.size().x + gap * 0.8 + chev_sz;
-    let height = 25.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let fill = if resp.is_pointer_button_down_on() {
-            p.bg_active
-        } else if resp.hovered() {
-            p.bg_hover
-        } else {
-            Color32::TRANSPARENT
-        };
-        let stroke = if resp.hovered() {
-            Stroke::new(1.0, p.border_subtle)
-        } else {
-            Stroke::NONE
-        };
-        ui.painter().rect(
-            rect,
-            CornerRadius::same(5),
-            fill,
-            stroke,
-            StrokeKind::Inside,
-        );
-        let icon_rect = Rect::from_center_size(
-            pos2(rect.left() + pad_x + icon_sz * 0.5, rect.center().y),
-            vec2(icon_sz, icon_sz),
-        );
-        paint_icon(ui.painter(), icon_rect, icon, p.text_secondary);
-        let text_pos = pos2(
-            icon_rect.right() + gap,
-            rect.center().y - galley.size().y * 0.5,
-        );
-        ui.painter().galley(text_pos, galley, p.text_primary);
-        let chev_rect = Rect::from_center_size(
-            pos2(rect.right() - pad_x - chev_sz * 0.5, rect.center().y),
-            vec2(chev_sz, chev_sz),
-        );
-        paint_icon(ui.painter(), chev_rect, Icon::ChevronDown, p.text_muted);
     }
     resp
 }
@@ -484,4 +446,232 @@ pub fn v_divider(ui: &mut Ui, p: &ThemePalette) {
         ],
         Stroke::new(1.0, p.border_subtle),
     );
+}
+
+/// Square icon-only tool button inside floating viewport rails (32x32).
+pub fn rail_tool_button(
+    ui: &mut Ui,
+    p: &ThemePalette,
+    icon: Icon,
+    active: bool,
+    tooltip: &str,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if active {
+            p.accent_muted
+        } else if resp.is_pointer_button_down_on() {
+            p.bg_active
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        let stroke = if active {
+            Stroke::new(1.0, p.accent)
+        } else if resp.hovered() {
+            Stroke::new(1.0, p.border_subtle)
+        } else {
+            Stroke::NONE
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(7),
+            fill,
+            stroke,
+            StrokeKind::Inside,
+        );
+        let col = if active {
+            p.accent
+        } else if resp.hovered() {
+            p.text_primary
+        } else {
+            p.text_secondary
+        };
+        paint_icon(ui.painter(), rect.shrink(7.0), icon, col);
+    }
+    resp.on_hover_text(tooltip)
+}
+
+/// Equal-width sleek segmented control strip returning `true` when changed.
+pub fn segmented_control<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    p: &ThemePalette,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    current: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let mut changed = false;
+    let count = options.len().max(1);
+    let total_w = ui.available_width();
+    egui::Frame::NONE
+        .fill(p.bg_input)
+        .stroke(Stroke::new(1.0, p.border_subtle))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            let inner_w = (total_w - 8.0).max(72.0);
+            let gap = 3.0;
+            let seg_w =
+                ((inner_w - gap * (count.saturating_sub(1) as f32)) / count as f32).max(28.0);
+            let seg_h = 26.0;
+            ui.push_id(id_source, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for &(val, label) in options {
+                        let active = *current == val;
+                        let (rect, resp) =
+                            ui.allocate_exact_size(vec2(seg_w, seg_h), Sense::click());
+                        if ui.is_rect_visible(rect) {
+                            let fill = if active {
+                                p.bg_card
+                            } else if resp.hovered() {
+                                p.bg_hover.gamma_multiply(0.6)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            let stroke = if active {
+                                Stroke::new(1.0, p.accent.gamma_multiply(0.85))
+                            } else {
+                                Stroke::NONE
+                            };
+                            ui.painter().rect(
+                                rect,
+                                CornerRadius::same(6),
+                                fill,
+                                stroke,
+                                StrokeKind::Inside,
+                            );
+                            let col = if active {
+                                p.accent
+                            } else if resp.hovered() {
+                                p.text_primary
+                            } else {
+                                p.text_secondary
+                            };
+                            let galley = ui.painter().layout_no_wrap(
+                                label.to_owned(),
+                                egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                                col,
+                            );
+                            ui.painter().galley(
+                                pos2(
+                                    rect.center().x - galley.size().x * 0.5,
+                                    rect.center().y - galley.size().y * 0.5,
+                                ),
+                                galley,
+                                col,
+                            );
+                        }
+                        if resp.clicked() && !active {
+                            *current = val;
+                            changed = true;
+                        }
+                    }
+                });
+            });
+        });
+    changed
+}
+
+/// Collapsible framed inspector section with header chevron and optional count pill.
+pub fn inspector_section(
+    ui: &mut Ui,
+    p: &ThemePalette,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
+    title: &str,
+    badge_text: Option<&str>,
+    default_open: bool,
+    body: impl FnOnce(&mut Ui),
+) {
+    let id = ui.make_persistent_id(id_source);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let is_open = state.is_open();
+    egui::Frame::NONE
+        .fill(p.bg_card)
+        .stroke(Stroke::new(1.0, p.border_subtle))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let (rect, resp) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::click());
+            if ui.is_rect_visible(rect) {
+                let icon_rect = Rect::from_center_size(
+                    pos2(rect.left() + 6.0, rect.center().y),
+                    vec2(12.0, 12.0),
+                );
+                paint_icon(
+                    ui.painter(),
+                    icon_rect,
+                    if is_open {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronUp
+                    },
+                    if resp.hovered() {
+                        p.text_primary
+                    } else {
+                        p.text_muted
+                    },
+                );
+                let title_col = if resp.hovered() {
+                    p.text_primary
+                } else {
+                    p.text_secondary
+                };
+                let title_galley = ui.painter().layout_no_wrap(
+                    title.to_ascii_uppercase(),
+                    egui::FontId::new(10.5, egui::FontFamily::Proportional),
+                    title_col,
+                );
+                ui.painter().galley(
+                    pos2(
+                        icon_rect.right() + 6.0,
+                        rect.center().y - title_galley.size().y * 0.5,
+                    ),
+                    title_galley,
+                    title_col,
+                );
+                if let Some(bt) = badge_text {
+                    let b_galley = ui.painter().layout_no_wrap(
+                        bt.to_owned(),
+                        egui::FontId::new(10.5, egui::FontFamily::Proportional),
+                        p.text_muted,
+                    );
+                    let bw = b_galley.size().x + 12.0;
+                    let brect = Rect::from_min_size(
+                        pos2(rect.right() - bw, rect.center().y - 8.5),
+                        vec2(bw, 17.0),
+                    );
+                    ui.painter().rect(
+                        brect,
+                        CornerRadius::same(8),
+                        p.bg_input,
+                        Stroke::new(1.0, p.border_subtle),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().galley(
+                        pos2(
+                            brect.center().x - b_galley.size().x * 0.5,
+                            brect.center().y - b_galley.size().y * 0.5,
+                        ),
+                        b_galley,
+                        p.text_muted,
+                    );
+                }
+            }
+            if resp.clicked() {
+                state.toggle(ui);
+            }
+            if is_open {
+                ui.add_space(6.0);
+                body(ui);
+            }
+        });
+    state.store(ui.ctx());
 }

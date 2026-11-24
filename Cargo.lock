@@ -1889,6 +1889,7 @@ dependencies = [
 name = "layercraft-ui-egui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eframe",
  "egui",
  "egui-wgpu",
@@ -1901,6 +1902,7 @@ dependencies = [
  "layercraft-slice",
  "layercraft-viewport",
  "layercraft-viewport-gpu",
+ "png",
  "rfd",
  "serde",
  "serde_json",

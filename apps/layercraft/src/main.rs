@@ -30,6 +30,9 @@ struct Args {
     /// Automatically slice on startup and switch to Preview view.
     #[arg(long)]
     preview: bool,
+    /// Open directly on the Home / Recent Projects launcher view.
+    #[arg(long)]
+    home: bool,
     /// Optional PNG output path: render headlessly offscreen via wgpu and exit.
     #[arg(long)]
     screenshot: Option<PathBuf>,
@@ -66,8 +69,11 @@ fn build_app(
     sample: Option<SampleShape>,
     theme: Option<ThemeMode>,
     preview: bool,
+    home: bool,
 ) -> LayerCraftApp {
-    let mut app = if initial_bytes.is_some() {
+    let mut app = if home || (initial_bytes.is_none() && sample.is_none() && !preview) {
+        LayerCraftApp::new_home()
+    } else if initial_bytes.is_some() {
         LayerCraftApp::new(None)
     } else {
         LayerCraftApp::new(Some(sample.unwrap_or(SampleShape::Cube20)))
@@ -290,8 +296,10 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    let home = args.home;
+
     if let Some(screenshot_path) = args.screenshot {
-        let mut app = build_app(initial_bytes, sample, theme, preview);
+        let mut app = build_app(initial_bytes, sample, theme, preview, home);
         if let Err(e) = render_headless_screenshot(&mut app, &screenshot_path, 1360, 840) {
             eprintln!("headless screenshot failed: {e}");
             return ExitCode::FAILURE;
@@ -319,7 +327,7 @@ fn main() -> ExitCode {
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 install_renderer(rs);
             }
-            let mut app = build_app(initial_bytes, sample, theme, preview);
+            let mut app = build_app(initial_bytes, sample, theme, preview, home);
             if !args.no_bridge {
                 let ctx = cc.egui_ctx.clone();
                 match StudioBridgeHost::bind(
