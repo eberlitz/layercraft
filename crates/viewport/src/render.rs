@@ -365,14 +365,23 @@ fn rasterize_triangles(
         let min_y = p0[1].min(p1[1]).min(p2[1]).floor().max(0.0) as i32;
         let max_y = p0[1].max(p1[1]).max(p2[1]).ceil().min((h - 1) as f32) as i32;
 
-        let n = Vec3::from_array(v0.normal).normalize_or_zero();
+        let n = (Vec3::from_array(v0.normal)
+            + Vec3::from_array(v1.normal)
+            + Vec3::from_array(v2.normal))
+        .normalize_or_zero();
         let diff = n.dot(light_dir).abs();
         let hemi = 0.5 + 0.5 * n.z;
-        let shade = (0.32 + 0.50 * diff + 0.18 * hemi).clamp(0.15, 1.0);
+        let shade = (0.30 + 0.52 * diff + 0.18 * hemi).clamp(0.15, 1.0);
+        let c0 = v0.color;
+        let c1 = v1.color;
+        let c2 = v2.color;
+        let avg_r = (c0[0] + c1[0] + c2[0]) / 3.0;
+        let avg_g = (c0[1] + c1[1] + c2[1]) / 3.0;
+        let avg_b = (c0[2] + c1[2] + c2[2]) / 3.0;
         let rgb = [
-            (v0.color[0] * shade * 255.0).clamp(0.0, 255.0) as u8,
-            (v0.color[1] * shade * 255.0).clamp(0.0, 255.0) as u8,
-            (v0.color[2] * shade * 255.0).clamp(0.0, 255.0) as u8,
+            (avg_r * shade * 255.0).clamp(0.0, 255.0) as u8,
+            (avg_g * shade * 255.0).clamp(0.0, 255.0) as u8,
+            (avg_b * shade * 255.0).clamp(0.0, 255.0) as u8,
         ];
 
         for py in min_y..=max_y {

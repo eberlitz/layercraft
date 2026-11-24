@@ -418,7 +418,7 @@ pub fn build_bed_grid_themed(config: &PrintConfig, theme: ViewportTheme) -> Vec<
     let w = config.machine.bed_width_mm as f32;
     let d = config.machine.bed_depth_mm as f32;
     let mut lines = Vec::new();
-    let z = 0.04_f32;
+    let z = -0.01_f32;
 
     let (minor, major, border, front_col) = match theme {
         ViewportTheme::Dark => (
@@ -475,7 +475,7 @@ pub fn build_bed_grid_themed(config: &PrintConfig, theme: ViewportTheme) -> Vec<
 
     // Origin triad (X=red, Y=green, Z=blue) raised slightly above grid lines to prevent Z fighting.
     let ax = 26.0_f32;
-    let z_ax = 0.08_f32;
+    let z_ax = 0.01_f32;
     for (end, col) in [
         ([ax, 0.0, z_ax], [0.95, 0.25, 0.25, 1.0]),
         ([0.0, ax, z_ax], [0.25, 0.90, 0.35, 1.0]),
@@ -498,7 +498,7 @@ pub fn build_bed_grid_themed(config: &PrintConfig, theme: ViewportTheme) -> Vec<
 pub fn build_bed_plate_mesh(config: &PrintConfig, theme: ViewportTheme) -> Vec<SceneVertex> {
     let w = config.machine.bed_width_mm as f32;
     let d = config.machine.bed_depth_mm as f32;
-    let z_top = -0.02_f32;
+    let z_top = -0.04_f32;
     let z_bot = -3.2_f32;
 
     let (top_col, bevel_col, front_accent) = match theme {
@@ -721,7 +721,282 @@ fn push_travel_segment(
     });
 }
 
-/// Build 3D extruded bead ribbons, combed/Z-hop travel lines, and per-step scrubbing indices.
+#[derive(Debug, Clone, Copy)]
+struct ProfileSample {
+    u: f32,
+    v: f32,
+    nu: f32,
+    nz: f32,
+    ao: f32,
+}
+
+const PROFILE_8: &[ProfileSample] = &[
+    // Top crown
+    ProfileSample {
+        u: 0.00,
+        v: 1.000,
+        nu: 0.000,
+        nz: 1.000,
+        ao: 1.03,
+    },
+    // Top-left shoulder
+    ProfileSample {
+        u: 0.66,
+        v: 0.943,
+        nu: 0.550,
+        nz: 0.835,
+        ao: 0.96,
+    },
+    // Mid-left flank (bulges cleanly out to define bead seam & layer lines)
+    ProfileSample {
+        u: 1.00,
+        v: 0.000,
+        nu: 1.000,
+        nz: 0.000,
+        ao: 0.88,
+    },
+    // Bottom-left shoulder
+    ProfileSample {
+        u: 0.66,
+        v: -0.943,
+        nu: 0.550,
+        nz: -0.835,
+        ao: 0.64,
+    },
+    // Bottom keel
+    ProfileSample {
+        u: 0.00,
+        v: -1.000,
+        nu: 0.000,
+        nz: -1.000,
+        ao: 0.56,
+    },
+    // Bottom-right shoulder
+    ProfileSample {
+        u: -0.66,
+        v: -0.943,
+        nu: -0.550,
+        nz: -0.835,
+        ao: 0.64,
+    },
+    // Mid-right flank
+    ProfileSample {
+        u: -1.00,
+        v: 0.000,
+        nu: -1.000,
+        nz: 0.000,
+        ao: 0.88,
+    },
+    // Top-right shoulder
+    ProfileSample {
+        u: -0.66,
+        v: 0.943,
+        nu: -0.550,
+        nz: 0.835,
+        ao: 0.96,
+    },
+];
+
+const PROFILE_6: &[ProfileSample] = &[
+    ProfileSample {
+        u: 0.00,
+        v: 1.000,
+        nu: 0.000,
+        nz: 1.000,
+        ao: 1.03,
+    },
+    ProfileSample {
+        u: 1.00,
+        v: 0.150,
+        nu: 0.940,
+        nz: 0.340,
+        ao: 0.90,
+    },
+    ProfileSample {
+        u: 0.68,
+        v: -0.943,
+        nu: 0.580,
+        nz: -0.810,
+        ao: 0.64,
+    },
+    ProfileSample {
+        u: 0.00,
+        v: -1.000,
+        nu: 0.000,
+        nz: -1.000,
+        ao: 0.56,
+    },
+    ProfileSample {
+        u: -0.68,
+        v: -0.943,
+        nu: -0.580,
+        nz: -0.810,
+        ao: 0.64,
+    },
+    ProfileSample {
+        u: -1.00,
+        v: 0.150,
+        nu: -0.940,
+        nz: 0.340,
+        ao: 0.90,
+    },
+];
+
+/// Small deterministic Z offset separating coplanar layer features cleanly in the depth buffer.
+#[inline]
+pub fn role_z_bias_mm(role: ExtrusionRole) -> f32 {
+    match role {
+        ExtrusionRole::Ironing => 0.002,
+        ExtrusionRole::OuterWall
+        | ExtrusionRole::OverhangWall
+        | ExtrusionRole::Skirt
+        | ExtrusionRole::Brim => 0.000,
+        ExtrusionRole::InnerWall => -0.004,
+        ExtrusionRole::SupportInterface => -0.005,
+        ExtrusionRole::TopSurface | ExtrusionRole::BottomSurface => -0.007,
+        ExtrusionRole::Support => -0.008,
+        ExtrusionRole::Bridge | ExtrusionRole::InternalBridge => -0.009,
+        ExtrusionRole::InternalSolidInfill => -0.011,
+        ExtrusionRole::SparseInfill => -0.014,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSeg {
+    pa: (f32, f32),
+    pb: (f32, f32),
+    dir: (f32, f32),
+    left: (f32, f32),
+    len: f32,
+    hwa: f32,
+    hwb: f32,
+    seg_width_mm: f32,
+}
+
+fn corner_join(seg_a: &PathSeg, seg_b: &PathSeg) -> Option<((f32, f32), bool)> {
+    let gap = (seg_b.pa.0 - seg_a.pb.0).hypot(seg_b.pa.1 - seg_a.pb.1);
+    if gap > 1e-3 {
+        return None;
+    }
+    let dot = seg_a.dir.0 * seg_b.dir.0 + seg_a.dir.1 * seg_b.dir.1;
+    if dot <= -0.5 {
+        return None;
+    }
+    let lx = seg_a.left.0 + seg_b.left.0;
+    let ly = seg_a.left.1 + seg_b.left.1;
+    let denom = (1.0 + dot).max(0.25);
+    let mut mx = lx / denom;
+    let mut my = ly / denom;
+    let m_len = mx.hypot(my);
+    let max_miter = if seg_a.len.min(seg_b.len) < 1.2 * seg_a.hwb.max(seg_b.hwa) {
+        1.35
+    } else {
+        1.65
+    };
+    if m_len > max_miter && m_len > 1e-5 {
+        let scale = max_miter / m_len;
+        mx *= scale;
+        my *= scale;
+    }
+    let is_smooth_curve = dot > 0.80;
+    Some(((mx, my), is_smooth_curve))
+}
+
+#[inline]
+fn shade_bead_color(base: [f32; 4], ao: f32) -> [f32; 4] {
+    [
+        (base[0] * ao).clamp(0.0, 1.0),
+        (base[1] * ao).clamp(0.0, 1.0),
+        (base[2] * ao).clamp(0.0, 1.0),
+        base[3],
+    ]
+}
+
+fn build_ring_vertices(
+    profile: &[ProfileSample],
+    center: [f32; 3],
+    radii: (f32, f32),
+    offset_vec: (f32, f32),
+    norm_left: (f32, f32),
+    base_color: [f32; 4],
+) -> Vec<SceneVertex> {
+    let [cx, cy, z_mid] = center;
+    let (hw, hz) = radii;
+    let (ox, oy) = offset_vec;
+    let (nlx, nly) = norm_left;
+    let mut ring = Vec::with_capacity(profile.len());
+    for s in profile {
+        let px = cx + ox * (hw * s.u);
+        let py = cy + oy * (hw * s.u);
+        let pz = z_mid + hz * s.v;
+        let nx = nlx * s.nu;
+        let ny = nly * s.nu;
+        let nz = s.nz;
+        let n_len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-5);
+        ring.push(SceneVertex {
+            pos: [px, py, pz],
+            normal: [nx / n_len, ny / n_len, nz / n_len],
+            color: shade_bead_color(base_color, s.ao),
+        });
+    }
+    ring
+}
+
+fn push_smooth_quad(
+    out: &mut Vec<SceneVertex>,
+    a: SceneVertex,
+    b: SceneVertex,
+    c: SceneVertex,
+    d: SceneVertex,
+) {
+    out.push(a);
+    out.push(b);
+    out.push(c);
+    out.push(a);
+    out.push(c);
+    out.push(d);
+}
+
+fn push_domed_cap(
+    out: &mut Vec<SceneVertex>,
+    ring: &[SceneVertex],
+    center: [f32; 3],
+    dir: (f32, f32),
+    hw: f32,
+    base_color: [f32; 4],
+    is_start: bool,
+) {
+    let n = ring.len();
+    if n < 3 {
+        return;
+    }
+    let cap_push = (0.35 * hw).min(0.25);
+    let sign = if is_start { -1.0_f32 } else { 1.0_f32 };
+    let apex = SceneVertex {
+        pos: [
+            center[0] + sign * dir.0 * cap_push,
+            center[1] + sign * dir.1 * cap_push,
+            center[2],
+        ],
+        normal: [sign * dir.0, sign * dir.1, 0.0],
+        color: shade_bead_color(base_color, 0.90),
+    };
+    for k in 0..n {
+        let (Some(&v0), Some(&v1)) = (ring.get(k), ring.get((k + 1) % n)) else {
+            continue;
+        };
+        out.push(apex);
+        if is_start {
+            out.push(v0);
+            out.push(v1);
+        } else {
+            out.push(v1);
+            out.push(v0);
+        }
+    }
+}
+
+/// Build realistic rounded stadium-profile filament beads, combed/Z-hop travel lines, and per-step scrubbing indices.
 pub fn build_toolpath_mesh_with_config(
     plate: &SlicedPlate,
     mode: ColorMode,
@@ -743,6 +1018,25 @@ pub fn build_toolpath_mesh_with_config(
     } else {
         (0.04, 0.32)
     };
+
+    let total_segments_est: usize = plate
+        .layers
+        .iter()
+        .flat_map(|l| l.paths.iter())
+        .map(|p| {
+            if p.closed {
+                p.points.len()
+            } else {
+                p.points.len().saturating_sub(1)
+            }
+        })
+        .sum();
+    let profile = if total_segments_est > 60_000 {
+        PROFILE_6
+    } else {
+        PROFILE_8
+    };
+    let n_prof = profile.len();
 
     let travel_speed = config
         .map(|c| c.machine.travel_speed_mm_s as f32)
@@ -771,7 +1065,9 @@ pub fn build_toolpath_mesh_with_config(
         let travel_start = travel_lines.len() as u32;
         let mut steps = Vec::new();
         let z_top = layer.z_top_mm as f32;
-        let z_bot = (layer.z_top_mm - layer.height_mm) as f32;
+        let layer_h = (layer.height_mm as f32).max(0.02);
+        let z_center_base = z_top - 0.5 * layer_h;
+        let hz = 0.53 * layer_h;
         let z_line = z_top + 0.03;
 
         let combing = if enable_combing && !layer.slice_regions.is_empty() {
@@ -886,9 +1182,10 @@ pub fn build_toolpath_mesh_with_config(
                 }
             }
 
-            let color =
-                path_color_with_height_range(path, mode, layer_idx, total_layers, height_range_mm);
             let seg_count = if path.closed { n } else { n - 1 };
+            let mut segs: Vec<PathSeg> = Vec::with_capacity(seg_count);
+            let mut best_len = 0.0_f32;
+            let mut best_dir = (1.0_f32, 0.0_f32);
 
             for i in 0..seg_count {
                 let Some(&pa) = path.points.get(i) else {
@@ -902,57 +1199,169 @@ pub fn build_toolpath_mesh_with_config(
                 let Some(&pb) = path.points.get(next_idx) else {
                     continue;
                 };
-                let hwa = (0.5 * path.vertex_width_mm(i)) as f32;
-                let hwb = (0.5 * path.vertex_width_mm(next_idx)) as f32;
                 let (ax, ay) = pa.to_mm();
                 let (bx, by) = pb.to_mm();
-                let ax = ax as f32;
-                let ay = ay as f32;
-                let bx = bx as f32;
-                let by = by as f32;
+                let (ax, ay, bx, by) = (ax as f32, ay as f32, bx as f32, by as f32);
                 let dx = bx - ax;
                 let dy = by - ay;
                 let len = dx.hypot(dy);
                 if len < 1e-4 {
                     continue;
                 }
-                let nx = -dy / len;
-                let ny = dx / len;
-                let oxa = nx * hwa;
-                let oya = ny * hwa;
-                let oxb = nx * hwb;
-                let oyb = ny * hwb;
-
-                let al_t = [ax + oxa, ay + oya, z_top];
-                let ar_t = [ax - oxa, ay - oya, z_top];
-                let bl_t = [bx + oxb, by + oyb, z_top];
-                let br_t = [bx - oxb, by - oyb, z_top];
-
-                let al_b = [ax + oxa, ay + oya, z_bot];
-                let ar_b = [ax - oxa, ay - oya, z_bot];
-                let bl_b = [bx + oxb, by + oyb, z_bot];
-                let br_b = [bx - oxb, by - oyb, z_bot];
-
-                // Top face (+Z)
-                push_tri(&mut vertices, ar_t, br_t, bl_t, [0.0, 0.0, 1.0], color);
-                push_tri(&mut vertices, ar_t, bl_t, al_t, [0.0, 0.0, 1.0], color);
-
-                // Left side wall (+n)
-                push_tri(&mut vertices, al_b, bl_b, bl_t, [nx, ny, 0.0], color);
-                push_tri(&mut vertices, al_b, bl_t, al_t, [nx, ny, 0.0], color);
-
-                // Right side wall (-n)
-                push_tri(&mut vertices, br_b, ar_b, ar_t, [-nx, -ny, 0.0], color);
-                push_tri(&mut vertices, br_b, ar_t, br_t, [-nx, -ny, 0.0], color);
-
-                steps.push(LayerMoveStep {
-                    toolpath_vertex_end: vertices.len() as u32,
-                    travel_vertex_end: travel_lines.len() as u32,
-                    nozzle_pos: [bx, by, z_top],
-                    kind: MoveKind::Extrusion(path.role),
-                    speed_mm_s: path.speed_mm_s as f32,
-                    width_mm: path.segment_width_mm(i) as f32,
+                let dir = (dx / len, dy / len);
+                let left = (-dir.1, dir.0);
+                if len > best_len {
+                    best_len = len;
+                    best_dir = dir;
+                }
+                let hwa = 0.985 * (0.5 * path.vertex_width_mm(i)) as f32;
+                let hwb = 0.985 * (0.5 * path.vertex_width_mm(next_idx)) as f32;
+                segs.push(PathSeg {
+                    pa: (ax, ay),
+                    pb: (bx, by),
+                    dir,
+                    left,
+                    len,
+                    hwa,
+                    hwb,
+                    seg_width_mm: path.segment_width_mm(i) as f32,
                 });
+            }
+
+            if !segs.is_empty() {
+                let mut z_bias = role_z_bias_mm(path.role);
+                if matches!(
+                    path.role,
+                    ExtrusionRole::SparseInfill
+                        | ExtrusionRole::Support
+                        | ExtrusionRole::SupportInterface
+                ) {
+                    let angle_norm = best_dir
+                        .1
+                        .atan2(best_dir.0)
+                        .rem_euclid(std::f32::consts::PI)
+                        / std::f32::consts::PI;
+                    z_bias += angle_norm * 0.0025;
+                }
+                let z_mid = z_center_base + z_bias;
+                let color = path_color_with_height_range(
+                    path,
+                    mode,
+                    layer_idx,
+                    total_layers,
+                    height_range_mm,
+                );
+                let num_segs = segs.len();
+
+                for s_idx in 0..num_segs {
+                    let Some(&cur) = segs.get(s_idx) else {
+                        continue;
+                    };
+                    let prev_opt = if s_idx > 0 {
+                        segs.get(s_idx - 1)
+                    } else if path.closed && num_segs > 1 {
+                        segs.last()
+                    } else {
+                        None
+                    };
+                    let next_opt = if s_idx + 1 < num_segs {
+                        segs.get(s_idx + 1)
+                    } else if path.closed && num_segs > 1 {
+                        segs.first()
+                    } else {
+                        None
+                    };
+
+                    let prev_join = prev_opt.and_then(|prev| corner_join(prev, &cur));
+                    let next_join = next_opt.and_then(|next| corner_join(&cur, next));
+
+                    let (start_offset, start_norm, start_joined) = match prev_join {
+                        Some((miter, smooth)) => {
+                            let norm = if smooth {
+                                let l = miter.0.hypot(miter.1).max(1e-5);
+                                (miter.0 / l, miter.1 / l)
+                            } else {
+                                cur.left
+                            };
+                            (miter, norm, true)
+                        }
+                        None => (cur.left, cur.left, false),
+                    };
+
+                    let (end_offset, end_norm, end_joined) = match next_join {
+                        Some((miter, smooth)) => {
+                            let norm = if smooth {
+                                let l = miter.0.hypot(miter.1).max(1e-5);
+                                (miter.0 / l, miter.1 / l)
+                            } else {
+                                cur.left
+                            };
+                            (miter, norm, true)
+                        }
+                        None => (cur.left, cur.left, false),
+                    };
+
+                    let start_ring = build_ring_vertices(
+                        profile,
+                        [cur.pa.0, cur.pa.1, z_mid],
+                        (cur.hwa, hz),
+                        start_offset,
+                        start_norm,
+                        color,
+                    );
+                    let end_ring = build_ring_vertices(
+                        profile,
+                        [cur.pb.0, cur.pb.1, z_mid],
+                        (cur.hwb, hz),
+                        end_offset,
+                        end_norm,
+                        color,
+                    );
+
+                    for k in 0..n_prof {
+                        let k_next = (k + 1) % n_prof;
+                        if let (Some(&a0), Some(&a1), Some(&b0), Some(&b1)) = (
+                            start_ring.get(k),
+                            start_ring.get(k_next),
+                            end_ring.get(k),
+                            end_ring.get(k_next),
+                        ) {
+                            push_smooth_quad(&mut vertices, a0, b0, b1, a1);
+                        }
+                    }
+
+                    if !start_joined {
+                        push_domed_cap(
+                            &mut vertices,
+                            &start_ring,
+                            [cur.pa.0, cur.pa.1, z_mid],
+                            cur.dir,
+                            cur.hwa,
+                            color,
+                            true,
+                        );
+                    }
+                    if !end_joined {
+                        push_domed_cap(
+                            &mut vertices,
+                            &end_ring,
+                            [cur.pb.0, cur.pb.1, z_mid],
+                            cur.dir,
+                            cur.hwb,
+                            color,
+                            false,
+                        );
+                    }
+
+                    steps.push(LayerMoveStep {
+                        toolpath_vertex_end: vertices.len() as u32,
+                        travel_vertex_end: travel_lines.len() as u32,
+                        nozzle_pos: [cur.pb.0, cur.pb.1, z_top],
+                        kind: MoveKind::Extrusion(path.role),
+                        speed_mm_s: path.speed_mm_s as f32,
+                        width_mm: cur.seg_width_mm,
+                    });
+                }
             }
 
             let end_pt = if path.closed {
@@ -1215,5 +1624,89 @@ mod tests {
 
         let corner_ray = cam.screen_ray(0.95, 0.95, aspect);
         assert!(ray_intersect_mesh(corner_ray, &front_cube).is_none());
+    }
+
+    #[test]
+    fn toolpath_beads_have_rounded_profile_layer_normals_and_role_z_bias() {
+        assert!(
+            role_z_bias_mm(ExtrusionRole::OuterWall) > role_z_bias_mm(ExtrusionRole::InnerWall)
+        );
+        assert!(
+            role_z_bias_mm(ExtrusionRole::InnerWall) > role_z_bias_mm(ExtrusionRole::TopSurface)
+        );
+        assert!(role_z_bias_mm(ExtrusionRole::TopSurface) > role_z_bias_mm(ExtrusionRole::Bridge));
+        assert!(
+            role_z_bias_mm(ExtrusionRole::Bridge) > role_z_bias_mm(ExtrusionRole::SparseInfill)
+        );
+
+        let cfg = PrintConfig::default();
+        let mesh = sample_cube();
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        let geom = build_toolpath_mesh_with_config(&plate, ColorMode::Feature, Some(&cfg));
+        assert!(!geom.vertices.is_empty());
+
+        let has_top = geom.vertices.iter().any(|v| v.normal[2] > 0.7);
+        let has_flank = geom.vertices.iter().any(|v| v.normal[2].abs() < 0.15);
+        let has_bottom = geom.vertices.iter().any(|v| v.normal[2] < -0.7);
+        assert!(has_top && has_flank && has_bottom);
+
+        let segs = [
+            PathSeg {
+                pa: (0.0, 0.0),
+                pb: (20.0, 0.0),
+                dir: (1.0, 0.0),
+                left: (0.0, 1.0),
+                len: 20.0,
+                hwa: 0.21,
+                hwb: 0.21,
+                seg_width_mm: 0.42,
+            },
+            PathSeg {
+                pa: (20.0, 0.0),
+                pb: (20.0, 20.0),
+                dir: (0.0, 1.0),
+                left: (-1.0, 0.0),
+                len: 20.0,
+                hwa: 0.21,
+                hwb: 0.21,
+                seg_width_mm: 0.42,
+            },
+        ];
+        let (miter, smooth) = corner_join(&segs[0], &segs[1]).unwrap();
+        assert!(!smooth);
+        assert!((miter.0 - (-1.0)).abs() < 1e-5);
+        assert!((miter.1 - 1.0).abs() < 1e-5);
+
+        // Build a closed 20x20 path and check consecutive segments share exact mitered corner vertices.
+        let path_plate = SlicedPlate {
+            layers: vec![layercraft_slice::SlicedLayer {
+                index: 0,
+                z_top_mm: 0.2,
+                height_mm: 0.2,
+                fan_percent: 0,
+                estimated_time_s: 1.0,
+                slice_regions: Vec::new(),
+                paths: vec![ExtrusionPath {
+                    role: ExtrusionRole::OuterWall,
+                    points: vec![
+                        layercraft_geom::Point2::from_mm(0.0, 0.0).unwrap(),
+                        layercraft_geom::Point2::from_mm(20.0, 0.0).unwrap(),
+                        layercraft_geom::Point2::from_mm(20.0, 20.0).unwrap(),
+                        layercraft_geom::Point2::from_mm(0.0, 20.0).unwrap(),
+                    ],
+                    point_widths_mm: Vec::new(),
+                    closed: true,
+                    width_mm: 0.42,
+                    height_mm: 0.2,
+                    speed_mm_s: 40.0,
+                    flow_ratio: 1.0,
+                }],
+            }],
+        };
+        let path_geom = build_toolpath_mesh(&path_plate, ColorMode::Feature);
+        // 4 segments * 8 quads * 6 vertices = 192 vertices (no open caps on closed path).
+        assert_eq!(path_geom.vertices.len(), 192);
+        // Seg 0 end vertex b0 (vertex 1) must match Seg 1 start vertex a0 (vertex 48).
+        assert_eq!(path_geom.vertices[1].pos, path_geom.vertices[48].pos);
     }
 }

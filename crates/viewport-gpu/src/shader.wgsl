@@ -66,15 +66,15 @@ fn fs_lit(in: LitOut) -> @location(0) vec4<f32> {
     let key_dir = normalize(vec3<f32>(0.42, -0.38, 0.82));
     let fill_dir = normalize(vec3<f32>(-0.55, 0.58, 0.44));
     let rim_dir = normalize(vec3<f32>(0.0, 0.72, 0.68));
-    let diff_key = max(dot(n, key_dir), 0.0) * 0.56;
-    let diff_fill = max(dot(n, fill_dir), 0.0) * 0.24;
-    let diff_rim = max(dot(n, rim_dir), 0.0) * 0.14;
-    let hemi = (0.5 + 0.5 * n.z) * select(0.18, 0.26, light_mode);
-    let ambient = select(0.24, 0.36, light_mode);
-    let lit = clamp(ambient + diff_key + diff_fill + diff_rim + hemi, 0.18, 1.08);
+    let diff_key = max(dot(n, key_dir), 0.0) * 0.52;
+    let diff_fill = max(dot(n, fill_dir), 0.0) * 0.20;
+    let diff_rim = max(dot(n, rim_dir), 0.0) * 0.12;
+    let hemi = (0.5 + 0.5 * n.z) * select(0.16, 0.22, light_mode);
+    let ambient = select(0.20, 0.30, light_mode);
+    let lit = clamp(ambient + diff_key + diff_fill + diff_rim + hemi, 0.15, 1.04);
     let h_key = normalize(key_dir + v);
-    let spec = pow(max(dot(n, h_key), 0.0), 36.0) * select(0.22, 0.16, light_mode);
-    let fresnel = pow(1.0 - max(dot(n, v), 0.0), 3.0) * select(0.14, 0.08, light_mode);
+    let spec = pow(max(dot(n, h_key), 0.0), 36.0) * select(0.24, 0.16, light_mode);
+    let fresnel = pow(1.0 - max(dot(n, v), 0.0), 3.0) * select(0.12, 0.07, light_mode);
     let col_rgb = clamp(
         in.color.rgb * lit + vec3<f32>(spec) + in.color.rgb * fresnel,
         vec3<f32>(0.0),
