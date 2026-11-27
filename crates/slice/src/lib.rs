@@ -5546,6 +5546,69 @@ mod tests {
             "width ratio {:.3} < 1.35 (min={min_w:.3}, max={max_w:.3})",
             max_w / min_w
         );
+
+        let inner_loop_max_x = walls
+            .iter()
+            .filter(|w| w.role == ExtrusionRole::InnerWall && w.closed)
+            .flat_map(|w| w.points.iter())
+            .map(|pt| pt.to_mm().0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let inner_medial_min_x = walls
+            .iter()
+            .filter(|w| w.role == ExtrusionRole::InnerWall && !w.closed)
+            .flat_map(|w| w.points.iter())
+            .map(|pt| pt.to_mm().0)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            inner_loop_max_x.is_finite() && inner_medial_min_x.is_finite(),
+            "expected both closed and medial InnerWall paths"
+        );
+        let inner_gap = (inner_medial_min_x - inner_loop_max_x).abs();
+        assert!(
+            inner_gap <= 0.25,
+            "InnerWall 2->1 gap {inner_gap:.3} mm > 0.25 mm (loop_max={inner_loop_max_x:.3}, medial_min={inner_medial_min_x:.3})"
+        );
+
+        let tip = walls
+            .iter()
+            .copied()
+            .find(|w| w.role == ExtrusionRole::OuterWall && !w.closed)
+            .expect("expected open OuterWall medial tip path");
+        assert!(
+            tip.points.len() >= 4,
+            "expected subdivided OuterWall tip points, got {}",
+            tip.points.len()
+        );
+        assert!(tip.has_variable_width());
+        let tip_ratio = tip.max_width_mm() / tip.min_width_mm();
+        assert!(
+            tip_ratio >= 1.5,
+            "expected progressive tip width ratio >= 1.5, got {tip_ratio:.3} (min={:.3}, max={:.3})",
+            tip.min_width_mm(),
+            tip.max_width_mm()
+        );
+
+        for w in &walls {
+            if !w.has_variable_width() || w.points.len() < 2 {
+                continue;
+            }
+            let pn = w.points.len();
+            let segs = if w.closed { pn } else { pn - 1 };
+            for i in 0..segs {
+                let j = (i + 1) % pn;
+                let a = w.points[i].to_mm();
+                let b = w.points[j].to_mm();
+                let len = (b.0 - a.0).hypot(b.1 - a.1);
+                if len > 0.30 {
+                    let dw = (w.vertex_width_mm(j) - w.vertex_width_mm(i)).abs();
+                    assert!(
+                        dw <= 0.05,
+                        "un-subdivided width jump {dw:.3} mm over {len:.3} mm segment on {:?}",
+                        w.role
+                    );
+                }
+            }
+        }
     }
 
     #[test]

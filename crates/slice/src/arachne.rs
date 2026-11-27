@@ -17,6 +17,7 @@ const EDGE_SUBDIVIDE_MM: f64 = 0.40;
 const MIN_COLLAPSED_EDGE_MM: f64 = 0.02;
 const SIMPLIFY_XY_EPS_MM: f64 = 0.005;
 const SIMPLIFY_W_EPS_MM: f64 = 0.004;
+const MAX_SEG_WIDTH_DELTA_MM: f64 = 0.04;
 const UNIFORM_WIDTH_TOL_MM: f64 = 0.004;
 const CHAIN_STITCH_TOL_MM: f64 = 0.025;
 const MITER_SHIFT_LIMIT: f64 = 1.6;
@@ -405,10 +406,16 @@ pub(crate) fn build_perimeters_arachne(
                 params.w_min_inner
             };
 
+            let d_nom = params.nominal_inset(m);
+            let excl_inset = (d_nom - 0.5 * min_w).max(0.0);
             let excl_polys = match r_pair.get(m) {
                 Some(r) if !r.is_empty() => {
-                    let shrunk = offset(r, -mm_to_nm(0.25 * nom_w)?, support_join)?;
-                    if shrunk.is_empty() { r.clone() } else { shrunk }
+                    if excl_inset <= 1e-4 {
+                        r.clone()
+                    } else {
+                        let shrunk = offset(r, -mm_to_nm(excl_inset)?, support_join)?;
+                        if shrunk.is_empty() { r.clone() } else { shrunk }
+                    }
                 }
                 _ => Vec::new(),
             };
@@ -455,13 +462,13 @@ pub(crate) fn build_perimeters_arachne(
                 }
 
                 for piece in clipped {
-                    if piece.len() < 2 {
+                    let sampled = subdivide_open_poly(&piece, EDGE_SUBDIVIDE_MM);
+                    if sampled.len() < 2 {
                         continue;
                     }
-                    let mut pts_mm = Vec::with_capacity(piece.len());
-                    let mut widths = Vec::with_capacity(piece.len());
-                    for pt in piece {
-                        let (px, py) = pt.to_mm();
+                    let mut pts_mm = Vec::with_capacity(sampled.len());
+                    let mut widths = Vec::with_capacity(sampled.len());
+                    for (px, py) in sampled {
                         let t_local = project_thickness_on_edge(px, py, edge).unwrap_or(t_lo);
                         let t_clamped = t_local.clamp(t_lo, t_hi.max(t_lo));
                         let plan = compute_beading(t_clamped, &params);
@@ -556,9 +563,9 @@ fn emit_paired_contour(
     }
 
     let default_w = if pair_idx == 0 {
-        params.outer_w
+        params.w_min_outer
     } else {
-        params.inner_w
+        params.w_min_inner
     };
 
     let mut displaced = Vec::with_capacity(m);
@@ -575,9 +582,9 @@ fn emit_paired_contour(
         let mut d_target = 0.0;
         for u in 0..pair_idx {
             let wu = plan.pair_widths.get(u).copied().unwrap_or(if u == 0 {
-                params.outer_w
+                params.w_min_outer
             } else {
-                params.inner_w
+                params.w_min_inner
             });
             d_target += wu - params.overlap;
         }
@@ -613,6 +620,55 @@ fn emit_paired_contour(
     }
 }
 
+fn refine_variable_width_polyline(
+    pts_mm: &[(f64, f64)],
+    widths_mm: &[f64],
+    closed: bool,
+) -> (Vec<(f64, f64)>, Vec<f64>) {
+    let n = pts_mm.len();
+    if n < 2 || n != widths_mm.len() {
+        return (pts_mm.to_vec(), widths_mm.to_vec());
+    }
+    let segs = if closed { n } else { n - 1 };
+    let mut out_pts = Vec::with_capacity(n);
+    let mut out_w = Vec::with_capacity(n);
+
+    for i in 0..segs {
+        let j = (i + 1) % n;
+        let (Some(&a), Some(&b), Some(&wa), Some(&wb)) = (
+            pts_mm.get(i),
+            pts_mm.get(j),
+            widths_mm.get(i),
+            widths_mm.get(j),
+        ) else {
+            continue;
+        };
+        out_pts.push(a);
+        out_w.push(wa);
+
+        let dw = (wb - wa).abs();
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        if dw > MAX_SEG_WIDTH_DELTA_MM && len > 0.15 {
+            let max_by_len = (len / 0.12).floor().max(1.0);
+            let steps = (dw / MAX_SEG_WIDTH_DELTA_MM).ceil().min(max_by_len) as usize;
+            if steps >= 2 {
+                for k in 1..steps {
+                    let t = (k as f64) / (steps as f64);
+                    out_pts.push((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)));
+                    out_w.push(wa + t * (wb - wa));
+                }
+            }
+        }
+    }
+
+    if !closed && let (Some(&pn), Some(&wn)) = (pts_mm.last(), widths_mm.last()) {
+        out_pts.push(pn);
+        out_w.push(wn);
+    }
+
+    (out_pts, out_w)
+}
+
 fn emit_polyline_with_widths(
     pts_mm: &[(f64, f64)],
     widths_mm: &[f64],
@@ -625,22 +681,23 @@ fn emit_polyline_with_widths(
     if pts_mm.len() < 2 || pts_mm.len() != widths_mm.len() {
         return;
     }
-    let points: Vec<Point2> = pts_mm
+    let (pts_refined, widths_refined) = refine_variable_width_polyline(pts_mm, widths_mm, closed);
+    let points: Vec<Point2> = pts_refined
         .iter()
         .filter_map(|&(x, y)| Point2::from_mm(x, y).ok())
         .collect();
-    if points.len() != pts_mm.len() {
+    if points.len() != pts_refined.len() {
         return;
     }
 
-    let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
-    let mean_w = weighted_mean_width(pts_mm, widths_mm, closed);
+    let min_w = widths_refined.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_w = widths_refined.iter().copied().fold(0.0, f64::max);
+    let mean_w = weighted_mean_width(&pts_refined, &widths_refined, closed);
 
     let point_widths_mm = if max_w - min_w <= UNIFORM_WIDTH_TOL_MM {
         Vec::new()
     } else {
-        widths_mm.to_vec()
+        widths_refined
     };
 
     out.push(ExtrusionPath {
@@ -702,6 +759,37 @@ fn merge_tiny_polygon_edges(pts: &[Point2], min_len_mm: f64) -> Vec<Point2> {
         kept.pop();
     }
     kept
+}
+
+fn subdivide_open_poly(pts: &[Point2], max_seg_mm: f64) -> Vec<(f64, f64)> {
+    let n = pts.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return pts.first().map(|p| vec![p.to_mm()]).unwrap_or_default();
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n - 1 {
+        let (Some(&a), Some(&b)) = (pts.get(i), pts.get(i + 1)) else {
+            continue;
+        };
+        let (ax, ay) = a.to_mm();
+        let (bx, by) = b.to_mm();
+        out.push((ax, ay));
+        let len = (bx - ax).hypot(by - ay);
+        if len > max_seg_mm {
+            let steps = (len / max_seg_mm).ceil() as usize;
+            for k in 1..steps {
+                let u = (k as f64) / (steps as f64);
+                out.push((ax + u * (bx - ax), ay + u * (by - ay)));
+            }
+        }
+    }
+    if let Some(&last) = pts.last() {
+        out.push(last.to_mm());
+    }
+    out
 }
 
 fn subdivide_closed_poly(pts: &[Point2], max_seg_mm: f64) -> Vec<(f64, f64)> {
@@ -775,6 +863,9 @@ fn is_collinear_with_width(
     b: (f64, f64),
     wb: f64,
 ) -> bool {
+    if (wb - wa).abs() > MAX_SEG_WIDTH_DELTA_MM {
+        return false;
+    }
     let dx = b.0 - a.0;
     let dy = b.1 - a.1;
     let len2 = dx * dx + dy * dy;
