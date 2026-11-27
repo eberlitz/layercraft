@@ -6295,6 +6295,13 @@ mod tests {
         assert!(gcode_out.gcode.contains("M572 S0"));
         assert!(gcode_out.gcode.contains("M84 X Y E"));
         let end_section = gcode_out.gcode.split("M73 P100 R0").nth(1).unwrap();
+        let last_layer = gcode_out.gcode.rsplit(";LAYER_CHANGE").next().unwrap();
+        let wipe_end = last_layer.rfind(";WIPE_END").unwrap();
+        let m73_done = last_layer.find("M73 P100 R0").unwrap();
+        assert!(
+            wipe_end < m73_done,
+            "expected final-layer wipe-retract before end_gcode"
+        );
         let z22 = end_section.find("G1 Z22 F720").unwrap();
         let park = end_section.find("G1 X242 Y211 F10200").unwrap();
         let z100 = end_section.find("G1 Z100 F720").unwrap();

@@ -52,9 +52,9 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 - **Geometry:** `BridgeArch` sample (or calibration overhang/bridge tower)
 - **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PETG (0.4mm HF Nozzle)` + `LayerCraft 0.20mm Balanced (0.4mm HF)`
 - **Inspect on hardware:**
-  - [ ] 18 mm clear span under bridge deck shows minimal sag and fused bottom threads
+  - [x] 18 mm clear span under bridge deck shows minimal sag and clean pier-to-pier threads (total height `11.03 mm` vs `11.00 mm` nominal; mid-span deck thickness `3.57 mm` vs `3.00 mm` nominal; zero collapsed loops or archway stringing)
   - [ ] Overhang speed ramp & elevated `OverhangWall` cooling prevent curling on 45°–60° slopes
-  - [ ] PETG `z_hop` (0.4 mm) avoids boogers/scarring across travel moves
+  - [x] PETG `z_hop` (0.4 mm) avoids boogers/scarring across travel moves (final-layer wipe-retract added post-run before `end_gcode` to remove the finishing corner wisp)
 
 ### 3. Tree Supports & Interface Breakaway
 - **Geometry:** `CBracket` or overhanging functional part with `process.support.enabled = true`, `style = "tree"`
@@ -93,7 +93,7 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 | Print # | Part & Preset | Estimated Time (Studio) | Actual Time (CORE One+ LCD) | Error (%) | Notes / Adjustments |
 |---|---|---|---|---|---|
 | 1 | Cube 20 mm (`PETG HF`, `0.20 Balanced`) | `14m 25s` | `22m 53s` | `+59% (incl. heat/soak/MBL)` | `20.01 × 20.02 × 20.05 mm` (within ±0.15 mm); LCD `PETG 3g`, chamber `37°C`; clean gyroid/corners; `end_gcode` updated to park before `Z100` drop |
-| 2 | Bridge / Overhang (`PETG HF`, `0.20 Balanced`) | `__m __s` | `__m __s` | `___%` | |
+| 2 | BridgeArch (`PETG HF`, `0.20 Balanced`) | `8m 9s` | `16m 35s` | `+8m 26s (startup)` | `11.03 mm` height (nom `11.00`), `3.57 mm` mid-span deck (nom `3.00`); `PETG 1g`, chamber `34°C`; startup overhead matches Print #1 (`+8m 28s`) within 2 s |
 | 3 | C-Bracket (`PLA HF`, Tree Supports) | `__m __s` | `__m __s` | `___%` | |
 | 4 | Thin Rib / Wedge (`PLA HF`, Arachne) | `__m __s` | `__m __s` | `___%` | |
 | 5 | Cylinder (`PLA HF`, Scarf + Ironing + Arcs) | `__m __s` | `__m __s` | `___%` | |

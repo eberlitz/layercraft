@@ -740,6 +740,21 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         elapsed_est_s += layer.estimated_time_s.max(0.0);
     }
 
+    if !retracted && has_extruded && retract_len > 0.0 {
+        perform_retract(
+            &mut out,
+            config,
+            &mut cur_x,
+            &mut cur_y,
+            &mut cur_e,
+            &last_path_trail,
+            retract_len,
+            retract_f,
+            &mut total_travel_mm,
+            &mut total_time_s,
+        )?;
+    }
+
     if let Some(prev_id) = current_object_id.take()
         && let Some((_, prev_gid)) = object_table.get(&prev_id)
     {
@@ -772,15 +787,6 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         let expanded = expand_gcode_template(tpl, &vars);
         push_template_block(&mut out, &expanded)?;
     } else {
-        if !retracted && has_extruded && retract_len > 0.0 {
-            emit_e_move(
-                &mut out,
-                config.machine.relative_extrusion,
-                &mut cur_e,
-                -retract_len,
-                retract_f,
-            )?;
-        }
         writeln!(out, "M107").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M104 S0").map_err(|_| GcodeError::FormatError)?;
         writeln!(out, "M140 S0").map_err(|_| GcodeError::FormatError)?;
@@ -4899,5 +4905,47 @@ mod tests {
             "expected tallest object max Z, got {}",
             rep.max_z_mm
         );
+    }
+
+    #[test]
+    fn final_layer_wipe_retracts_before_custom_end_gcode() {
+        let lib = layercraft_config::ProfileLibrary::with_builtin_presets();
+        let cfg = lib
+            .build_print_config(
+                &PrintConfig::default(),
+                Some("LayerCraft CORE One+ HF 0.4mm"),
+                Some("LayerCraft PETG (0.4mm HF Nozzle)"),
+                Some("LayerCraft 0.20mm Balanced (0.4mm HF)"),
+            )
+            .unwrap()
+            .config;
+        let out = emit_gcode(
+            &slice_single_mesh(&make_box(20.0, 20.0, 2.0), &cfg).unwrap(),
+            &cfg,
+        )
+        .unwrap();
+
+        let last_layer = out.gcode.rsplit(";LAYER_CHANGE").next().unwrap();
+        let wipe_start = last_layer.rfind(";WIPE_START").unwrap();
+        let wipe_end = last_layer.rfind(";WIPE_END").unwrap();
+        let m73_end = last_layer.find("M73 P100 R0").unwrap();
+        let z_lift = last_layer.find("G1 Z4 F720").unwrap();
+        let park = last_layer.find("G1 X242 Y211 F10200").unwrap();
+        assert!(wipe_start < wipe_end);
+        assert!(
+            last_layer[wipe_start..wipe_end].contains("E-"),
+            "expected negative E wipe move before end_gcode: {}",
+            &last_layer[wipe_start..wipe_end]
+        );
+        assert!(wipe_end < m73_end && m73_end < z_lift && z_lift < park);
+
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
     }
 }

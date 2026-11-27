@@ -4133,7 +4133,6 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                     "M142 S36"
                 ),
                 "machine_end_gcode": concat!(
-                    "G1 E-1.0 F2700\n",
                     "G1 Z{min(max_z + 2, bed_height)} F720\n",
                     "G1 X242 Y211 F10200\n",
                     "M104 S0\n",
@@ -4224,7 +4223,6 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                     "M142 S36"
                 ),
                 "machine_end_gcode": concat!(
-                    "G1 E-1.0 F2700\n",
                     "G1 Z{min(max_z + 2, bed_height)} F720\n",
                     "G1 X242 Y211 F10200\n",
                     "M104 S0\n",
