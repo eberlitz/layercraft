@@ -377,9 +377,13 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
                     .map_err(|_| GcodeError::FormatError)?;
                 }
                 GcodeFlavor::Marlin | GcodeFlavor::MarlinBuddy => {
+                    writeln!(out, "M486 S{idx}").map_err(|_| GcodeError::FormatError)?;
                     writeln!(out, "M486 A{}", obj.gcode_id).map_err(|_| GcodeError::FormatError)?;
                 }
             }
+        }
+        if config.machine.flavor != GcodeFlavor::Klipper {
+            writeln!(out, "M486 S-1").map_err(|_| GcodeError::FormatError)?;
         }
     }
 
@@ -534,6 +538,21 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         let mut z_hopped = if seq_object_changed {
             true
         } else if layer_seq_idx == 0 && config.machine.start_gcode.is_some() {
+            if retract_len > 0.0 && !retracted {
+                emit_e_move(
+                    &mut out,
+                    config.machine.relative_extrusion,
+                    &mut cur_e,
+                    -retract_len,
+                    retract_f,
+                )?;
+                retracted = true;
+                total_time_s += estimate_trapezoid_move_time_s(
+                    retract_len,
+                    config.machine.retraction_speed_mm_s,
+                    DEFAULT_EXTRUSION_ACCEL_MM_S2,
+                );
+            }
             let travel_z = layer.z_top_mm + config.machine.z_hop_mm.max(1.8);
             writeln!(out, "G0 Z{travel_z:.3} F{zhop_f:.0}").map_err(|_| GcodeError::FormatError)?;
             total_time_s += estimate_trapezoid_move_time_s(
@@ -4449,11 +4468,21 @@ mod tests {
         )
         .unwrap();
 
+        assert!((cfg.machine.retraction_length_mm - 0.7).abs() < 1e-6);
         let after_l0 = out.gcode.split(";LAYER_CHANGE").nth(1).unwrap();
+        let expected_retract = format!("G1 E-{:.5} ", cfg.machine.retraction_length_mm);
+        let expected_deretract = format!("G1 E{:.5} ", cfg.machine.retraction_length_mm);
+        let mut seen_retract = false;
         let mut seen_lift_z = false;
         let mut seen_xy_travel_at_lift = false;
+        let mut seen_drop_z = false;
+        let mut seen_deretract = false;
+        let mut seen_first_extrusion = false;
         for line in after_l0.lines() {
-            if line.starts_with("G0 Z") {
+            if !seen_retract && line.starts_with(&expected_retract) {
+                assert!(!seen_lift_z, "expected purge retract before Z lift");
+                seen_retract = true;
+            } else if line.starts_with("G0 Z") {
                 let z: f64 = line
                     .strip_prefix("G0 Z")
                     .unwrap()
@@ -4463,23 +4492,46 @@ mod tests {
                     .parse()
                     .unwrap();
                 if !seen_lift_z {
+                    assert!(seen_retract, "expected purge retract before Z lift");
                     assert!(z >= 1.9, "expected lifted layer-0 Z clearance, got {z}");
                     seen_lift_z = true;
-                } else if seen_xy_travel_at_lift {
+                } else if seen_xy_travel_at_lift && !seen_drop_z {
                     assert!((z - 0.2).abs() < 1e-3, "expected drop to Z0.200, got {z}");
-                    break;
+                    seen_drop_z = true;
                 }
-            } else if seen_lift_z && line.starts_with("G0 X") {
+            } else if seen_lift_z && !seen_drop_z && line.starts_with("G0 X") {
                 seen_xy_travel_at_lift = true;
+            } else if seen_drop_z && !seen_deretract && line.starts_with(&expected_deretract) {
+                seen_deretract = true;
             } else if line.starts_with("G1 ") && line.contains(" X") && line.contains(" E") {
                 assert!(
-                    seen_lift_z && seen_xy_travel_at_lift,
-                    "started extruding layer 0 before lifted XY travel"
+                    seen_retract
+                        && seen_lift_z
+                        && seen_xy_travel_at_lift
+                        && seen_drop_z
+                        && seen_deretract,
+                    "started extruding layer 0 out of order"
                 );
+                seen_first_extrusion = true;
                 break;
             }
         }
-        assert!(seen_lift_z && seen_xy_travel_at_lift);
+        assert!(
+            seen_retract
+                && seen_lift_z
+                && seen_xy_travel_at_lift
+                && seen_drop_z
+                && seen_deretract
+                && seen_first_extrusion
+        );
+        let (rep, _) = evaluate_gcode(
+            &out.gcode,
+            cfg.filament.diameter_mm,
+            cfg.machine.bed_width_mm,
+            cfg.machine.bed_depth_mm,
+        )
+        .unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
     }
 
     #[test]
@@ -4618,6 +4670,10 @@ mod tests {
         assert!(out_buddy.gcode.contains("M486 S0"));
         assert!(out_buddy.gcode.contains("M486 S1"));
         assert!(out_buddy.gcode.contains("M486 S-1"));
+        let before_l0 = out_buddy.gcode.split(";LAYER_CHANGE").next().unwrap();
+        assert!(before_l0.contains("M486 T2\nM486 S0\nM486 A"));
+        assert!(before_l0.contains("\nM486 S1\nM486 A"));
+        assert!(before_l0.trim_end().ends_with("M486 S-1"));
         let (rep_b, _) = evaluate_gcode(
             &out_buddy.gcode,
             cfg.filament.diameter_mm,
