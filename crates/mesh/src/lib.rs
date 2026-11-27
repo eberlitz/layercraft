@@ -1205,6 +1205,7 @@ pub enum SampleShape {
     ThinRib,
     BridgeArch,
     Dome,
+    TaperedWedge,
 }
 
 impl SampleShape {
@@ -1218,11 +1219,12 @@ impl SampleShape {
             Self::ThinRib => "Thin Rib 30x1.6",
             Self::BridgeArch => "Bridge Arch",
             Self::Dome => "Dome R10 H18",
+            Self::TaperedWedge => "Tapered Wedge",
         }
     }
 
     /// All built-in sample variants.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Cube20,
         Self::Cylinder,
         Self::HollowTube,
@@ -1230,6 +1232,7 @@ impl SampleShape {
         Self::ThinRib,
         Self::BridgeArch,
         Self::Dome,
+        Self::TaperedWedge,
     ];
 }
 
@@ -1372,6 +1375,29 @@ pub fn build_sample_shape(shape: SampleShape) -> Result<TriangleMesh, MeshError>
                     }
                 }
             }
+            t
+        }
+        SampleShape::TaperedWedge => {
+            let length = 36.0;
+            let hw0 = 2.0;
+            let hw1 = 0.125;
+            let h = 8.0;
+            let p000 = Point3::new(0.0, -hw0, 0.0);
+            let p100 = Point3::new(length, -hw1, 0.0);
+            let p110 = Point3::new(length, hw1, 0.0);
+            let p010 = Point3::new(0.0, hw0, 0.0);
+            let p001 = Point3::new(0.0, -hw0, h);
+            let p101 = Point3::new(length, -hw1, h);
+            let p111 = Point3::new(length, hw1, h);
+            let p011 = Point3::new(0.0, hw0, h);
+
+            let mut t = Vec::with_capacity(12);
+            push_sample_quad(&mut t, p000, p010, p110, p100);
+            push_sample_quad(&mut t, p001, p101, p111, p011);
+            push_sample_quad(&mut t, p000, p100, p101, p001);
+            push_sample_quad(&mut t, p010, p011, p111, p110);
+            push_sample_quad(&mut t, p000, p001, p011, p010);
+            push_sample_quad(&mut t, p100, p110, p111, p101);
             t
         }
     };
@@ -1635,5 +1661,30 @@ mod tests {
         let repaired_loops = stitch_segments_into_loops(&cracked_and_flipped);
         assert_eq!(repaired_loops.len(), 1);
         assert!((repaired_loops[0].area_mm2() - 100.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn all_sample_shapes_are_watertight_and_tapered_wedge_matches_spec() {
+        for shape in SampleShape::ALL {
+            let mesh = build_sample_shape(shape).unwrap();
+            let insp = inspect_mesh(&mesh);
+            assert_eq!(insp.boundary_edges, 0, "boundary edges on {shape:?}");
+            assert!(insp.volume_mm3 > 0.0, "non-positive volume on {shape:?}");
+            if shape != SampleShape::BridgeArch {
+                assert_eq!(
+                    insp.non_manifold_edges, 0,
+                    "non-manifold edges on {shape:?}"
+                );
+            }
+        }
+
+        let wedge = build_sample_shape(SampleShape::TaperedWedge).unwrap();
+        let insp = inspect_mesh(&wedge);
+        assert_eq!(wedge.triangles.len(), 12);
+        let size = wedge.aabb().unwrap().size();
+        assert!((size.x - 36.0).abs() < 1e-6);
+        assert!((size.y - 4.0).abs() < 1e-6);
+        assert!((size.z - 8.0).abs() < 1e-6);
+        assert!((insp.volume_mm3 - 612.0).abs() < 1e-3);
     }
 }

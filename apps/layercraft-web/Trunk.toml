@@ -1,3 +1,8 @@
 [build]
 target = "index.html"
 dist = "dist"
+
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", "python3 \"$TRUNK_SOURCE_DIR/scripts/hash_worker.py\""]

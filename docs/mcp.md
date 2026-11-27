@@ -109,7 +109,7 @@ Call `list_commands` / `describe_command` (or `commands`) via MCP, or run `cargo
 - `plate.add_mesh_file` *(native)* — Load an STL or 3MF file from disk (`path`, `append`, `name`).
 - `plate.add_stl_bytes` — Load a binary or ASCII STL from a byte array (`bytes`, `append`, `name`).
 - `plate.add_3mf_bytes` — Load a 3MF archive from a byte array (`bytes`, `append`, `name`).
-- `plate.add_sample_shape` — Load a built-in watertight test shape (`shape`: `"cube20"`, `"cylinder"`, `"hollow_tube"`, `"stepped_block"`, `"thin_rib"`, `"bridge_arch"`, `"dome"`).
+- `plate.add_sample_shape` — Load a built-in watertight test shape (`shape`: `"cube20"`, `"cylinder"`, `"hollow_tube"`, `"stepped_block"`, `"thin_rib"`, `"bridge_arch"`, `"dome"`, `"tapered_wedge"`).
 - `plate.inspect` — Inspect merged plate bounds, triangle count, volume, and manifold edges.
 - `plate.analyze_printability` — Run Printability / DFM diagnostics (overhangs, floating islands, thin walls, adhesion, feature breakdown).
 - `plate.list_objects` — List objects on the plate with IDs, names, transforms, and AABBs.

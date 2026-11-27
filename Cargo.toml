@@ -72,4 +72,3 @@ inherits = "release"
 opt-level = "s"
 lto = "thin"
 codegen-units = 1
-strip = "symbols"

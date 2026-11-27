@@ -21,7 +21,7 @@ use layercraft_viewport_gpu::{ViewportGpuRenderer, install_renderer};
 struct Args {
     /// Optional STL or 3MF file to open at startup.
     file: Option<PathBuf>,
-    /// Optional built-in sample primitive (`cube20`, `cylinder`, `hollow_tube`, `stepped_block`, `thin_rib`, `bridge_arch`, `dome`).
+    /// Optional built-in sample primitive (`cube20`, `cylinder`, `hollow_tube`, `stepped_block`, `thin_rib`, `bridge_arch`, `dome`, `tapered_wedge`).
     #[arg(long)]
     sample: Option<String>,
     /// Optional initial color theme (`dark`, `light`, `system`).
@@ -58,6 +58,7 @@ fn parse_sample(name: &str) -> SampleShape {
         "thin_rib" | "rib" => SampleShape::ThinRib,
         "bridge_arch" | "bridge" => SampleShape::BridgeArch,
         "dome" | "hemisphere" => SampleShape::Dome,
+        "tapered_wedge" | "wedge" => SampleShape::TaperedWedge,
         _ => SampleShape::Cube20,
     }
 }

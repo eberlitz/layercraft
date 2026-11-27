@@ -1729,6 +1729,20 @@ impl LayerCraftApp {
         self.status_message = "Slicing cancelled.".to_owned();
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn slice_worker_url() -> String {
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| {
+                d.query_selector(r#"meta[name="layercraft-worker-url"]"#)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|el| el.get_attribute("content"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "./slice_worker_loader.js".to_owned())
+    }
+
     /// Trigger slicing from interactive UI controls (async background thread on native, Web Worker on WASM).
     pub(crate) fn start_slice_action(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
@@ -1794,7 +1808,8 @@ impl LayerCraftApp {
                 return;
             };
 
-            let Ok(worker) = web_sys::Worker::new("./slice_worker_loader.js") else {
+            let worker_url = Self::slice_worker_url();
+            let Ok(worker) = web_sys::Worker::new(&worker_url) else {
                 self.run_slice();
                 return;
             };
