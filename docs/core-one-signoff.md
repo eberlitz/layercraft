@@ -27,14 +27,14 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 
 ## Physical Print Validation Suite
 
-### 1. Baseline Cube & `.bgcode` / PrusaLink Handshake (PLA HF)
+### 1. Baseline Cube & `.bgcode` / PrusaLink Handshake (PLA HF / PETG HF)
 - **Geometry:** 20 mm calibration cube (or Studio -> Sample -> Cube 20 mm)
-- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PLA (0.4mm HF Nozzle)` + `LayerCraft 0.20mm Balanced (0.4mm HF)`
+- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PETG (0.4mm HF Nozzle)` (verified first print; also test `LayerCraft PLA (0.4mm HF Nozzle)` when loaded) + `LayerCraft 0.20mm Balanced (0.4mm HF)`
 - **CLI slice & upload:**
   ```bash
   ./target/release/layercraft-cli slice cube20.stl -o cube20.bgcode \
     --machine "LayerCraft CORE One+ HF 0.4mm" \
-    --filament "LayerCraft PLA (0.4mm HF Nozzle)" \
+    --filament "LayerCraft PETG (0.4mm HF Nozzle)" \
     --process "LayerCraft 0.20mm Balanced (0.4mm HF)" \
     --binary
   ./target/release/layercraft-cli eval cube20.gcode   # if exporting plain .gcode
@@ -43,10 +43,10 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
     --binary
   ```
 - **Inspect on hardware:**
-  - [ ] LCD displays QOI thumbnail preview, `Print Time`, and `Material` with zero firmware incompatibility warnings on `M862.1` / `M862.3` / `M862.5` / `M862.6` ("Input shaper")
-  - [ ] Chamber exhaust / fan (`M106 P3 S127` for PLA) starts cleanly; `G29 G` heat soak and focused `G29 P1` mesh bed leveling finish cleanly after anti-ooze retraction
-  - [ ] Front-right purge strip (`X249 -> X199, Y=-2.5`) clears cleanly with zero nozzle collision on move to skirt/part
-  - [ ] XY dimensions within ±0.15 mm; bed finishes with clean park & PA reset (`M572 S0`, `M84 X Y E`) in `end_gcode`
+  - [x] LCD displays QOI thumbnail preview, `Print Time`, and `Material` (`PETG 3g`) with zero firmware incompatibility warnings on `M862.1` / `M862.3` / `M862.5` / `M862.6` ("Input shaper")
+  - [x] `G29 G` heat soak, focused `G29 P1` mesh bed leveling, anti-ooze retraction, and `M141 S35` (`37°C` chamber) finished cleanly on PETG HF (PLA `M106 P3 S127` still pending a PLA load)
+  - [x] Front-right purge strip (`X249 -> X199, Y=-2.5`) clears cleanly with zero nozzle collision and zero ooze tail on move to Layer 0
+  - [x] Measured `20.01 × 20.02 × 20.05 mm` (within ±0.15 mm); clean park & PA reset (`M572 S0`, `M84 X Y E`) in `end_gcode` (`end_gcode` updated post-run to park before `Z100` drop to prevent final top-corner string)
 
 ### 2. Bridges & Progressive Overhangs (PETG HF)
 - **Geometry:** `BridgeArch` sample (or calibration overhang/bridge tower)
@@ -92,7 +92,7 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 
 | Print # | Part & Preset | Estimated Time (Studio) | Actual Time (CORE One+ LCD) | Error (%) | Notes / Adjustments |
 |---|---|---|---|---|---|
-| 1 | Cube 20 mm (`PLA HF`, `0.20 Balanced`) | `__m __s` | `__m __s` | `___%` | |
+| 1 | Cube 20 mm (`PETG HF`, `0.20 Balanced`) | `14m 25s` | `22m 53s` | `+59% (incl. heat/soak/MBL)` | `20.01 × 20.02 × 20.05 mm` (within ±0.15 mm); LCD `PETG 3g`, chamber `37°C`; clean gyroid/corners; `end_gcode` updated to park before `Z100` drop |
 | 2 | Bridge / Overhang (`PETG HF`, `0.20 Balanced`) | `__m __s` | `__m __s` | `___%` | |
 | 3 | C-Bracket (`PLA HF`, Tree Supports) | `__m __s` | `__m __s` | `___%` | |
 | 4 | Thin Rib / Wedge (`PLA HF`, Arachne) | `__m __s` | `__m __s` | `___%` | |
