@@ -3609,8 +3609,23 @@ impl LayerCraftApp {
                     self.viewport_aspect = rect.width() / rect.height();
                 }
 
+                let multi_touch = ui
+                    .input(|i| i.multi_touch())
+                    .filter(|mt| rect.contains(mt.start_pos) || rect.contains(mt.center_pos));
+
                 let shift = ui.input(|i| i.modifiers.shift);
-                if resp.dragged_by(egui::PointerButton::Middle)
+                if let Some(mt) = multi_touch {
+                    if mt.zoom_delta.is_finite()
+                        && mt.zoom_delta > 0.0
+                        && (mt.zoom_delta - 1.0).abs() > 1e-4
+                    {
+                        self.camera.zoom_by_factor(1.0 / mt.zoom_delta);
+                    }
+                    if mt.translation_delta.length_sq() > 0.0 {
+                        self.camera
+                            .pan(mt.translation_delta.x, mt.translation_delta.y);
+                    }
+                } else if resp.dragged_by(egui::PointerButton::Middle)
                     || (resp.dragged_by(egui::PointerButton::Primary) && shift)
                 {
                     let d = resp.drag_delta();
@@ -3627,9 +3642,16 @@ impl LayerCraftApp {
                     if scroll.abs() > 0.0 {
                         self.camera.zoom(scroll);
                     }
+                    if multi_touch.is_none() {
+                        let pinch = ui.input(|i| i.zoom_delta());
+                        if pinch.is_finite() && pinch > 0.0 && (pinch - 1.0).abs() > 1e-4 {
+                            self.camera.zoom_by_factor(1.0 / pinch);
+                        }
+                    }
                 }
 
-                if self.view_mode == ViewMode::Prepare
+                if multi_touch.is_none()
+                    && self.view_mode == ViewMode::Prepare
                     && resp.clicked_by(egui::PointerButton::Primary)
                     && !shift
                     && rect.width() > 1.0
@@ -4930,7 +4952,94 @@ mod tests {
 
         app.sidebar_open = false;
         app.view_mode = ViewMode::Preview;
-        let mut out = ctx.run_ui(phone_input, |ui| app.render_ui(ui));
+        let mut out = ctx.run_ui(phone_input.clone(), |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
+        // Synthetic 2-finger pinch-out zoom inside 412x840 viewport (matches eframe touch sequence)
+        let mut touch1_down = phone_input.clone();
+        touch1_down.events = vec![
+            egui::Event::PointerMoved(egui::pos2(170.0, 420.0)),
+            egui::Event::PointerButton {
+                pos: egui::pos2(170.0, 420.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Start,
+                pos: egui::pos2(170.0, 420.0),
+                force: None,
+            },
+        ];
+        let mut out = ctx.run_ui(touch1_down, |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        let d_before_pinch = app.camera.distance;
+
+        let mut touch2_down = phone_input.clone();
+        touch2_down.events = vec![egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(2),
+            phase: egui::TouchPhase::Start,
+            pos: egui::pos2(242.0, 420.0),
+            force: None,
+        }];
+        let mut out = ctx.run_ui(touch2_down, |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+
+        let mut pinch_spread = phone_input.clone();
+        pinch_spread.events = vec![
+            egui::Event::PointerMoved(egui::pos2(120.0, 420.0)),
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::Move,
+                pos: egui::pos2(120.0, 420.0),
+                force: None,
+            },
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Move,
+                pos: egui::pos2(292.0, 420.0),
+                force: None,
+            },
+        ];
+        let mut out = ctx.run_ui(pinch_spread, |ui| app.render_ui(ui));
+        out.textures_delta.clear();
+        assert!(
+            app.camera.distance < d_before_pinch,
+            "expected pinch-out to zoom in: {} -> {}",
+            d_before_pinch,
+            app.camera.distance
+        );
+
+        let mut pinch_end = phone_input;
+        pinch_end.events = vec![
+            egui::Event::PointerButton {
+                pos: egui::pos2(120.0, 420.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerGone,
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(1),
+                phase: egui::TouchPhase::End,
+                pos: egui::pos2(120.0, 420.0),
+                force: None,
+            },
+            egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::End,
+                pos: egui::pos2(292.0, 420.0),
+                force: None,
+            },
+        ];
+        let mut out = ctx.run_ui(pinch_end, |ui| app.render_ui(ui));
         out.textures_delta.clear();
 
         let mut out = ctx.run_ui(raw_input, |ui| app.render_ui(ui));

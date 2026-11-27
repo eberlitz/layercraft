@@ -156,31 +156,35 @@ pub fn draw_sidebar_overlay(
 
     let mut close_drawer = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
-    egui::Area::new(egui::Id::unique("layercraft_inspector_scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(bounds_rect.min)
-        .show(ctx, |ui| {
-            let (scrim_rect, scrim_resp) =
-                ui.allocate_exact_size(bounds_rect.size(), egui::Sense::click());
-            let scrim_col = if p.dark {
-                egui::Color32::from_black_alpha(135)
-            } else {
-                egui::Color32::from_black_alpha(85)
-            };
-            ui.painter().rect_filled(scrim_rect, 0.0, scrim_col);
-            if scrim_resp.clicked() {
-                close_drawer = true;
-            }
-        });
-
     let drawer_w = (bounds_rect.width() - 36.0)
         .clamp(240.0, 352.0)
         .min(bounds_rect.width().max(240.0));
     let drawer_h = bounds_rect.height().max(200.0);
+    let drawer_left = bounds_rect.right() - drawer_w;
+    let scrim_w = (drawer_left - bounds_rect.left()).max(0.0);
+
+    if scrim_w > 1.0 {
+        egui::Area::new(egui::Id::unique("layercraft_inspector_scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(bounds_rect.min)
+            .show(ctx, |ui| {
+                let (scrim_rect, scrim_resp) =
+                    ui.allocate_exact_size(vec2(scrim_w, drawer_h), egui::Sense::click());
+                let scrim_col = if p.dark {
+                    egui::Color32::from_black_alpha(135)
+                } else {
+                    egui::Color32::from_black_alpha(85)
+                };
+                ui.painter().rect_filled(scrim_rect, 0.0, scrim_col);
+                if scrim_resp.clicked() {
+                    close_drawer = true;
+                }
+            });
+    }
 
     let drawer_resp = egui::Area::new(egui::Id::unique("layercraft_inspector_drawer"))
         .order(egui::Order::Foreground)
-        .fixed_pos(pos2(bounds_rect.right() - drawer_w, bounds_rect.top()))
+        .fixed_pos(pos2(drawer_left, bounds_rect.top()))
         .show(ctx, |ui| {
             ui.set_min_size(vec2(drawer_w, drawer_h));
             ui.set_max_size(vec2(drawer_w, drawer_h));

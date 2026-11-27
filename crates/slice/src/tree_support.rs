@@ -9,7 +9,8 @@ use layercraft_mesh::RawSliceLayer;
 
 use crate::{
     ExtrusionPath, ExtrusionRole, SliceError, bed_clamp_expolygon, bottom_gap_exclusion_range,
-    detect_contact_overhangs, generate_rectilinear_hatch, push_closed_poly, stadium_spacing_mm,
+    detect_contact_overhangs, find_support_contact_layer, generate_rectilinear_hatch,
+    push_closed_poly, stadium_spacing_mm,
 };
 
 const CONE_SIMPLIFY_EPS_NM: i64 = 25_000;
@@ -70,7 +71,8 @@ pub(crate) fn generate_tree_support_paths(
 
     // Pass 2: Bottom-up printability reachability cone.
     // A branch centerline outside `blocked[j]` can descend cleanly to the build plate at angle <= `max_branch_angle_deg`.
-    let r_avoid_cone = 0.5 * s.line_width_mm + s.xy_distance_mm;
+    let r_avoid_cone =
+        (0.5 * s.line_width_mm + s.xy_distance_mm).max(s.xy_distance_mm + s.line_width_mm - tip_r);
     let mut blocked: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
     if let Some(layer0) = raw_layers.first()
         && !layer0.regions.is_empty()
@@ -230,7 +232,18 @@ pub(crate) fn generate_tree_support_paths(
                     continue;
                 }
                 let d = (other.x - b.x).hypot(other.y - b.y);
-                if d > 1e-6 && d < best_peer_dist {
+                if d > 1e-6
+                    && d < best_peer_dist
+                    && segment_is_clear(
+                        b.x,
+                        b.y,
+                        other.x,
+                        other.y,
+                        next_regions,
+                        next_cone,
+                        b.plate_bound,
+                    )
+                {
                     best_peer_dist = d;
                     let step = (0.65 * max_step).min(0.5 * d);
                     target_dx = (other.x - b.x) * (step / d);
@@ -261,7 +274,7 @@ pub(crate) fn generate_tree_support_paths(
                         let min_keep_r = tip_r + s.xy_distance_mm;
                         if sdf2 >= min_keep_r {
                             next_r = (sdf2 - s.xy_distance_mm).clamp(tip_r, next_r);
-                        } else if !b.plate_bound || sdf2 <= 0.0 {
+                        } else if sdf2 <= 0.0 {
                             keep = false;
                         } else {
                             next_r = tip_r;
@@ -290,6 +303,7 @@ pub(crate) fn generate_tree_support_paths(
         merge_close_branches(
             &mut next_active,
             max_r,
+            max_step,
             s.xy_distance_mm,
             next_regions,
             next_cone,
@@ -297,12 +311,18 @@ pub(crate) fn generate_tree_support_paths(
         active = next_active;
     }
 
-    // Pass 4: Union branch disks per layer, clip exact model/Z-gap clearances, emit hollow tubes & interface caps.
+    // Pass 4: Union branch disks per layer, clip exact model/Z-gap clearances, enforce bottom-up grounding, emit hollow tubes & interface caps.
+    let mut grounded_prev: Vec<ExPolygon> = Vec::new();
+    let mut prev_union_holes: Vec<ExPolygon> = Vec::new();
     for idx in 0..n {
         let Some(disks) = layer_disks.get(idx) else {
+            grounded_prev.clear();
+            prev_union_holes.clear();
             continue;
         };
         if disks.is_empty() {
+            grounded_prev.clear();
+            prev_union_holes.clear();
             continue;
         }
         let h = raw_layers
@@ -328,9 +348,40 @@ pub(crate) fn generate_tree_support_paths(
             }
         }
         if disk_polys.is_empty() {
+            grounded_prev.clear();
+            prev_union_holes.clear();
             continue;
         }
-        let tree_union = union(&disk_polys)?;
+        let mut tree_union = union(&disk_polys)?;
+        let max_step = (h * tree.max_branch_angle_deg.to_radians().tan()).max(1e-4);
+        let step_allow = (max_step + 0.5 * s.line_width_mm).max(0.25);
+        let prev_holes_expanded = if idx > 0 && !prev_union_holes.is_empty() {
+            offset(&prev_union_holes, mm_to_nm(step_allow)?, join)?
+        } else {
+            Vec::new()
+        };
+        let mut cur_union_holes = Vec::new();
+        for ex in &mut tree_union {
+            let mut kept_holes = Vec::with_capacity(ex.holes.len());
+            for hole in ex.holes.drain(..) {
+                if hole.area_mm2() < 16.0 {
+                    continue;
+                }
+                let mut ccw = hole.clone();
+                ccw.ensure_ccw();
+                let hex = ExPolygon::new(ccw, Vec::new());
+                let hole_grounded = idx == 0
+                    || (!prev_holes_expanded.is_empty()
+                        && difference(std::slice::from_ref(&hex), &prev_holes_expanded)?
+                            .is_empty());
+                if hole_grounded {
+                    cur_union_holes.push(hex);
+                    kept_holes.push(hole);
+                }
+            }
+            ex.holes = kept_holes;
+        }
+        prev_union_holes = cur_union_holes;
 
         let mut excl_sources = if let Some(cur_layer) = raw_layers.get(idx) {
             offset(&cur_layer.regions, mm_to_nm(s.xy_distance_mm)?, join)?
@@ -360,9 +411,43 @@ pub(crate) fn generate_tree_support_paths(
         };
         let mut tree_polys = intersection(&clipped, bed_slice)?;
         tree_polys.retain(|ex| ex.area_mm2() >= MIN_DISK_AREA_MM2);
+        if idx > 0 {
+            let mut support_below: Vec<ExPolygon> = Vec::new();
+            if !grounded_prev.is_empty() {
+                support_below.extend(offset(&grounded_prev, mm_to_nm(step_allow)?, join)?);
+            }
+            if !s.on_build_plate_only
+                && let Some(base_idx) =
+                    find_support_contact_layer(raw_layers, idx, s.bottom_z_distance_mm)
+                && let Some(base_layer) = raw_layers.get(base_idx)
+                && !base_layer.regions.is_empty()
+            {
+                support_below.extend(base_layer.regions.iter().cloned());
+            }
+            if support_below.is_empty() {
+                tree_polys.clear();
+            } else {
+                let allowed = if support_below.len() > 1 {
+                    union(&support_below)?
+                } else {
+                    support_below
+                };
+                tree_polys = intersection(&tree_polys, &allowed)?;
+                tree_polys.retain(|ex| ex.area_mm2() >= MIN_DISK_AREA_MM2);
+            }
+        }
         if tree_polys.is_empty() {
+            grounded_prev.clear();
+            prev_union_holes.clear();
             continue;
         }
+        let printable_core = offset(&tree_polys, -mm_to_nm(0.5 * s.line_width_mm)?, join)?;
+        if printable_core.is_empty() {
+            grounded_prev.clear();
+            prev_union_holes.clear();
+            continue;
+        }
+        grounded_prev = offset(&printable_core, mm_to_nm(0.5 * s.line_width_mm)?, join)?;
 
         let interface_here = if iface > 0 {
             let mut iface_sources = tip_polys;
@@ -742,6 +827,33 @@ fn signed_dist_to_regions(x: f64, y: f64, regions: &[ExPolygon]) -> Option<(f64,
     Some((signed, best_qx, best_qy))
 }
 
+fn segment_is_clear(
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+    regions: &[ExPolygon],
+    cone: &[ExPolygon],
+    check_cone: bool,
+) -> bool {
+    for t in [0.25, 0.5, 0.75] {
+        let px = ax + t * (bx - ax);
+        let py = ay + t * (by - ay);
+        if !regions.is_empty()
+            && signed_dist_to_regions(px, py, regions).is_some_and(|(s, _, _)| s <= 0.0)
+        {
+            return false;
+        }
+        if check_cone
+            && !cone.is_empty()
+            && signed_dist_to_regions(px, py, cone).is_some_and(|(s, _, _)| s < 0.0)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn clamp_step_from_anchor(ax: f64, ay: f64, tx: f64, ty: f64, max_step: f64) -> (f64, f64) {
     let dx = tx - ax;
     let dy = ty - ay;
@@ -827,10 +939,13 @@ fn push_toward_clearance(
 fn merge_close_branches(
     nodes: &mut Vec<BranchNode>,
     max_r: f64,
+    max_step: f64,
     xy_distance_mm: f64,
     regions: &[ExPolygon],
     cone: &[ExPolygon],
 ) {
+    let mut merged_ids: Vec<usize> = Vec::new();
+    let allow_overhang = (1.25 * max_step).max(0.25);
     loop {
         let m = nodes.len();
         if m < 2 {
@@ -844,12 +959,18 @@ fn merge_close_branches(
                 let (Some(a), Some(b)) = (nodes.get(i), nodes.get(j)) else {
                     continue;
                 };
-                if a.plate_bound != b.plate_bound {
+                if a.plate_bound != b.plate_bound
+                    || merged_ids.contains(&a.id)
+                    || merged_ids.contains(&b.id)
+                {
                     continue;
                 }
                 let dist = (a.x - b.x).hypot(a.y - b.y);
                 let merge_thresh = 0.70 * (a.radius + b.radius);
                 if dist > merge_thresh || dist >= best_dist {
+                    continue;
+                }
+                if !segment_is_clear(a.x, a.y, b.x, b.y, regions, cone, a.plate_bound) {
                     continue;
                 }
                 let w_sum = (a.radius * a.radius + b.radius * b.radius).max(1e-9);
@@ -876,6 +997,11 @@ fn merge_close_branches(
                         continue;
                     }
                 }
+                let da = (a.x - mx).hypot(a.y - my);
+                let db = (b.x - mx).hypot(b.y - my);
+                if da + a.radius > mr + allow_overhang || db + b.radius > mr + allow_overhang {
+                    continue;
+                }
                 best_dist = dist;
                 best_pair = Some((i, j, mx, my, mr));
             }
@@ -885,7 +1011,9 @@ fn merge_close_branches(
             break;
         };
         let node_j = nodes.remove(j);
+        merged_ids.push(node_j.id);
         if let Some(node_i) = nodes.get_mut(i) {
+            merged_ids.push(node_i.id);
             node_i.x = mx;
             node_i.y = my;
             node_i.radius = mr;

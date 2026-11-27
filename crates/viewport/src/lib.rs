@@ -161,6 +161,13 @@ impl OrbitCamera {
         self.distance = (self.distance * factor).clamp(8.0, 2000.0);
     }
 
+    /// Scale camera distance multiplicatively (`< 1.0` zooms in, `> 1.0` zooms out).
+    pub fn zoom_by_factor(&mut self, distance_scale: f32) {
+        if distance_scale.is_finite() && distance_scale > 0.0 {
+            self.distance = (self.distance * distance_scale).clamp(8.0, 2000.0);
+        }
+    }
+
     /// World-space eye position in millimeters.
     pub fn eye_pos(&self) -> Vec3 {
         let t = Vec3::from_array(self.target);
@@ -2237,5 +2244,22 @@ mod tests {
 
         let (lo, hi) = compute_color_mode_range(&plate, ColorMode::VolumetricFlow, Some(&cfg));
         assert!(lo == 0.0 && hi >= 20.0);
+    }
+
+    #[test]
+    fn orbit_camera_zoom_by_factor_scales_clamps_and_ignores_invalid() {
+        let mut cam = OrbitCamera::default();
+        let d0 = cam.distance;
+        cam.zoom_by_factor(0.5);
+        assert!((cam.distance - d0 * 0.5).abs() < 1e-3);
+        let d1 = cam.distance;
+        cam.zoom_by_factor(f32::NAN);
+        cam.zoom_by_factor(-2.0);
+        cam.zoom_by_factor(0.0);
+        assert_eq!(cam.distance, d1);
+        cam.zoom_by_factor(1000.0);
+        assert_eq!(cam.distance, 2000.0);
+        cam.zoom_by_factor(1e-6);
+        assert_eq!(cam.distance, 8.0);
     }
 }

@@ -5731,6 +5731,178 @@ mod tests {
     }
 
     #[test]
+    fn tree_support_never_emits_floating_midair_circles() {
+        let box_at = |x: f64, y: f64, z: f64, w: f64, d: f64, h: f64| -> Vec<Triangle> {
+            make_box_mesh(w, d, h)
+                .triangles
+                .iter()
+                .map(|t| {
+                    let mv = |q: Point3| Point3::new(q.x + x, q.y + y, q.z + z);
+                    Triangle::new(mv(t.a), mv(t.b), mv(t.c))
+                })
+                .collect()
+        };
+
+        let mut tris = Vec::new();
+        // Thin vertical spine wall with staggered ribs on BOTH sides (similar to thin walls with ears)
+        tris.extend(box_at(0.0, 0.0, 0.0, 3.0, 80.0, 26.0));
+        for (k, z) in [6.0, 10.0, 14.0, 18.0].into_iter().enumerate() {
+            let y0 = 6.0 + (k as f64) * 14.0;
+            tris.extend(box_at(3.0, y0, z, 5.0, 8.0, 1.8));
+            tris.extend(box_at(-5.0, y0 + 5.0, z + 1.0, 5.0, 8.0, 1.8));
+        }
+        // Multi-level stacked shelves + nearby pillar & parallel wall
+        for (k, z) in [8.0, 14.0, 20.0].into_iter().enumerate() {
+            tris.extend(box_at(
+                14.0,
+                10.0 + (k as f64) * 5.0,
+                z,
+                12.0,
+                48.0 - (k as f64) * 8.0,
+                1.6,
+            ));
+        }
+        tris.extend(box_at(19.0, 28.0, 0.0, 4.0, 4.0, 26.0));
+        tris.extend(box_at(29.0, 14.0, 0.0, 4.0, 50.0, 24.0));
+        let composite = TriangleMesh::new(tris).unwrap();
+
+        for plate_only in [false, true] {
+            let mut cfg = PrintConfig::default();
+            cfg.process.support.enabled = true;
+            cfg.process.support.style = SupportStyle::Tree;
+            cfg.process.support.on_build_plate_only = plate_only;
+            cfg.process.support.interface_layers = 2;
+            cfg.process.support.tree.max_branch_angle_deg = 45.0;
+
+            let plate = slice_single_mesh(&composite, &cfg).unwrap();
+            let mut saw_sup = false;
+            let mut saw_iface = false;
+            let has_l0_sup = plate.layers[0]
+                .paths
+                .iter()
+                .any(|p| p.role == ExtrusionRole::Support);
+            assert!(
+                has_l0_sup,
+                "expected layer 0 trunks for plate_only={plate_only}"
+            );
+
+            let max_step = cfg.process.layer_height_mm
+                * cfg
+                    .process
+                    .support
+                    .tree
+                    .max_branch_angle_deg
+                    .to_radians()
+                    .tan();
+            let reach_tol = max_step + cfg.process.support.line_width_mm + 0.35;
+
+            for i in 1..plate.layers.len() {
+                let cur = &plate.layers[i];
+                let prev = &plate.layers[i - 1];
+                let z_bot = cur.z_top_mm - cur.height_mm;
+                let gap_target = (z_bot - cfg.process.support.bottom_z_distance_mm).max(0.0);
+
+                for p in &cur.paths {
+                    if !matches!(
+                        p.role,
+                        ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                    ) || !p.closed
+                        || p.points.is_empty()
+                    {
+                        continue;
+                    }
+                    if p.role == ExtrusionRole::Support {
+                        saw_sup = true;
+                    } else {
+                        saw_iface = true;
+                    }
+                    let n_pts = p.points.len() as f64;
+                    let (mut cx, mut cy) = (0.0, 0.0);
+                    for pt in &p.points {
+                        let (x, y) = pt.to_mm();
+                        cx += x / n_pts;
+                        cy += y / n_pts;
+                    }
+                    let check_pts =
+                        std::iter::once((cx, cy)).chain(p.points.iter().map(|pt| pt.to_mm()));
+
+                    let pt_to_seg_dist =
+                        |px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64| -> f64 {
+                            let dx = bx - ax;
+                            let dy = by - ay;
+                            let len2 = dx * dx + dy * dy;
+                            let t = if len2 > 1e-18 {
+                                (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            (px - (ax + t * dx)).hypot(py - (ay + t * dy))
+                        };
+
+                    let supported_by_prev_sup = prev.paths.iter().any(|q| {
+                        if !matches!(
+                            q.role,
+                            ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                        ) || q.points.is_empty()
+                        {
+                            return false;
+                        }
+                        let qn = q.points.len();
+                        let seg_count = if q.closed { qn } else { qn.saturating_sub(1) };
+                        let min_d = p
+                            .points
+                            .iter()
+                            .copied()
+                            .chain(Point2::from_mm(cx, cy).ok())
+                            .map(|pt| {
+                                let (px, py) = pt.to_mm();
+                                (0..seg_count.max(1))
+                                    .map(|si| {
+                                        let a = q.points[si].to_mm();
+                                        let b = if seg_count == 0 {
+                                            a
+                                        } else {
+                                            q.points[(si + 1) % qn].to_mm()
+                                        };
+                                        pt_to_seg_dist(px, py, a.0, a.1, b.0, b.1)
+                                    })
+                                    .fold(f64::INFINITY, f64::min)
+                            })
+                            .fold(f64::INFINITY, f64::min);
+                        min_d <= reach_tol
+                    });
+
+                    let supported_by_model = !plate_only
+                        && z_bot > cfg.process.support.bottom_z_distance_mm
+                        && plate.layers[..i].iter().any(|bl| {
+                            (bl.z_top_mm - gap_target).abs() <= bl.height_mm * 0.75 + 1e-3
+                                && check_pts.clone().any(|(px, py)| {
+                                    Point2::from_mm(px, py).is_ok_and(|c| {
+                                        bl.slice_regions.iter().any(|r| r.contains_point(c))
+                                    })
+                                })
+                        });
+
+                    assert!(
+                        supported_by_prev_sup || supported_by_model,
+                        "floating tree support contour on layer {} (z={:.2} mm, plate_only={plate_only}) at ({cx:.2}, {cy:.2})",
+                        cur.index,
+                        cur.z_top_mm
+                    );
+                }
+            }
+            assert!(
+                saw_sup,
+                "expected Support paths for plate_only={plate_only}"
+            );
+            assert!(
+                saw_iface,
+                "expected SupportInterface paths for plate_only={plate_only}"
+            );
+        }
+    }
+
+    #[test]
     fn adaptive_dome_and_top_shell_thickness_propagate_heights() {
         let dome = layercraft_mesh::build_sample_shape(layercraft_mesh::SampleShape::Dome).unwrap();
         let mut cfg = PrintConfig::default();

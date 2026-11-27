@@ -66,7 +66,7 @@ fn draw_prepare_tool_rail(
         return;
     }
     Area::new(Id::unique("layercraft_hud_prepare_rail"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::LEFT_TOP)
         .fixed_pos(viewport_rect.left_top() + vec2(12.0, 12.0))
         .constrain_to(viewport_rect)
@@ -269,7 +269,7 @@ fn draw_orientation_gizmo(
         return;
     }
     Area::new(Id::unique("layercraft_hud_gizmo"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::RIGHT_TOP)
         .fixed_pos(viewport_rect.right_top() + vec2(-12.0, 12.0))
         .constrain_to(viewport_rect)
@@ -360,41 +360,54 @@ fn draw_orientation_gizmo(
                         app.frame_camera(preset);
                     }
 
+                    let draw_gizmo_btn = |ui: &mut Ui, size: Vec2, lbl: &str, tip: &str| -> bool {
+                        let (br, bresp) = ui.allocate_exact_size(size, Sense::click());
+                        if ui.is_rect_visible(br) {
+                            let bg = if bresp.hovered() {
+                                p.bg_hover
+                            } else {
+                                p.bg_card
+                            };
+                            ui.painter().rect(
+                                br,
+                                CornerRadius::same(4),
+                                bg,
+                                Stroke::new(1.0, p.border_subtle),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                br.center(),
+                                Align2::CENTER_CENTER,
+                                lbl,
+                                egui::FontId::proportional(9.5),
+                                p.text_secondary,
+                            );
+                        }
+                        bresp.on_hover_text(tip).clicked()
+                    };
+
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for (lbl, preset) in [
-                            ("Iso", CameraPreset::Isometric),
-                            ("Top", CameraPreset::Top),
-                            ("Frt", CameraPreset::Front),
-                            ("Rgt", CameraPreset::Right),
+                        for (lbl, tip, preset) in [
+                            ("Iso", "Isometric camera view", CameraPreset::Isometric),
+                            ("Top", "Top-down camera view", CameraPreset::Top),
+                            ("Frt", "Front camera view", CameraPreset::Front),
+                            ("Rgt", "Right side camera view", CameraPreset::Right),
                         ] {
-                            let (br, bresp) =
-                                ui.allocate_exact_size(vec2(22.0, 18.0), Sense::click());
-                            if ui.is_rect_visible(br) {
-                                let bg = if bresp.hovered() {
-                                    p.bg_hover
-                                } else {
-                                    p.bg_card
-                                };
-                                ui.painter().rect(
-                                    br,
-                                    CornerRadius::same(4),
-                                    bg,
-                                    Stroke::new(1.0, p.border_subtle),
-                                    StrokeKind::Inside,
-                                );
-                                ui.painter().text(
-                                    br.center(),
-                                    Align2::CENTER_CENTER,
-                                    lbl,
-                                    egui::FontId::proportional(9.5),
-                                    p.text_secondary,
-                                );
-                            }
-                            if bresp.clicked() {
+                            if draw_gizmo_btn(ui, vec2(22.0, 18.0), lbl, tip) {
                                 app.frame_camera(preset);
                             }
+                        }
+                    });
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if draw_gizmo_btn(ui, vec2(46.0, 18.0), "−", "Zoom out") {
+                            app.camera.zoom_by_factor(1.25);
+                        }
+                        if draw_gizmo_btn(ui, vec2(46.0, 18.0), "+", "Zoom in") {
+                            app.camera.zoom_by_factor(0.8);
                         }
                     });
                 });
@@ -419,7 +432,7 @@ fn draw_preview_summary_hud(
     };
     let combo_w = if max_w < 220.0 { 114.0 } else { 142.0 };
     Area::new(Id::unique("layercraft_hud_preview_summary"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::LEFT_TOP)
         .fixed_pos(viewport_rect.left_top() + vec2(12.0, 12.0))
         .constrain_to(viewport_rect)
@@ -767,7 +780,7 @@ fn draw_vertical_layer_scrubber(
 
     let mut scrubber_active = false;
     let area_resp = Area::new(Id::unique("layercraft_hud_scrubber"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::RIGHT_CENTER)
         .fixed_pos(anchor_pos)
         .constrain_to(viewport_rect)
@@ -869,7 +882,7 @@ fn draw_vertical_layer_scrubber(
         let callout_pos = pos2(scrubber_rect.left() - 8.0, callout_y);
 
         Area::new(Id::unique("layercraft_hud_layer_callout"))
-            .order(Order::Foreground)
+            .order(Order::Middle)
             .pivot(Align2::RIGHT_CENTER)
             .fixed_pos(callout_pos)
             .constrain_to(viewport_rect)
@@ -953,7 +966,7 @@ fn draw_preview_bottom_dock(
     };
     let dock_margin = Margin::symmetric(if compact { 8 } else { 12 }, 7);
     Area::new(Id::unique("layercraft_hud_preview_dock"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(pos2(
             viewport_rect.center().x,
@@ -1305,7 +1318,7 @@ fn draw_gcode_viewer_hud(
     let mut next_all_layers = app.gcode_viewer_all_layers;
 
     Area::new(Id::unique("layercraft_hud_gcode_viewer"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(viewport_rect.left_bottom() + vec2(12.0, -86.0))
         .constrain_to(viewport_rect)
@@ -1430,7 +1443,7 @@ fn draw_bottom_view_pill(
     p: &ThemePalette,
 ) {
     Area::new(Id::unique("layercraft_hud_bottom_pill"))
-        .order(Order::Foreground)
+        .order(Order::Middle)
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(pos2(
             viewport_rect.center().x,
