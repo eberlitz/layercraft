@@ -5638,6 +5638,180 @@ mod tests {
     }
 
     #[test]
+    fn tree_support_c_bracket_has_no_inverted_bulge_or_steep_overhang() {
+        let mesh = make_c_bracket_mesh(24.0, 12.0, 4.0, 6.0, 6.0, 4.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.support.enabled = true;
+        cfg.process.support.style = SupportStyle::Tree;
+        cfg.process.support.on_build_plate_only = true;
+        cfg.process.support.interface_layers = 2;
+        cfg.process.support.tree.max_branch_angle_deg = 45.0;
+
+        let plate = slice_single_mesh(&mesh, &cfg).unwrap();
+        assert!(
+            plate.layers[0]
+                .paths
+                .iter()
+                .any(|p| p.role == ExtrusionRole::Support),
+            "expected layer 0 trunks"
+        );
+        assert!(
+            plate
+                .layers
+                .iter()
+                .flat_map(|l| l.paths.iter())
+                .any(|p| p.role == ExtrusionRole::SupportInterface),
+            "expected SupportInterface paths under upper arm"
+        );
+
+        let max_step = cfg.process.layer_height_mm
+            * cfg
+                .process
+                .support
+                .tree
+                .max_branch_angle_deg
+                .to_radians()
+                .tan();
+        let max_flare = max_step + 0.15;
+
+        let pt_to_seg_dist = |px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64| -> f64 {
+            let dx = bx - ax;
+            let dy = by - ay;
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 1e-18 {
+                (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (px - (ax + t * dx)).hypot(py - (ay + t * dy))
+        };
+
+        let poly_area = |pts: &[Point2]| -> f64 {
+            if pts.len() < 3 {
+                return 0.0;
+            }
+            let mut sum = 0.0;
+            for i in 0..pts.len() {
+                let (x0, y0) = pts[i].to_mm();
+                let (x1, y1) = pts[(i + 1) % pts.len()].to_mm();
+                sum += x0 * y1 - x1 * y0;
+            }
+            0.5 * sum.abs()
+        };
+
+        for layer in &plate.layers {
+            for p in &layer.paths {
+                if matches!(
+                    p.role,
+                    ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                ) {
+                    for pt in &p.points {
+                        for reg in &layer.slice_regions {
+                            assert!(
+                                !reg.contains_point(*pt),
+                                "support collided with model at layer {}",
+                                layer.index
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut trunk_areas = Vec::new();
+        let mut mid_areas = Vec::new();
+        for i in 1..plate.layers.len() {
+            let cur = &plate.layers[i];
+            let prev = &plate.layers[i - 1];
+            let cur_sup: Vec<&ExtrusionPath> = cur
+                .paths
+                .iter()
+                .filter(|p| p.role == ExtrusionRole::Support && p.closed && p.points.len() >= 3)
+                .collect();
+            let prev_sup: Vec<&ExtrusionPath> = prev
+                .paths
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.role,
+                        ExtrusionRole::Support | ExtrusionRole::SupportInterface
+                    ) && p.closed
+                        && !p.points.is_empty()
+                })
+                .collect();
+
+            let prev_outer_polys: Vec<Polygon> = prev_sup
+                .iter()
+                .map(|q| Polygon::new(q.points.clone()))
+                .collect();
+
+            for p in &cur_sup {
+                for pt in &p.points {
+                    if prev_outer_polys.iter().any(|poly| poly.contains_point(*pt)) {
+                        continue;
+                    }
+                    let (px, py) = pt.to_mm();
+                    let min_d = prev_sup
+                        .iter()
+                        .map(|q| {
+                            let qn = q.points.len();
+                            (0..qn)
+                                .map(|si| {
+                                    let a = q.points[si].to_mm();
+                                    let b = q.points[(si + 1) % qn].to_mm();
+                                    pt_to_seg_dist(px, py, a.0, a.1, b.0, b.1)
+                                })
+                                .fold(f64::INFINITY, f64::min)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(
+                        min_d <= max_flare,
+                        "steep support overhang on layer {} (z={:.2} mm): {min_d:.3} mm > {max_flare:.3} mm",
+                        cur.index,
+                        cur.z_top_mm
+                    );
+                }
+            }
+
+            let outer_polys: Vec<(f64, Polygon)> = cur_sup
+                .iter()
+                .map(|p| {
+                    let poly = Polygon::new(p.points.clone());
+                    (poly_area(&p.points), poly)
+                })
+                .collect();
+            let mut layer_outer_areas = Vec::new();
+            for (idx, (area, poly)) in outer_polys.iter().enumerate() {
+                let sample = poly.points[0];
+                let nested = outer_polys
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (other_area, other))| {
+                        j != idx && *other_area > *area + 1e-3 && other.contains_point(sample)
+                    });
+                if !nested {
+                    layer_outer_areas.push(*area);
+                }
+            }
+            if !layer_outer_areas.is_empty() {
+                if (1.0..=3.6).contains(&cur.z_top_mm) {
+                    trunk_areas.extend(layer_outer_areas);
+                } else if (4.6..=8.4).contains(&cur.z_top_mm) {
+                    mid_areas.extend(layer_outer_areas);
+                }
+            }
+        }
+
+        assert!(!trunk_areas.is_empty() && !mid_areas.is_empty());
+        let mean_trunk = trunk_areas.iter().sum::<f64>() / (trunk_areas.len() as f64);
+        let mean_mid = mid_areas.iter().sum::<f64>() / (mid_areas.len() as f64);
+        assert!(
+            mean_trunk >= 0.65 * mean_mid,
+            "inverted tree trunk detected: mean trunk area {mean_trunk:.2} mm2 < 0.65 * mid area {mean_mid:.2} mm2"
+        );
+    }
+
+    #[test]
     fn tree_support_bridge_arch_merges_branches_and_saves_filament() {
         let mesh = make_bridge_arch_mesh(5.0, 16.0, 10.0, 10.0, 2.0);
         let mut cfg_tree = PrintConfig::default();

@@ -71,8 +71,7 @@ pub(crate) fn generate_tree_support_paths(
 
     // Pass 2: Bottom-up printability reachability cone.
     // A branch centerline outside `blocked[j]` can descend cleanly to the build plate at angle <= `max_branch_angle_deg`.
-    let r_avoid_cone =
-        (0.5 * s.line_width_mm + s.xy_distance_mm).max(s.xy_distance_mm + s.line_width_mm - tip_r);
+    let r_avoid_cone = (branch_r + s.xy_distance_mm).max(0.5 * s.line_width_mm + s.xy_distance_mm);
     let mut blocked: Vec<Vec<ExPolygon>> = vec![Vec::new(); n];
     if let Some(layer0) = raw_layers.first()
         && !layer0.regions.is_empty()
@@ -255,7 +254,14 @@ pub(crate) fn generate_tree_support_paths(
             let mut ny = b.y + target_dy;
 
             if b.plate_bound && !next_cone.is_empty() {
-                (nx, ny) = push_outside_cone(b.x, b.y, nx, ny, next_cone, max_step);
+                let min_margin = (next_r - branch_r).max(0.0);
+                (nx, ny) = push_outside_cone(b.x, b.y, nx, ny, next_cone, min_margin, max_step);
+                if next_r > branch_r
+                    && let Some((sdf_c, _, _)) = signed_dist_to_regions(nx, ny, next_cone)
+                    && sdf_c < next_r - branch_r
+                {
+                    next_r = next_r.min((branch_r + sdf_c.max(0.0)).max(b.radius));
+                }
             }
 
             let mut keep = true;
@@ -271,13 +277,11 @@ pub(crate) fn generate_tree_support_paths(
                     if let Some((sdf2, _, _)) = signed_dist_to_regions(nx, ny, next_regions)
                         && sdf2 < req
                     {
-                        let min_keep_r = tip_r + s.xy_distance_mm;
-                        if sdf2 >= min_keep_r {
-                            next_r = (sdf2 - s.xy_distance_mm).clamp(tip_r, next_r);
-                        } else if sdf2 <= 0.0 {
+                        if sdf2 <= 0.0 {
                             keep = false;
                         } else {
-                            next_r = tip_r;
+                            let min_r = (b.radius - 0.5 * max_step).max(tip_r);
+                            next_r = (sdf2 - s.xy_distance_mm).clamp(min_r, next_r);
                         }
                     }
                 }
@@ -302,6 +306,7 @@ pub(crate) fn generate_tree_support_paths(
 
         merge_close_branches(
             &mut next_active,
+            branch_r,
             max_r,
             max_step,
             s.xy_distance_mm,
@@ -354,7 +359,7 @@ pub(crate) fn generate_tree_support_paths(
         }
         let mut tree_union = union(&disk_polys)?;
         let max_step = (h * tree.max_branch_angle_deg.to_radians().tan()).max(1e-4);
-        let step_allow = (max_step + 0.5 * s.line_width_mm).max(0.25);
+        let step_allow = (max_step + 0.05).max(0.15);
         let prev_holes_expanded = if idx > 0 && !prev_union_holes.is_empty() {
             offset(&prev_union_holes, mm_to_nm(step_allow)?, join)?
         } else {
@@ -871,41 +876,50 @@ fn push_outside_cone(
     cand_x: f64,
     cand_y: f64,
     cone: &[ExPolygon],
+    min_margin: f64,
     max_step: f64,
 ) -> (f64, f64) {
     let Some((sdf_c, bx, by)) = signed_dist_to_regions(cand_x, cand_y, cone) else {
         return (cand_x, cand_y);
     };
-    if sdf_c >= 0.0 {
+    if sdf_c >= min_margin {
         return (cand_x, cand_y);
     }
-    let dx = bx - cand_x;
-    let dy = by - cand_y;
+    let (dx, dy) = if sdf_c < 0.0 {
+        (bx - cand_x, by - cand_y)
+    } else {
+        (cand_x - bx, cand_y - by)
+    };
     let len = dx.hypot(dy);
+    let mut best = (cand_x, cand_y);
     if len > 1e-9 {
-        let want = len + 0.02;
+        let want = (min_margin - sdf_c) + 0.02;
         let tx = cand_x + dx * (want / len);
         let ty = cand_y + dy * (want / len);
         let (px, py) = clamp_step_from_anchor(anchor_x, anchor_y, tx, ty, max_step);
-        if signed_dist_to_regions(px, py, cone).is_none_or(|(s2, _, _)| s2 >= 0.0) {
+        if signed_dist_to_regions(px, py, cone).is_none_or(|(s2, _, _)| s2 >= min_margin) {
             return (px, py);
         }
+        best = (px, py);
     }
 
     if let Some((sdf_a, abx, aby)) = signed_dist_to_regions(anchor_x, anchor_y, cone)
-        && sdf_a < 0.0
+        && sdf_a < min_margin
     {
-        let adx = abx - anchor_x;
-        let ady = aby - anchor_y;
+        let (adx, ady) = if sdf_a < 0.0 {
+            (abx - anchor_x, aby - anchor_y)
+        } else {
+            (anchor_x - abx, anchor_y - aby)
+        };
         let alen = adx.hypot(ady);
         if alen > 1e-9 {
-            let want = alen + 0.02;
+            let want = (min_margin - sdf_a) + 0.02;
             let tx = anchor_x + adx * (want / alen);
             let ty = anchor_y + ady * (want / alen);
             return clamp_step_from_anchor(anchor_x, anchor_y, tx, ty, max_step);
         }
     }
-    (cand_x, cand_y)
+    best
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -938,6 +952,7 @@ fn push_toward_clearance(
 
 fn merge_close_branches(
     nodes: &mut Vec<BranchNode>,
+    branch_r: f64,
     max_r: f64,
     max_step: f64,
     xy_distance_mm: f64,
@@ -945,7 +960,7 @@ fn merge_close_branches(
     cone: &[ExPolygon],
 ) {
     let mut merged_ids: Vec<usize> = Vec::new();
-    let allow_overhang = (1.25 * max_step).max(0.25);
+    let allow_overhang = max_step;
     loop {
         let m = nodes.len();
         if m < 2 {
@@ -982,9 +997,16 @@ fn merge_close_branches(
 
                 if a.plate_bound
                     && !cone.is_empty()
-                    && signed_dist_to_regions(mx, my, cone).is_some_and(|(sc, _, _)| sc < 0.0)
+                    && let Some((sc, _, _)) = signed_dist_to_regions(mx, my, cone)
                 {
-                    continue;
+                    if sc < 0.0 {
+                        continue;
+                    }
+                    let avail_r = branch_r + sc;
+                    if avail_r < a.radius.max(b.radius) {
+                        continue;
+                    }
+                    mr = mr.min(avail_r).min(max_r);
                 }
                 if !regions.is_empty()
                     && let Some((sdf, _, _)) = signed_dist_to_regions(mx, my, regions)
