@@ -43,10 +43,10 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
     --binary
   ```
 - **Inspect on hardware:**
-  - [ ] LCD displays QOI thumbnail preview & print time without firmware warnings on `M862.1` / `M862.3` / `M862.5`
-  - [ ] Chamber exhaust / fan (`M106 P3 S127` for PLA) starts cleanly; waitless heat-bed/probe `G29 P9` finishes without oozing
-  - [ ] Front-edge purge line (`Y=-2.5`) clears cleanly with zero nozzle collision on move to skirt/part
-  - [ ] XY dimensions within ±0.15 mm; bed finishes with clean bed drop (`end_gcode`)
+  - [ ] LCD displays QOI thumbnail preview, `Print Time`, and `Material` with zero firmware incompatibility warnings on `M862.1` / `M862.3` / `M862.5` / `M862.6` ("Input shaper")
+  - [ ] Chamber exhaust / fan (`M106 P3 S127` for PLA) starts cleanly; `G29 G` heat soak and focused `G29 P1` mesh bed leveling finish cleanly after anti-ooze retraction
+  - [ ] Front-right purge strip (`X249 -> X199, Y=-2.5`) clears cleanly with zero nozzle collision on move to skirt/part
+  - [ ] XY dimensions within ±0.15 mm; bed finishes with clean park & PA reset (`M572 S0`, `M84 X Y E`) in `end_gcode`
 
 ### 2. Bridges & Progressive Overhangs (PETG HF)
 - **Geometry:** `BridgeArch` sample (or calibration overhang/bridge tower)

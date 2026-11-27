@@ -85,6 +85,10 @@ pub struct PrintStatistics {
     pub travel_distance_mm: f64,
     pub estimated_time_s: f64,
     pub features: BTreeMap<String, FeatureStats>,
+    #[serde(default)]
+    pub first_layer_time_s: f64,
+    #[serde(default)]
+    pub objects_info_json: Option<String>,
 }
 
 /// Complete G-code artifact and associated physical statistics.
@@ -287,6 +291,15 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
         out.push_str(&block);
     }
 
+    if config.machine.emit_progress_m73 {
+        let total_min = (total_est_time_s.max(0.0) / 60.0).ceil() as u64;
+        writeln!(out, "M73 P0 R{total_min}").map_err(|_| GcodeError::FormatError)?;
+        if config.machine.flavor == GcodeFlavor::MarlinBuddy {
+            let silent_min = (estimate_silent_time_s(total_est_time_s) / 60.0).ceil() as u64;
+            writeln!(out, "M73 Q0 S{silent_min}").map_err(|_| GcodeError::FormatError)?;
+        }
+    }
+
     writeln!(out, ";TYPE:Custom").map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "G21 ; millimeters").map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "G90 ; absolute XYZ").map_err(|_| GcodeError::FormatError)?;
@@ -385,6 +398,7 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     let mut total_e_mm = 0.0;
     let mut total_travel_mm = 0.0;
     let mut total_time_s = 0.0;
+    let mut first_layer_time_s = 0.0;
     let mut elapsed_est_s = 0.0;
     let mut current_accel_mm_s2: Option<f64> = None;
     let mut feature_stats: BTreeMap<String, FeatureStats> = BTreeMap::new();
@@ -466,8 +480,14 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             } else {
                 ((layer_seq_idx * 99) / total_layers.max(1)).min(99) as u8
             };
-            let rem_min = ((total_est_time_s - elapsed_est_s).max(0.0) / 60.0).ceil() as u64;
+            let rem_s = (total_est_time_s - elapsed_est_s).max(0.0);
+            let rem_min = (rem_s / 60.0).ceil() as u64;
             writeln!(out, "M73 P{pct} R{rem_min}").map_err(|_| GcodeError::FormatError)?;
+            if config.machine.flavor == GcodeFlavor::MarlinBuddy {
+                let silent_rem_min = (estimate_silent_time_s(rem_s) / 60.0).ceil() as u64;
+                writeln!(out, "M73 Q{pct} S{silent_rem_min}")
+                    .map_err(|_| GcodeError::FormatError)?;
+            }
         }
 
         if let Some(tpl) = &config.machine.layer_change_gcode
@@ -695,6 +715,9 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             writeln!(out, "G92 E0").map_err(|_| GcodeError::FormatError)?;
             cur_e = 0.0;
         }
+        if layer_seq_idx == 0 {
+            first_layer_time_s = total_time_s;
+        }
         elapsed_est_s += layer.estimated_time_s.max(0.0);
     }
 
@@ -706,6 +729,9 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
 
     if config.machine.emit_progress_m73 {
         writeln!(out, "M73 P100 R0").map_err(|_| GcodeError::FormatError)?;
+        if config.machine.flavor == GcodeFlavor::MarlinBuddy {
+            writeln!(out, "M73 Q100 S0").map_err(|_| GcodeError::FormatError)?;
+        }
     }
 
     writeln!(out, ";TYPE:Custom").map_err(|_| GcodeError::FormatError)?;
@@ -754,16 +780,42 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
 
     let total_vol = total_e_mm * fil_area;
     let total_weight = total_vol * 0.001 * config.filament.density_g_cm3;
+    let silent_time_s = estimate_silent_time_s(total_time_s);
+    let first_layer_silent_time_s = estimate_silent_time_s(first_layer_time_s);
+    let objects_info_json = format_objects_info_json(&plate.objects);
 
+    if let Some(ref json) = objects_info_json {
+        writeln!(out, "; objects_info = {json}").map_err(|_| GcodeError::FormatError)?;
+    }
     writeln!(out, "; filament used [mm] = {total_e_mm:.2}").map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "; filament used [cm3] = {:.2}", total_vol * 0.001)
         .map_err(|_| GcodeError::FormatError)?;
     writeln!(out, "; filament used [g] = {total_weight:.2}")
         .map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; total filament used [g] = {total_weight:.2}")
+        .map_err(|_| GcodeError::FormatError)?;
     writeln!(
         out,
         "; estimated printing time (normal mode) = {}",
         format_duration_hms(total_time_s)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; estimated printing time (silent mode) = {}",
+        format_duration_hms(silent_time_s)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; estimated first layer printing time (normal mode) = {}",
+        format_duration_hms(first_layer_time_s)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; estimated first layer printing time (silent mode) = {}",
+        format_duration_hms(first_layer_silent_time_s)
     )
     .map_err(|_| GcodeError::FormatError)?;
     if let Some(ft) = config
@@ -777,8 +829,14 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     }
     writeln!(
         out,
-        "; nozzle_diameter = {:.2}",
-        config.machine.nozzle_diameter_mm
+        "; nozzle_diameter = {}",
+        format_compact_f64(config.machine.nozzle_diameter_mm)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; nozzle_high_flow = {}",
+        u8::from(config.machine.nozzle_high_flow)
     )
     .map_err(|_| GcodeError::FormatError)?;
     if let Some(pm) = config
@@ -790,6 +848,35 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
     {
         writeln!(out, "; printer_model = {pm}").map_err(|_| GcodeError::FormatError)?;
     }
+    writeln!(out, "; max_layer_z = {max_z:.2}").map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; bed_temperature = {}", config.filament.bed_temp_c)
+        .map_err(|_| GcodeError::FormatError)?;
+    writeln!(out, "; temperature = {}", config.filament.nozzle_temp_c)
+        .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; layer_height = {}",
+        format_compact_f64(config.process.layer_height_mm)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; fill_density = {:.0}%",
+        config.process.sparse_infill_density * 100.0
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; support_material = {}",
+        u8::from(config.process.support.enabled)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
+    writeln!(
+        out,
+        "; ironing = {}",
+        u8::from(config.process.ironing.mode != layercraft_config::IroningType::Off)
+    )
+    .map_err(|_| GcodeError::FormatError)?;
 
     Ok(GcodeOutput {
         gcode: out,
@@ -802,8 +889,66 @@ pub fn emit_gcode(plate: &SlicedPlate, config: &PrintConfig) -> Result<GcodeOutp
             travel_distance_mm: total_travel_mm,
             estimated_time_s: total_time_s,
             features: feature_stats,
+            first_layer_time_s,
+            objects_info_json,
         },
     })
+}
+
+pub(crate) fn format_compact_f64(val: f64) -> String {
+    let s = format!("{val:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed == "-0" || trimmed.is_empty() {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+pub(crate) fn estimate_silent_time_s(normal_time_s: f64) -> f64 {
+    if normal_time_s > 0.0 {
+        (normal_time_s * 1.05).max(normal_time_s + 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn push_json_escaped(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+}
+
+fn format_objects_info_json(objects: &[SlicedObjectInfo]) -> Option<String> {
+    if objects.is_empty() {
+        return None;
+    }
+    let mut s = String::from("{\"objects\":[");
+    for (oi, obj) in objects.iter().enumerate() {
+        if oi > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"name\":\"");
+        push_json_escaped(&mut s, &obj.gcode_id);
+        s.push_str("\",\"polygon\":[");
+        for (pi, [px, py]) in obj.polygon_xy_mm.iter().enumerate() {
+            if pi > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "[{px:.3},{py:.3}]");
+        }
+        s.push_str("]}");
+    }
+    s.push_str("]}");
+    Some(s)
 }
 
 fn format_duration_hms(total_seconds: f64) -> String {
@@ -4079,15 +4224,17 @@ mod tests {
         assert!(out.gcode.contains(r#"M862.3 P "COREONE""#));
         assert!(out.gcode.contains("M862.1 P0.4 A0 F1"));
         assert!(out.gcode.contains("M862.5 P2"));
+        assert!(out.gcode.contains(r#"M862.6 P"Input shaper""#));
         assert!(out.gcode.contains("G29 P9 X208 Y-2.5 W32 H4"));
-        assert!(out.gcode.contains("G1 X5 Y-2.5 Z10"));
+        assert!(out.gcode.contains("G0 X249 Y-2.5 Z15"));
         assert!(out.gcode.contains("M106 P3 S127"));
         assert!(out.gcode.contains("M106 P3 R"));
-        assert!(out.gcode.contains("G1 Z100 F900"));
+        assert!(out.gcode.contains("G1 Z100 F720"));
         assert!(out.gcode.contains("M555 "));
         assert!(out.gcode.contains("M73 P"));
-        assert!(out.gcode.contains("; thumbnail_QOI begin 440x240 "));
-        assert!(out.gcode.contains("; thumbnail begin 160x120 "));
+        assert!(out.gcode.contains("M73 Q"));
+        assert!(out.gcode.contains("; thumbnail_QOI begin 480x240 "));
+        assert!(out.gcode.contains("; thumbnail begin 380x285 "));
         assert!(
             out.gcode
                 .contains("; estimated printing time (normal mode) = ")

@@ -257,7 +257,7 @@ pub fn encode_bgcode(
     )?;
 
     // 2. Printer Metadata (Type 3)
-    let printer_ini = build_printer_ini(config);
+    let printer_ini = build_printer_ini(output, config);
     if !printer_ini.is_empty() {
         write_block(
             &mut out,
@@ -587,7 +587,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, BgcodeError> {
     Ok(u32::from_le_bytes(arr))
 }
 
-fn build_printer_ini(config: &PrintConfig) -> String {
+fn build_printer_ini(output: &GcodeOutput, config: &PrintConfig) -> String {
     let mut s = String::new();
     if let Some(pm) = config
         .machine
@@ -598,19 +598,81 @@ fn build_printer_ini(config: &PrintConfig) -> String {
     {
         let _ = writeln!(s, "printer_model={pm}");
     }
+    if let Some(ft) = config
+        .filament
+        .filament_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let _ = writeln!(s, "filament_type={ft}");
+    }
+    let _ = writeln!(s, "filament_abrasive=0");
     let _ = writeln!(
         s,
-        "nozzle_diameter={:.2}",
-        config.machine.nozzle_diameter_mm
+        "nozzle_diameter={}",
+        crate::format_compact_f64(config.machine.nozzle_diameter_mm)
     );
     let _ = writeln!(
         s,
-        "bed_shape=0x0,{:.1}x0,{:.1}x{:.1},0x{:.1}",
-        config.machine.bed_width_mm,
-        config.machine.bed_width_mm,
-        config.machine.bed_depth_mm,
-        config.machine.bed_depth_mm
+        "nozzle_high_flow={}",
+        u8::from(config.machine.nozzle_high_flow)
     );
+    let _ = writeln!(s, "bed_temperature={}", config.filament.bed_temp_c);
+    let _ = writeln!(
+        s,
+        "brim_width={}",
+        crate::format_compact_f64(config.process.brim_width_mm)
+    );
+    let _ = writeln!(
+        s,
+        "fill_density={:.0}%",
+        config.process.sparse_infill_density * 100.0
+    );
+    let _ = writeln!(
+        s,
+        "layer_height={}",
+        crate::format_compact_f64(config.process.layer_height_mm)
+    );
+    let _ = writeln!(s, "temperature={}", config.filament.nozzle_temp_c);
+    let _ = writeln!(
+        s,
+        "ironing={}",
+        u8::from(config.process.ironing.mode != layercraft_config::IroningType::Off)
+    );
+    let _ = writeln!(
+        s,
+        "support_material={}",
+        u8::from(config.process.support.enabled)
+    );
+    let _ = writeln!(s, "max_layer_z={:.2}", output.stats.max_z_mm);
+    if let Some(ref json) = output.stats.objects_info_json {
+        let _ = writeln!(s, "objects_info={json}");
+    }
+    let _ = writeln!(
+        s,
+        "filament used [mm]={:.2}",
+        output.stats.filament_length_mm
+    );
+    let _ = writeln!(s, "filament used [g]={:.2}", output.stats.filament_weight_g);
+    let _ = writeln!(
+        s,
+        "filament used [cm3]={:.2}",
+        output.stats.filament_volume_mm3 * 0.001
+    );
+    let _ = writeln!(
+        s,
+        "estimated printing time (normal mode)={}",
+        crate::format_duration_hms(output.stats.estimated_time_s)
+    );
+    let _ = writeln!(
+        s,
+        "estimated printing time (silent mode)={}",
+        crate::format_duration_hms(crate::estimate_silent_time_s(output.stats.estimated_time_s))
+    );
+    let bw = crate::format_compact_f64(config.machine.bed_width_mm);
+    let bd = crate::format_compact_f64(config.machine.bed_depth_mm);
+    let _ = writeln!(s, "bed_shape=0x0,{bw}x0,{bw}x{bd},0x{bd}");
     let flavor_name = match config.machine.flavor {
         GcodeFlavor::Klipper => "klipper",
         GcodeFlavor::Marlin => "marlin",
@@ -624,11 +686,6 @@ fn build_print_ini(output: &GcodeOutput, config: &PrintConfig) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "estimated printing time (normal mode)={}",
-        crate::format_duration_hms(output.stats.estimated_time_s)
-    );
-    let _ = writeln!(
-        s,
         "filament used [mm]={:.2}",
         output.stats.filament_length_mm
     );
@@ -638,6 +695,33 @@ fn build_print_ini(output: &GcodeOutput, config: &PrintConfig) -> String {
         output.stats.filament_volume_mm3 * 0.001
     );
     let _ = writeln!(s, "filament used [g]={:.2}", output.stats.filament_weight_g);
+    let _ = writeln!(
+        s,
+        "total filament used [g]={:.2}",
+        output.stats.filament_weight_g
+    );
+    let _ = writeln!(
+        s,
+        "estimated printing time (normal mode)={}",
+        crate::format_duration_hms(output.stats.estimated_time_s)
+    );
+    let _ = writeln!(
+        s,
+        "estimated first layer printing time (normal mode)={}",
+        crate::format_duration_hms(output.stats.first_layer_time_s)
+    );
+    let _ = writeln!(
+        s,
+        "estimated printing time (silent mode)={}",
+        crate::format_duration_hms(crate::estimate_silent_time_s(output.stats.estimated_time_s))
+    );
+    let _ = writeln!(
+        s,
+        "estimated first layer printing time (silent mode)={}",
+        crate::format_duration_hms(crate::estimate_silent_time_s(
+            output.stats.first_layer_time_s
+        ))
+    );
     if let Some(ft) = config
         .filament
         .filament_type
@@ -647,11 +731,15 @@ fn build_print_ini(output: &GcodeOutput, config: &PrintConfig) -> String {
     {
         let _ = writeln!(s, "filament_type={ft}");
     }
-    let _ = writeln!(s, "layer_height={:.3}", config.process.layer_height_mm);
     let _ = writeln!(
         s,
-        "first_layer_height={:.3}",
-        config.process.first_layer_height_mm
+        "layer_height={}",
+        crate::format_compact_f64(config.process.layer_height_mm)
+    );
+    let _ = writeln!(
+        s,
+        "first_layer_height={}",
+        crate::format_compact_f64(config.process.first_layer_height_mm)
     );
     let _ = writeln!(s, "temperature={}", config.filament.nozzle_temp_c);
     let _ = writeln!(s, "bed_temperature={}", config.filament.bed_temp_c);
@@ -675,6 +763,26 @@ fn build_slicer_ini(config: &PrintConfig) -> String {
     );
     let _ = writeln!(s, "filament_diameter={:.3}", config.filament.diameter_mm);
     let _ = writeln!(s, "filament_density={:.3}", config.filament.density_g_cm3);
+    let _ = writeln!(
+        s,
+        "nozzle_high_flow={}",
+        u8::from(config.machine.nozzle_high_flow)
+    );
+    let _ = writeln!(
+        s,
+        "brim_width={}",
+        crate::format_compact_f64(config.process.brim_width_mm)
+    );
+    let _ = writeln!(
+        s,
+        "support_material={}",
+        u8::from(config.process.support.enabled)
+    );
+    let _ = writeln!(
+        s,
+        "ironing={}",
+        u8::from(config.process.ironing.mode != layercraft_config::IroningType::Off)
+    );
     s
 }
 
@@ -1234,6 +1342,51 @@ mod tests {
                     .get("printer_model")
                     .map(String::as_str),
                 Some("COREONE")
+            );
+            assert_eq!(
+                decoded
+                    .printer_metadata
+                    .get("filament_type")
+                    .map(String::as_str),
+                Some("PLA")
+            );
+            assert_eq!(
+                decoded
+                    .printer_metadata
+                    .get("nozzle_diameter")
+                    .map(String::as_str),
+                Some("0.4")
+            );
+            assert_eq!(
+                decoded
+                    .printer_metadata
+                    .get("nozzle_high_flow")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert!(
+                decoded
+                    .printer_metadata
+                    .get("estimated printing time (normal mode)")
+                    .is_some_and(|s| !s.is_empty())
+            );
+            assert!(
+                decoded
+                    .printer_metadata
+                    .get("estimated printing time (silent mode)")
+                    .is_some_and(|s| !s.is_empty())
+            );
+            assert!(decoded.printer_metadata.contains_key("filament used [g]"));
+            assert!(decoded.printer_metadata.contains_key("max_layer_z"));
+            assert!(
+                decoded
+                    .print_metadata
+                    .contains_key("total filament used [g]")
+            );
+            assert!(
+                decoded
+                    .print_metadata
+                    .contains_key("estimated first layer printing time (normal mode)")
             );
             assert_eq!(decoded.thumbnails.len(), 4);
             assert_eq!(decoded.thumbnails[0].format, BgcodeThumbnailFormat::Qoi);

@@ -6285,7 +6285,17 @@ mod tests {
         assert!(gcode_out.gcode.contains("M862.3 P \"COREONE\""));
         assert!(gcode_out.gcode.contains("M862.1"));
         assert!(gcode_out.gcode.contains("M862.5 P2"));
+        assert!(gcode_out.gcode.contains("M862.6 P\"Input shaper\""));
         assert!(gcode_out.gcode.contains("G29 P9"));
+        assert!(gcode_out.gcode.contains("G29 P1"));
+        assert!(gcode_out.gcode.contains("G29 A"));
+        assert!(gcode_out.gcode.contains("M591 S0"));
+        assert!(gcode_out.gcode.contains("M591 R"));
+        assert!(gcode_out.gcode.contains("G0 X249 Y-2.5"));
+        assert!(gcode_out.gcode.contains("M572 S0"));
+        assert!(gcode_out.gcode.contains("M84 X Y E"));
+        assert!(gcode_out.gcode.contains("M73 P0"));
+        assert!(gcode_out.gcode.contains("M73 Q0"));
         assert!(gcode_out.gcode.contains("M17"));
         assert!(gcode_out.gcode.contains("M106 P3"));
         assert!(report.pressure_advance_commands_count > 0);
@@ -6306,6 +6316,26 @@ mod tests {
                 .map(String::as_str),
             Some("COREONE")
         );
+        assert_eq!(
+            decoded
+                .printer_metadata
+                .get("filament_type")
+                .map(String::as_str),
+            Some("PLA")
+        );
+        assert_eq!(
+            decoded
+                .printer_metadata
+                .get("nozzle_high_flow")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            decoded
+                .printer_metadata
+                .contains_key("estimated printing time (normal mode)")
+        );
+        assert!(decoded.printer_metadata.contains_key("objects_info"));
         let (decoded_rep, _) = evaluate_gcode(
             &decoded.gcode,
             sess.config.filament.diameter_mm,
