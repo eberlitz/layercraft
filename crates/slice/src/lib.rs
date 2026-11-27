@@ -5809,6 +5809,78 @@ mod tests {
             mean_trunk >= 0.65 * mean_mid,
             "inverted tree trunk detected: mean trunk area {mean_trunk:.2} mm2 < 0.65 * mid area {mean_mid:.2} mm2"
         );
+
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for r in &plate.layers[50].slice_regions {
+            if let Some(aabb) = r.aabb() {
+                let (x0, y0) = aabb.min.to_mm();
+                let (x1, y1) = aabb.max.to_mm();
+                min_x = min_x.min(x0);
+                min_y = min_y.min(y0);
+                max_x = max_x.max(x1);
+                max_y = max_y.max(y1);
+            }
+        }
+        assert!(min_x < max_x && min_y < max_y);
+
+        let top_iface: Vec<&ExtrusionPath> = plate.layers[48]
+            .paths
+            .iter()
+            .filter(|p| p.role == ExtrusionRole::SupportInterface && !p.points.is_empty())
+            .collect();
+        assert!(
+            !top_iface.is_empty(),
+            "expected SupportInterface on layer 48 (z={:.2} mm)",
+            plate.layers[48].z_top_mm
+        );
+
+        let min_iface_dist = |px: f64, py: f64| -> f64 {
+            top_iface
+                .iter()
+                .map(|q| {
+                    let qn = q.points.len();
+                    if qn == 1 {
+                        let (ax, ay) = q.points[0].to_mm();
+                        return (px - ax).hypot(py - ay);
+                    }
+                    let seg_count = if q.closed { qn } else { qn - 1 };
+                    (0..seg_count)
+                        .map(|si| {
+                            let a = q.points[si].to_mm();
+                            let b = q.points[(si + 1) % qn].to_mm();
+                            pt_to_seg_dist(px, py, a.0, a.1, b.0, b.1)
+                        })
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+
+        let mid_y = 0.5 * (min_y + max_y);
+        for (label, px, py, max_dist) in [
+            (
+                "outer front-right corner",
+                max_x - 0.225,
+                min_y + 0.225,
+                0.50,
+            ),
+            (
+                "outer back-right corner",
+                max_x - 0.225,
+                max_y - 0.225,
+                0.50,
+            ),
+            ("right-edge midpoint", max_x - 0.225, mid_y, 0.50),
+            ("overhang center", min_x + 15.0, mid_y, 0.60),
+        ] {
+            let d = min_iface_dist(px, py);
+            assert!(
+                d <= max_dist,
+                "layer 48 SupportInterface missed {label} ({px:.2}, {py:.2}): min dist {d:.3} mm > {max_dist:.3} mm"
+            );
+        }
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub(crate) fn generate_tree_support_paths(
         let ovhs = contact_overhangs.get(idx).map(Vec::as_slice).unwrap_or(&[]);
 
         for ovh in ovhs {
-            let candidates = collect_seeds_in_expolygon(ovh, tree.branch_distance_mm);
+            let candidates = collect_seeds_in_expolygon(ovh, tree.branch_distance_mm, tip_r, join);
             for (mut cx, mut cy) in candidates {
                 let near_existing = active
                     .iter()
@@ -455,20 +455,61 @@ pub(crate) fn generate_tree_support_paths(
         grounded_prev = offset(&printable_core, mm_to_nm(0.5 * s.line_width_mm)?, join)?;
 
         let interface_here = if iface > 0 {
-            let mut iface_sources = tip_polys;
+            let mut contact_sources = Vec::new();
             let top_end = (idx + iface - 1).min(n.saturating_sub(1));
             for j in idx..=top_end {
                 if let Some(co) = contact_overhangs.get(j) {
-                    iface_sources.extend(co.iter().cloned());
+                    contact_sources.extend(co.iter().cloned());
                 }
             }
-            if iface_sources.is_empty() {
+            let contact_union = if contact_sources.is_empty() {
                 Vec::new()
             } else {
-                let mut iu = intersection(&tree_polys, &union(&iface_sources)?)?;
-                iu.retain(|ex| ex.area_mm2() >= MIN_DISK_AREA_MM2);
-                iu
+                union(&contact_sources)?
+            };
+
+            let mut base_sources = tip_polys;
+            base_sources.extend(contact_union.iter().cloned());
+            let mut iu = if base_sources.is_empty() {
+                Vec::new()
+            } else {
+                intersection(&tree_polys, &union(&base_sources)?)?
+            };
+
+            if !contact_union.is_empty() {
+                let cleared_contact = if excl.is_empty() {
+                    intersection(&contact_union, bed_slice)?
+                } else {
+                    intersection(&difference(&contact_union, &excl)?, bed_slice)?
+                };
+                if !cleared_contact.is_empty() {
+                    let contact_tips = intersection(&tree_polys, &cleared_contact)?;
+                    if !contact_tips.is_empty() {
+                        let edge_reach = (branch_r - tip_r + 0.6).clamp(0.6, 1.5);
+                        let close_r = (0.85 * tree.branch_distance_mm).clamp(1.2, 3.0);
+                        let padded = offset(&contact_tips, mm_to_nm(edge_reach)?, join)?;
+                        let dilated = offset(&padded, mm_to_nm(close_r)?, join)?;
+                        let closed = offset(&dilated, -mm_to_nm(close_r)?, join)?;
+                        let raw_canopy = intersection(&closed, &cleared_contact)?;
+                        let mut canopy = Vec::with_capacity(raw_canopy.len());
+                        for ex in raw_canopy {
+                            if ex.area_mm2() >= MIN_DISK_AREA_MM2
+                                && !intersection(std::slice::from_ref(&ex), &contact_tips)?
+                                    .is_empty()
+                            {
+                                canopy.push(ex);
+                            }
+                        }
+                        if !canopy.is_empty() {
+                            iu.extend(canopy);
+                            iu = union(&iu)?;
+                        }
+                    }
+                }
             }
+
+            iu.retain(|ex| ex.area_mm2() >= MIN_DISK_AREA_MM2);
+            iu
         } else {
             Vec::new()
         };
@@ -543,7 +584,7 @@ pub(crate) fn generate_tree_support_paths(
 
         if !interface_here.is_empty() {
             let irings = offset(&interface_here, -mm_to_nm(0.5 * s.line_width_mm)?, join)?;
-            for ex in irings {
+            for ex in &irings {
                 push_closed_poly(
                     &ex.outer,
                     ExtrusionRole::SupportInterface,
@@ -574,8 +615,13 @@ pub(crate) fn generate_tree_support_paths(
             } else {
                 -std::f64::consts::FRAC_PI_4
             };
+            let hatch_region = if irings.is_empty() {
+                interface_here.as_slice()
+            } else {
+                irings.as_slice()
+            };
             let hatched = generate_rectilinear_hatch(
-                &interface_here,
+                hatch_region,
                 angle,
                 iface_spacing,
                 0.0,
@@ -640,19 +686,81 @@ fn clamp_to_bed(x: f64, y: f64, r: f64, config: &PrintConfig) -> (f64, f64) {
     )
 }
 
-fn collect_seeds_in_expolygon(ex: &ExPolygon, spacing_mm: f64) -> Vec<(f64, f64)> {
+fn collect_seeds_in_expolygon(
+    ex: &ExPolygon,
+    spacing_mm: f64,
+    tip_r: f64,
+    join: JoinType,
+) -> Vec<(f64, f64)> {
     let Some(aabb) = ex.aabb() else {
         return Vec::new();
     };
     let (min_x, min_y) = aabb.min.to_mm();
     let (max_x, max_y) = aabb.max.to_mm();
     let step = spacing_mm.max(0.5);
+    let mut seeds = Vec::new();
+
+    // Seed inset boundary vertices (90-degree corners first so they win deduplication)
+    // followed by subdivided boundary segments before interior grid probes.
+    let edge_inset = tip_r.clamp(0.25, 0.75);
+    let mut inset_polys = if let Ok(neg) = mm_to_nm(edge_inset) {
+        offset(std::slice::from_ref(ex), -neg, join).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if inset_polys.is_empty() {
+        let fallback_inset = (0.5 * edge_inset).max(0.12);
+        if let Ok(neg) = mm_to_nm(fallback_inset) {
+            inset_polys = offset(std::slice::from_ref(ex), -neg, join).unwrap_or_default();
+        }
+    }
+
+    let mut rings: Vec<&Polygon> = Vec::new();
+    for inset_ex in &inset_polys {
+        rings.push(&inset_ex.outer);
+        rings.extend(inset_ex.holes.iter());
+    }
+    for ring in &rings {
+        for &pt in &ring.points {
+            if ex.contains_point(pt) {
+                seeds.push(pt.to_mm());
+            }
+        }
+    }
+    for ring in &rings {
+        let m = ring.points.len();
+        if m < 2 {
+            continue;
+        }
+        for i in 0..m {
+            let (Some(&a), Some(&b)) = (ring.points.get(i), ring.points.get((i + 1) % m)) else {
+                continue;
+            };
+            let (ax, ay) = a.to_mm();
+            let (bx, by) = b.to_mm();
+            let len = (bx - ax).hypot(by - ay);
+            let segs = (len / step).ceil() as usize;
+            if segs < 2 {
+                continue;
+            }
+            for k in 1..segs {
+                let t = (k as f64) / (segs as f64);
+                let px = ax + t * (bx - ax);
+                let py = ay + t * (by - ay);
+                if let Ok(p) = Point2::from_mm(px, py)
+                    && ex.contains_point(p)
+                {
+                    seeds.push((px, py));
+                }
+            }
+        }
+    }
+
     let nx = (((max_x - min_x) / step).ceil() as usize).clamp(1, MAX_GRID_BINS);
     let ny = (((max_y - min_y) / step).ceil() as usize).clamp(1, MAX_GRID_BINS);
     let dx = (max_x - min_x).max(1e-6) / (nx as f64);
     let dy = (max_y - min_y).max(1e-6) / (ny as f64);
 
-    let mut seeds = Vec::new();
     for iy in 0..ny {
         let y0 = min_y + (iy as f64) * dy;
         let y1 = min_y + ((iy + 1) as f64) * dy;
