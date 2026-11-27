@@ -3483,12 +3483,11 @@ pub(crate) fn build_perimeters_classic(
     }
 
     if config.process.gap_fill_enabled {
-        let ribbon_join = JoinType::Miter { limit: 1.45 };
         let mut wall_ribbons = Vec::new();
         for (_, w_mm, _, poly_group) in &rings {
             let half_w = 0.5 * *w_mm;
-            let outer_env = offset(poly_group, mm_to_nm(half_w)?, ribbon_join)?;
-            let inner_void = offset(poly_group, -mm_to_nm(half_w)?, ribbon_join)?;
+            let outer_env = offset(poly_group, mm_to_nm(half_w + 0.005)?, join)?;
+            let inner_void = offset(poly_group, -mm_to_nm((half_w - 0.005).max(0.01))?, join)?;
             wall_ribbons.extend(difference(&outer_env, &inner_void)?);
         }
         let covered_by_walls = union_if_multi(wall_ribbons)?;
@@ -3501,10 +3500,22 @@ pub(crate) fn build_perimeters_classic(
             } else {
                 offset(&wide_eroded, mm_to_nm(0.5 * solid_w)?, join)?
             };
-            let gap_regions = if wide_infill.is_empty() {
+            let raw_gap_regions = if wide_infill.is_empty() {
                 uncovered
             } else {
                 difference(&uncovered, &wide_infill)?
+            };
+            let open_r = (0.25 * config.process.gap_fill_min_width_mm).clamp(0.01, 0.04);
+            let gap_regions = if raw_gap_regions.is_empty() {
+                Vec::new()
+            } else {
+                let eroded = offset(&raw_gap_regions, -mm_to_nm(open_r)?, join)?;
+                if eroded.is_empty() {
+                    Vec::new()
+                } else {
+                    let opened = offset(&eroded, mm_to_nm(open_r + 0.002)?, join)?;
+                    intersection(&raw_gap_regions, &opened)?
+                }
             };
             if !gap_regions.is_empty() {
                 let gap_speed = config
@@ -6981,7 +6992,7 @@ mod tests {
 
     #[test]
     fn classic_gap_fill_connects_tapered_wedge_tip_to_outer_wall() {
-        let wedge = make_tapered_wedge_mesh(36.0, 4.0, 0.25, 4.0);
+        let wedge = make_tapered_wedge_mesh(36.0, 4.0, 0.25, 8.0);
         let mut cfg = PrintConfig::default();
         cfg.process.wall_generator = WallGenerator::Classic;
         cfg.process.wall_loops = 2;
@@ -6990,50 +7001,65 @@ mod tests {
         cfg.process.gap_fill_enabled = true;
 
         let plate = slice_single_mesh(&wedge, &cfg).unwrap();
-        let mid = &plate.layers[10];
-        let outer_max_x = mid
-            .paths
-            .iter()
-            .filter(|p| p.role == ExtrusionRole::OuterWall)
-            .flat_map(|p| p.points.iter())
-            .map(|pt| pt.to_mm().0)
-            .fold(f64::NEG_INFINITY, f64::max);
-        assert!(outer_max_x.is_finite());
+        assert_eq!(plate.layers.len(), 40);
+        for layer in &plate.layers {
+            let outer_max_x = layer
+                .paths
+                .iter()
+                .filter(|p| p.role == ExtrusionRole::OuterWall)
+                .flat_map(|p| p.points.iter())
+                .map(|pt| pt.to_mm().0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                outer_max_x.is_finite(),
+                "missing OuterWall on layer {} (z={:.2})",
+                layer.index,
+                layer.z_top_mm
+            );
 
-        let gap_paths: Vec<_> = mid
-            .paths
-            .iter()
-            .filter(|p| p.role == ExtrusionRole::GapFill)
-            .collect();
-        let tip_gap = gap_paths
-            .iter()
-            .copied()
-            .find(|p| {
-                p.points
-                    .iter()
-                    .map(|pt| pt.to_mm().0)
-                    .fold(f64::NEG_INFINITY, f64::max)
-                    > outer_max_x + 0.5
-            })
-            .expect("expected GapFill tip path extending tapered wedge");
-        let tip_min_x = tip_gap
-            .points
-            .iter()
-            .map(|pt| pt.to_mm().0)
-            .fold(f64::INFINITY, f64::min);
-        let gap = tip_min_x - outer_max_x;
-        assert!(
-            gap <= 0.20,
-            "Classic GapFill tip detached from OuterWall: {gap:.3} mm > 0.20 mm (outer_max_x={outer_max_x:.3}, tip_min_x={tip_min_x:.3})"
-        );
+            let gap_paths: Vec<_> = layer
+                .paths
+                .iter()
+                .filter(|p| p.role == ExtrusionRole::GapFill)
+                .collect();
+            let tip_gap = gap_paths
+                .iter()
+                .copied()
+                .find(|p| {
+                    p.points
+                        .iter()
+                        .map(|pt| pt.to_mm().0)
+                        .fold(f64::NEG_INFINITY, f64::max)
+                        > outer_max_x + 0.5
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected GapFill tip path extending tapered wedge on layer {} (z={:.2})",
+                        layer.index, layer.z_top_mm
+                    )
+                });
+            let tip_min_x = tip_gap
+                .points
+                .iter()
+                .map(|pt| pt.to_mm().0)
+                .fold(f64::INFINITY, f64::min);
+            let gap = tip_min_x - outer_max_x;
+            assert!(
+                gap <= 0.20,
+                "Classic GapFill tip detached from OuterWall on layer {} (z={:.2}): {gap:.3} mm > 0.20 mm (outer_max_x={outer_max_x:.3}, tip_min_x={tip_min_x:.3})",
+                layer.index,
+                layer.z_top_mm
+            );
 
-        for gp in &gap_paths {
-            for pt in &gp.points {
-                assert!(
-                    mid.slice_regions.iter().any(|r| r.contains_point(*pt)),
-                    "GapFill endpoint {:?} poked outside model slice region",
-                    pt.to_mm()
-                );
+            for gp in &gap_paths {
+                for pt in &gp.points {
+                    assert!(
+                        layer.slice_regions.iter().any(|r| r.contains_point(*pt)),
+                        "GapFill endpoint {:?} poked outside model slice region on layer {}",
+                        pt.to_mm(),
+                        layer.index
+                    );
+                }
             }
         }
     }

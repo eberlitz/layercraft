@@ -152,12 +152,26 @@ impl MedialAxis {
 
 /// Compute the pruned interior Voronoi medial axis and vertex anchors for `region`.
 pub fn medial_axis(region: &ExPolygon) -> Result<MedialAxis, ClipError> {
-    let mut simplified_outer = crate::simplify(&region.outer, 2_000);
+    if region.area_mm2() < 1e-4 {
+        return Ok(MedialAxis::default());
+    }
+    match medial_axis_with_eps(region, 5_000) {
+        Ok(axis)
+            if !axis.edges.is_empty() || !axis.anchors.is_empty() || region.area_mm2() < 0.02 =>
+        {
+            Ok(axis)
+        }
+        _ => medial_axis_with_eps(region, 15_000),
+    }
+}
+
+fn medial_axis_with_eps(region: &ExPolygon, simplify_eps_nm: i64) -> Result<MedialAxis, ClipError> {
+    let mut simplified_outer = crate::simplify(&region.outer, simplify_eps_nm);
     simplified_outer.ensure_ccw();
     let mut contours: Vec<Polygon> = Vec::with_capacity(1 + region.holes.len());
     contours.push(simplified_outer);
     for hole in &region.holes {
-        let mut sh = crate::simplify(hole, 2_000);
+        let mut sh = crate::simplify(hole, simplify_eps_nm);
         sh.ensure_cw();
         contours.push(sh);
     }
