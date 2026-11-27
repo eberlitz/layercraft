@@ -223,11 +223,13 @@ pub fn medial_axis(region: &ExPolygon) -> Result<MedialAxis, ClipError> {
         return Ok(MedialAxis::default());
     }
 
-    let diagram = Builder::<i32>::default()
-        .with_segments(segs_i32.iter())
-        .map_err(|_| ClipError::KernelFailure(-1))?
-        .build()
-        .map_err(|_| ClipError::KernelFailure(-1))?;
+    let diagram = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Builder::<i32>::default()
+            .with_segments(segs_i32.iter())
+            .and_then(|b| b.build())
+    }))
+    .map_err(|_| ClipError::KernelFailure(-1))?
+    .map_err(|_| ClipError::KernelFailure(-1))?;
 
     let to_world = |vx: f64, vy: f64| -> (f64, f64) {
         (
@@ -374,6 +376,7 @@ pub fn medial_axis(region: &ExPolygon) -> Result<MedialAxis, ClipError> {
 
 fn clean_quantized_contour(pts: &mut Vec<(i32, i32)>) {
     loop {
+        pts.dedup();
         if pts.len() >= 2 && pts.first() == pts.last() {
             pts.pop();
         }
@@ -381,16 +384,21 @@ fn clean_quantized_contour(pts: &mut Vec<(i32, i32)>) {
         if n < 3 {
             break;
         }
-        let mut spike_idx = None;
+        let mut drop_idx = None;
         for i in 0..n {
-            let prev = pts.get((i + n - 1) % n);
-            let next = pts.get((i + 1) % n);
-            if prev.is_some() && prev == next {
-                spike_idx = Some(i);
+            let (Some(&prev), Some(&curr), Some(&next)) =
+                (pts.get((i + n - 1) % n), pts.get(i), pts.get((i + 1) % n))
+            else {
+                continue;
+            };
+            let cross = (curr.0 as i64 - prev.0 as i64) * (next.1 as i64 - curr.1 as i64)
+                - (curr.1 as i64 - prev.1 as i64) * (next.0 as i64 - curr.0 as i64);
+            if prev == next || cross == 0 {
+                drop_idx = Some(i);
                 break;
             }
         }
-        if let Some(idx) = spike_idx {
+        if let Some(idx) = drop_idx {
             pts.remove(idx);
             continue;
         }

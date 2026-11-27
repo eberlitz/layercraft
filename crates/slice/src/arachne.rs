@@ -1199,9 +1199,51 @@ fn extract_range_runs(edge: &MedialEdge, min_w: f64, max_w: f64) -> Vec<WidthPie
     pieces
 }
 
+fn anchor_gap_fill_endpoint(
+    p_end: (f64, f64),
+    p_neighbor: (f64, f64),
+    w_end: f64,
+    wall_coverage: &[ExPolygon],
+    model_regions: &[ExPolygon],
+) -> Option<(f64, f64)> {
+    if wall_coverage.is_empty() || w_end <= 1e-6 {
+        return None;
+    }
+    let dx = p_end.0 - p_neighbor.0;
+    let dy = p_end.1 - p_neighbor.1;
+    let len = dx.hypot(dy);
+    if len <= 1e-9 {
+        return None;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let in_any = |polys: &[ExPolygon], x: f64, y: f64| -> bool {
+        Point2::from_mm(x, y).is_ok_and(|pt| polys.iter().any(|ex| ex.contains_point(pt)))
+    };
+
+    for frac in [0.85, 0.70, 0.55, 0.40, 0.25] {
+        let ext = frac * w_end;
+        let p_ext = (p_end.0 + ext * ux, p_end.1 + ext * uy);
+        let p_mid = (p_end.0 + 0.5 * ext * ux, p_end.1 + 0.5 * ext * uy);
+        let p_cap = (
+            p_end.0 + (ext + 0.5 * w_end) * ux,
+            p_end.1 + (ext + 0.5 * w_end) * uy,
+        );
+        if in_any(wall_coverage, p_ext.0, p_ext.1)
+            && in_any(model_regions, p_mid.0, p_mid.1)
+            && in_any(model_regions, p_cap.0, p_cap.1)
+        {
+            return Some(p_ext);
+        }
+    }
+    None
+}
+
 /// Generate medial-axis variable-width gap fill paths across narrow residual channels.
 pub(crate) fn extract_gap_fill_paths(
     gap_regions: &[ExPolygon],
+    wall_coverage: &[ExPolygon],
+    model_regions: &[ExPolygon],
     min_width_mm: f64,
     max_width_mm: f64,
     layer_height_mm: f64,
@@ -1225,9 +1267,28 @@ pub(crate) fn extract_gap_fill_paths(
     let min_piece_len = (0.5 * min_width_mm).max(0.05);
     let stitched = stitch_open_chains(pieces, CHAIN_STITCH_TOL_MM);
     let mut out = Vec::new();
-    for (pts, widths, closed) in stitched {
+    for (mut pts, mut widths, closed) in stitched {
         if pts.len() < 2 || (!closed && polyline_len_mm(&pts, false) < min_piece_len) {
             continue;
+        }
+        if !closed && pts.len() == widths.len() {
+            if let (Some(&p0), Some(&p1), Some(&w0)) = (pts.first(), pts.get(1), widths.first())
+                && let Some(ext_start) =
+                    anchor_gap_fill_endpoint(p0, p1, w0, wall_coverage, model_regions)
+            {
+                pts.insert(0, ext_start);
+                widths.insert(0, w0);
+            }
+            let n = pts.len();
+            if n >= 2
+                && let (Some(&p_last), Some(&p_prev), Some(&w_last)) =
+                    (pts.get(n - 1), pts.get(n - 2), widths.last())
+                && let Some(ext_end) =
+                    anchor_gap_fill_endpoint(p_last, p_prev, w_last, wall_coverage, model_regions)
+            {
+                pts.push(ext_end);
+                widths.push(w_last);
+            }
         }
         emit_polyline_with_widths(
             &pts,
