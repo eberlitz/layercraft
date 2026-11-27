@@ -63,12 +63,12 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
   - [x] Hollow circular tree trunks adhere cleanly to build plate and clear lower arm geometry (`on_build_plate_only`) — 3 merged trunk clusters adhered flat on PEI with zero fusion to the lower arm
   - [x] Dense `Support interface` cap snaps off cleanly with smooth supported underside (no fused welts) — continuous 2-layer cross-hatched interface canopy + corner seeding (`6705742`) produced crisp 90° corners and clean breakaway on PETG HF with only a tiny inner-corner flake
 
-### 4. Thin-Wall Arachne Modulation
-- **Geometry:** `ThinRib` / tapered wedge with sub-nozzle wall widths (`process.wall_generator = "arachne"`)
-- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PLA (0.4mm HF Nozzle)` + `LayerCraft 0.20mm Balanced (0.4mm HF)`
+### 4. Thin-Wall Arachne Modulation (`PETG HF`)
+- **Geometry:** `ThinRib` / `TaperedWedge` (`36 × 4.0→0.25 × 8.0 mm`) with sub-nozzle wall widths (`process.wall_generator = "arachne"`)
+- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PETG (0.4mm HF Nozzle)` (verified fourth print; also test `LayerCraft PLA (0.4mm HF Nozzle)` when loaded) + `LayerCraft 0.20mm Balanced (0.4mm HF)`
 - **Inspect on hardware:**
-  - [ ] Narrow tapered tips print as continuous variable-width medial beads without gaps or dropped layers
-  - [ ] Intermediate transition from 2 perimeters -> 1 medial bead is smooth with no blobs
+  - [x] Narrow tapered tips print as continuous variable-width medial beads without gaps or dropped layers — measured `35.78 mm` length (vs `36.00 mm` nominal) and `0.49 mm` tip width on a `0.40 mm` nozzle with zero dropped layers or tip lifting
+  - [x] Intermediate transition from 2 perimeters -> 1 medial bead is smooth with no blobs — gap-free, blob-free solid transitions across `4→3→2→1` walls after Arachne transition/ramp fix (`aae97eb`) (minor cosmetic step noted at the outer `2→1` pinch where the seam started)
 
 ### 5. Surface & Motion Finish (Scarf Seam + Ironing + G2/G3 Arcs + PA)
 - **Geometry:** Cylinder (`SampleShape::Cylinder`) with `scarf_seam.enabled = true`, `ironing.mode = "topmost_surface"`, `arc_fitting = true`
@@ -95,6 +95,6 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 | 1 | Cube 20 mm (`PETG HF`, `0.20 Balanced`) | `14m 25s` | `22m 53s` | `+59% (incl. heat/soak/MBL)` | `20.01 × 20.02 × 20.05 mm` (within ±0.15 mm); LCD `PETG 3g`, chamber `37°C`; clean gyroid/corners; `end_gcode` updated to park before `Z100` drop |
 | 2 | BridgeArch (`PETG HF`, `0.20 Balanced`) | `8m 9s` | `16m 35s` | `+8m 26s (startup)` | `11.03 mm` height (nom `11.00`), `3.57 mm` mid-span deck (nom `3.00`); `PETG 1g`, chamber `34°C`; startup overhead matches Print #1 (`+8m 28s`) within 2 s |
 | 3 | C-Bracket (`PETG HF`, Tree Supports) | `12m 29s` | `20m 45s` | `+8m 16s (startup)` | `PETG 3g`, chamber `35°C`; continuous interface canopy & corner seeding `6705742`; clean breakaway & crisp 90° corners |
-| 4 | Thin Rib / Wedge (`PLA HF`, Arachne) | `__m __s` | `__m __s` | `___%` | |
+| 4 | TaperedWedge (`PETG HF`, Arachne) | `5m 34s` | `13m 37s` | `+8m 3s (startup)` | `35.78 mm` len (nom `36.00`), `0.49 mm` tip; `PETG 1g`, chamber `37°C`; gap-free `4→3→2→1` transitions after `aae97eb` |
 | 5 | Cylinder (`PLA HF`, Scarf + Ironing + Arcs) | `__m __s` | `__m __s` | `___%` | |
 | 6 | Multi-Part / ASA / TPU Check | `__m __s` | `__m __s` | `___%` | |
