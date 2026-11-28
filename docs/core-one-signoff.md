@@ -72,11 +72,11 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 
 ### 5. Surface & Motion Finish (Scarf Seam + Ironing + G2/G3 Arcs + PA)
 - **Geometry:** Cylinder (`SampleShape::Cylinder`) with `scarf_seam.enabled = true`, `ironing.mode = "topmost_surface"`, `arc_fitting = true`
-- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PLA (0.4mm HF Nozzle)` + `LayerCraft 0.20mm Balanced (0.4mm HF)`
+- **Presets:** `LayerCraft CORE One+ HF 0.4mm` + `LayerCraft PETG (0.4mm HF Nozzle)` (tested physically with loaded PETG HF spool; `LayerCraft PLA (0.4mm HF Nozzle)` still pending) + `LayerCraft 0.20mm Balanced (0.4mm HF)`
 - **Inspect on hardware:**
-  - [ ] Outer vertical seam step is visibly reduced by the Z/E-ramped scarf overlap
-  - [ ] Cylindrical walls move smoothly via `G2`/`G3` arcs with crisp corners/PA (`M572`) and no stuttering
-  - [ ] Top circular cap shows uniform glossy low-flow ironed finish with clean perimeter transition
+  - [ ] Outer vertical seam step is visibly reduced by the Z/E-ramped scarf overlap (follow-up needed: clean cylinder Ø measured `19.98–19.99 mm`, but across the scarf seam measured `20.18 mm` (`+0.18 mm` vertical ridge); root cause identified in G-code: inner-wall seam stacked directly behind outer-wall scarf start at `(125.000, 119.367)` with zero retract before the dead-stop `G0 Z(z_base + 0.02)` plunge + `start_height_ratio = 0.10` / `flow_ratio = 1.0`)
+  - [x] Cylindrical walls move smoothly via `G2`/`G3` arcs with crisp corners/PA (`M572`) and no stuttering (verified: `19.98–19.99 mm` clean Ø vs `20.00 mm` nom, `20.04 mm` height vs `20.00 mm` nom, smooth glossy walls, `3,199` arc moves)
+  - [ ] Top circular cap shows uniform glossy low-flow ironed finish with clean perimeter transition (follow-up needed: zero travel scars during monotonic ironing, top half smoothed well, lower half showed slight tearing/pitting from dry-ironing PETG HF at PLA-oriented `10%` flow / `30 mm/s` + `0.21 mm` inset overlapping outer perimeter)
 
 ### 6. Engineering Filaments & Multi-Object Cancel (`ASA`, `TPU 95A`, `M486`)
 - **ASA Test (`LayerCraft ASA (0.4mm HF Nozzle)`):**
@@ -96,5 +96,5 @@ Confirm printer LAN connectivity (`PrusaLink` or `Prusa Connect Local`) before s
 | 2 | BridgeArch (`PETG HF`, `0.20 Balanced`) | `8m 9s` | `16m 35s` | `+8m 26s (startup)` | `11.03 mm` height (nom `11.00`), `3.57 mm` mid-span deck (nom `3.00`); `PETG 1g`, chamber `34°C`; startup overhead matches Print #1 (`+8m 28s`) within 2 s |
 | 3 | C-Bracket (`PETG HF`, Tree Supports) | `12m 29s` | `20m 45s` | `+8m 16s (startup)` | `PETG 3g`, chamber `35°C`; continuous interface canopy & corner seeding `6705742`; clean breakaway & crisp 90° corners |
 | 4 | TaperedWedge (`PETG HF`, Arachne) | `5m 34s` | `13m 37s` | `+8m 3s (startup)` | `35.78 mm` len (nom `36.00`), `0.49 mm` tip; `PETG 1g`, chamber `37°C`; gap-free `4→3→2→1` transitions after `aae97eb` |
-| 5 | Cylinder (`PLA HF`, Scarf + Ironing + Arcs) | `__m __s` | `__m __s` | `___%` | |
+| 5 | Cylinder (`PETG HF`, Scarf + Ironing + Arcs) | `17m 10s` | `25m 18s` | `+8m 8s (startup)` | `20.04 mm` H, `19.98–19.99 mm` clean Ø (`G2/G3` arcs & PA clean), `20.18 mm` Ø across scarf ridge (`+0.18 mm`), `PETG 3g`, chamber `37°C`; scarf start plunge & PETG ironing flow flagged for tuning |
 | 6 | Multi-Part / ASA / TPU Check | `__m __s` | `__m __s` | `___%` | |

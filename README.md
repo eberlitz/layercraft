@@ -28,20 +28,20 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/preview-dark.png" alt="LayerCraft Modern Studio Canvas — 90-layer sliced dome with 4x MSAA viewport, floating ViewCube, unified playback & view dock, vertical layer scrubber, filtered feature legend, and right inspector" />
+  <img src="docs/screenshots/preview-dark.png" alt="LayerCraft Modern Studio Canvas — 90-layer sliced dome with 4x MSAA viewport, floating ViewCube with zoom controls, unified playback & view dock, vertical layer scrubber, filtered feature legend, and right inspector" />
 </p>
 
 <p align="center">
-  <em>LayerCraft Modern Studio Canvas (Dark Studio theme, 4× MSAA <code>wgpu</code> viewport): a 90-layer sliced dome inspected with GPU-instanced rounded beads, floating ViewCube navigation, filtered Feature Legend + <code>Color by</code> modes, unified move-playback dock, vertical layer scrubber, and right-docked <code>Objects | Settings | Printer</code> inspector.</em>
+  <em>LayerCraft Modern Studio Canvas (Dark Studio theme, 4× MSAA <code>wgpu</code> viewport): a 90-layer sliced dome inspected with GPU-instanced rounded beads, floating ViewCube navigation with zoom controls, filtered Feature Legend + <code>Color by</code> modes, unified move-playback dock, vertical layer scrubber, and right-docked <code>Objects | Settings | Printer</code> inspector.</em>
 </p>
 
 | Home — Recent Projects Hub | Dark Studio — Prepare |
 |---|---|
 | ![Home Recent Projects](docs/screenshots/home-dark.png) | ![Dark Studio Prepare](docs/screenshots/prepare-dark.png) |
-| Dedicated startup hub with searchable 3D plate thumbnails (desktop JSON + WASM IndexedDB cache), Quick Start shapes, and Active Setup summary. | Sleek 44px header with compact Project/Plate selector, left floating tool rail, 4× MSAA build plate canvas, and collapsible Outliner & Transform inspector. |
+| Dedicated startup hub with searchable 3D plate thumbnails (desktop JSON + WASM IndexedDB cache), 8 Quick Start calibration shapes (including Tapered Wedge), and Active Setup summary. | Sleek 44px header with compact Project/Plate selector, left floating tool rail, 4× MSAA build plate canvas with ViewCube zoom controls, and collapsible Outliner & Transform inspector. |
 
 <p align="center">
-  <img src="docs/screenshots/preview-light.png" alt="LayerCraft Light Drafting Preview — 90-layer sliced dome with translucent HUD overlays and right inspector" />
+  <img src="docs/screenshots/preview-light.png" alt="LayerCraft Light Drafting Preview — 90-layer sliced dome with ViewCube zoom controls, translucent HUD overlays, and right inspector" />
 </p>
 
 <p align="center">
@@ -111,15 +111,15 @@ Full MCP setup, Live Studio flags (`--connect`, `--standalone`, `--socket`), par
 
 Everything below runs through the same pure-Rust engine across the desktop app, browser app, headless CLI, and MCP server:
 
-- **Fixed-Point `i64` Nanometer Slicing & High-Poly Parallel Engine:** Exact Z-plane triangle slicing, classic perimeter offsetting, Voronoi medial-axis **Arachne** variable-width walls (`layercraft-clip` + `layercraft-slice`), Z-interval triangle bucketing, spatial `MaskClipIndex`, and deterministic multi-threaded desktop slicing + browser Web Worker execution.
+- **Fixed-Point `i64` Nanometer Slicing & High-Poly Parallel Engine:** Exact Z-plane triangle slicing, classic perimeter offsetting with wall-anchored thin gap fill, hardened Voronoi medial-axis **Arachne** variable-width wall transitions (`layercraft-clip` + `layercraft-slice`), Z-interval triangle bucketing, spatial `MaskClipIndex`, and deterministic multi-threaded desktop slicing + content-hashed browser Web Worker execution.
 - **Surfaces, Per-Object Slicing & Motion Finish:** Monotonic/concentric top and bottom skins, Rectilinear, Grid, 3D Gyroid, and 3D Cubic infill, thin gap fill, per-object overrides with `EXCLUDE_OBJECT`/`M486` cancel-object and sequential `ByObject` clearance checks, top-surface low-flow monotonic ironing, outer-wall ramped scarf seams, progressive overhang slowdown, mid-layer fan modulation, scheduled per-Z pause/`M600`/custom G-code events, and `G2`/`G3` circular arc fitting.
-- **Bridges, Overhangs & Supports:** Anchored bridge orientation and cooling/flow tuning, overhang wall detection and slowdown, **Grid** and **Snug** automatic supports, and model-avoiding branching **Organic Tree** supports with hollow trunks, dense interface layers, and build-plate-only routing.
+- **Bridges, Overhangs & Supports:** Anchored bridge orientation and cooling/flow tuning, overhang wall detection and slowdown, **Grid** and **Snug** automatic supports, and model-avoiding branching **Organic Tree** supports with hollow trunks, overhang corner seeding, continuous dense interface canopies, and build-plate-only routing.
 - **Adaptive Layers & 3D Modifier Volumes:** Curvature-driven adaptive layer heights (`0.08–0.28 mm` and custom schedules), explicit Z height-range bands, physical shell thicknesses, and primitive (`box`/`cylinder`) or arbitrary STL/3MF `Modifier`, `SupportBlocker`, `SupportEnforcer`, and `NegativePart` volumes.
 - **Multi-Plate `.3mf` Projects, Mesh Repair & DFM Safety:** Full multi-part & multi-plate `.3mf` project import/export, bounded undo/redo history, deterministic STL/3MF mesh repair (`repair_mesh` welding, manifold orientation, and hole filling), live out-of-bounds/overlap plate warnings, and Printability / DFM diagnostics with one-click fixes.
-- **Binary G-code (`.bgcode`), Profiles & Direct LAN Upload:** `Klipper`, `Marlin`, and Prusa `MarlinBuddy` emitters with `.bgcode` v1 (Heatshrink/Deflate + PNG/QOI xLCD thumbnails), volumetric flow capping, pressure/linear advance, per-role acceleration, chamber heating, `M73` progress, and `{if}/{elsif}/{else}` macro templates. Includes Prusa CORE One+ HF (`0.2mm`/`0.4mm` + PLA/PETG/ASA/TPU 95A) & generic starter presets, Orca/Bambu JSON profile inheritance, custom user preset saving, and direct LAN upload to `PrusaLink`, `Prusa Connect Local`, `OctoPrint`, and `Moonraker` with OS keychain credential storage.
-- **Modern Studio Canvas UI, Recent Projects Hub & Browser WASM:** Native `eframe` + `4× MSAA` `wgpu` studio featuring a startup **Home** hub with searchable 3D plate thumbnails (`recent_projects.json` on desktop, `localStorage` + IndexedDB in WASM), a 44px top workspace bar, floating `Prepare` tool rail, right-docked searchable `Objects | Settings | Printer` inspector, 7 `Color by` Preview modes, synchronized virtualized G-code viewer, intra-layer move playback scrubber with 3D nozzle marker, and responsive browser WASM app (`apps/layercraft-web`).
+- **Binary G-code (`.bgcode`), Profiles & Direct LAN Upload:** `Klipper`, `Marlin`, and Prusa `MarlinBuddy` emitters with `.bgcode` v1 (Heatshrink/Deflate + PNG/QOI xLCD thumbnails), volumetric flow capping, pressure/linear advance, per-role acceleration, chamber heating, `M73` progress, and `{if}/{elsif}/{else}` macro templates. Includes Prusa CORE One+ HF (`0.2mm`/`0.4mm` + PLA/PETG/ASA/TPU 95A; `5/6` physical validation prints logged in [docs/core-one-signoff.md](docs/core-one-signoff.md)) & generic starter presets, Orca/Bambu JSON profile inheritance, custom user preset saving, and direct LAN upload to `PrusaLink`, `Prusa Connect Local`, `OctoPrint`, and `Moonraker` with OS keychain credential storage.
+- **Modern Studio Canvas UI, Recent Projects Hub & Browser WASM:** Native `eframe` + `4× MSAA` `wgpu` studio featuring a startup **Home** hub with searchable 3D plate thumbnails (`recent_projects.json` on desktop, `localStorage` + IndexedDB in WASM) and 8 built-in Quick Start calibration shapes (including **Tapered Wedge**), a 44px top workspace bar, floating `Prepare` tool rail, ViewCube zoom controls (`-`/`+`), right-docked searchable `Objects | Settings | Printer` inspector, 7 `Color by` Preview modes, synchronized virtualized G-code viewer, intra-layer move playback scrubber with 3D nozzle marker, and responsive desktop + mobile/narrow-screen drawer layout in `apps/layercraft-web`.
 
-See [docs/architecture.md](docs/architecture.md) for crate structure, [docs/core-one-signoff.md](docs/core-one-signoff.md) for the Prusa CORE One+ hardware validation checklist, and [ROADMAP.md](ROADMAP.md) for completed phases (`0`–`6D`) and post-v1.0 items.
+See [docs/architecture.md](docs/architecture.md) for crate structure, [docs/core-one-signoff.md](docs/core-one-signoff.md) for the Prusa CORE One+ hardware validation checklist (`5/6` logged), and [ROADMAP.md](ROADMAP.md) for completed phases (`0`–`6D`) and post-v1.0 items.
 
 ---
 
