@@ -8,7 +8,8 @@ use layercraft_config::ModifierRole;
 use layercraft_mesh::{ModifierPrimitive, SampleShape};
 use layercraft_slice::ExtrusionRole;
 use layercraft_viewport::{
-    CameraPreset, ColorMode, MoveKind, color_ramp_sample, compute_color_mode_range, role_color,
+    CameraPreset, ColorMode, MoveKind, SCARF_SEAM_MARKER_COLOR, SEAM_MARKER_COLOR,
+    color_ramp_sample, compute_color_mode_range, role_color,
 };
 
 use crate::icons::Icon;
@@ -671,6 +672,41 @@ fn draw_preview_summary_hud(
                     }
                 }
 
+                if app.show_seams && !app.scene.seam_verts.is_empty() {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("SEAMS")
+                            .size(10.0)
+                            .strong()
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(2.0);
+                    let draw_seam_row = |ui: &mut Ui, rgba: [f32; 4], label: &str| {
+                        let col = Color32::from_rgb(
+                            (rgba[0] * 255.0) as u8,
+                            (rgba[1] * 255.0) as u8,
+                            (rgba[2] * 255.0) as u8,
+                        );
+                        ui.horizontal(|ui| {
+                            let (sw, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                            ui.painter().rect(
+                                sw,
+                                CornerRadius::same(2),
+                                col,
+                                Stroke::new(1.0, p.border_strong),
+                                StrokeKind::Inside,
+                            );
+                            ui.label(RichText::new(label).size(11.0).color(p.text_primary));
+                        });
+                    };
+                    draw_seam_row(ui, SEAM_MARKER_COLOR, "Seam");
+                    if app.session.config.process.scarf_seam.enabled {
+                        draw_seam_row(ui, SCARF_SEAM_MARKER_COLOR, "Scarf seam");
+                    }
+                }
+
                 if app.show_travels {
                     ui.add_space(6.0);
                     ui.separator();
@@ -1168,6 +1204,7 @@ fn draw_preview_bottom_dock(
                         enum DockToggle {
                             SingleLayer,
                             Travels,
+                            Seams,
                             GhostMesh,
                             BedGrid,
                             LegendHud,
@@ -1201,6 +1238,13 @@ fn draw_preview_bottom_dock(
                                     "Travels",
                                     "Toggle travel move lines (T)",
                                     app.show_travels,
+                                ),
+                                (
+                                    DockToggle::Seams,
+                                    Icon::Seam,
+                                    "Seams",
+                                    "Toggle outer-wall seam markers (M)",
+                                    app.show_seams,
                                 ),
                                 (
                                     DockToggle::GhostMesh,
@@ -1251,6 +1295,9 @@ fn draw_preview_bottom_dock(
                                 }
                                 DockToggle::Travels => {
                                     app.show_travels = !app.show_travels;
+                                }
+                                DockToggle::Seams => {
+                                    app.show_seams = !app.show_seams;
                                 }
                                 DockToggle::GhostMesh => {
                                     app.show_ghost_mesh = !app.show_ghost_mesh;

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CameraPreset, ColorMode, LineVertex, OrbitCamera, SceneVertex, ViewportError, build_bed_grid,
-    build_mesh_vertices, build_toolpath_instances, expand_bead_instances_to_vertices, path_color,
+    build_mesh_vertices, build_toolpath_instances_with_config, expand_bead_instances_to_vertices,
+    path_color,
 };
 
 /// Render target style for [`render_png`].
@@ -136,7 +137,8 @@ pub fn render_png_with_camera(
         }
         RenderMode::Preview => {
             if let Some(sliced) = plate {
-                let insts = build_toolpath_instances(sliced, req.color_mode);
+                let insts =
+                    build_toolpath_instances_with_config(sliced, req.color_mode, Some(config));
                 let total = insts.layer_ranges.len();
                 if total > 0 {
                     let top_idx = req.max_layer.unwrap_or(total - 1).min(total - 1);
@@ -154,6 +156,19 @@ pub fn render_png_with_camera(
                     if let Some(slice) = insts.beads.get(start_i..end_i) {
                         let verts = expand_bead_instances_to_vertices(slice);
                         rasterize_triangles(&verts, vp, w, h, &mut color_buf, &mut depth_buf);
+                    }
+                    let s_start = insts
+                        .seam_layer_ranges
+                        .get(start_idx)
+                        .map(|r| r.start as usize)
+                        .unwrap_or(0);
+                    let s_end = insts
+                        .seam_layer_ranges
+                        .get(top_idx)
+                        .map(|r| r.end as usize)
+                        .unwrap_or(0);
+                    if let Some(seam_slice) = insts.seam_verts.get(s_start..s_end) {
+                        rasterize_triangles(seam_slice, vp, w, h, &mut color_buf, &mut depth_buf);
                     }
                 }
             } else if let Some(m) = mesh {

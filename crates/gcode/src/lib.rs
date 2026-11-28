@@ -1136,7 +1136,7 @@ fn emit_single_layer_path(
     let config = st.config;
     let layer = st.layer;
 
-    let (ordered, ordered_widths) = orient_path_with_seam(
+    let (ordered, ordered_widths) = orient_path_for_seam(
         path,
         layer.index,
         path_idx,
@@ -2344,7 +2344,8 @@ fn shift_closed_index_by_fraction(points: &[Point2], start_idx: usize, frac: f64
     (start_idx + best_step) % n
 }
 
-fn orient_path_with_seam(
+/// Rotate a closed wall path so index 0 sits at the configured seam vertex (matching G-code emission).
+pub fn orient_path_for_seam(
     path: &ExtrusionPath,
     layer_idx: usize,
     path_idx: usize,

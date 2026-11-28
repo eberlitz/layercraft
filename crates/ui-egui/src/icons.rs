@@ -30,6 +30,7 @@ pub enum Icon {
     Ghost,
     Legend,
     Travel,
+    Seam,
     Play,
     Pause,
     #[cfg(not(target_arch = "wasm32"))]
@@ -337,6 +338,18 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Close => {
             painter.line_segment([pt(0.22, 0.22), pt(0.78, 0.78)], stroke);
             painter.line_segment([pt(0.78, 0.22), pt(0.22, 0.78)], stroke);
+        }
+        Icon::Seam => {
+            for cy in [0.22, 0.50, 0.78] {
+                let rad = 0.115;
+                let diamond = vec![
+                    pt(0.50, cy - rad),
+                    pt(0.50 + rad, cy),
+                    pt(0.50, cy + rad),
+                    pt(0.50 - rad, cy),
+                ];
+                painter.add(egui::Shape::convex_polygon(diamond, color, Stroke::NONE));
+            }
         }
     }
 }

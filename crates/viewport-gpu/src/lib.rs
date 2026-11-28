@@ -27,6 +27,8 @@ pub struct GpuSceneSnapshot {
     pub travel_lines: Vec<[f32; 7]>,
     pub travel_layer_ranges: Vec<Range<u32>>,
     pub layer_steps: Vec<Vec<LayerMoveStep>>,
+    pub seam_verts: Vec<[f32; 10]>,
+    pub seam_layer_ranges: Vec<Range<u32>>,
 }
 
 impl GpuSceneSnapshot {
@@ -70,8 +72,21 @@ impl GpuSceneSnapshot {
                 .collect(),
             travel_layer_ranges: toolpaths.travel_layer_ranges.clone(),
             layer_steps: toolpaths.layer_steps.clone(),
+            seam_verts: toolpaths
+                .seam_verts
+                .iter()
+                .copied()
+                .map(SceneVertex::to_packed)
+                .collect(),
+            seam_layer_ranges: toolpaths.seam_layer_ranges.clone(),
         }
     }
+}
+
+/// Hide the opaque bed plate slab when orbiting beneath it (`z < -0.04 mm`) so undersides are unobstructed.
+#[inline]
+pub fn bed_plate_visible_for_eye_z(eye_z: f32) -> bool {
+    eye_z >= -0.04
 }
 
 /// Per-frame paint callback submitted to `egui::Painter` for hardware 3D rendering.
@@ -85,6 +100,7 @@ pub struct ViewportCallback {
     pub draw_ghost: bool,
     pub toolpath_range: Range<u32>,
     pub travel_range: Range<u32>,
+    pub seam_range: Range<u32>,
     pub nozzle_pos: Option<[f32; 3]>,
 }
 
@@ -121,6 +137,7 @@ struct UploadedBuffers {
     ghost_buf: Option<ChunkedGpuBuffer>,
     toolpath_buf: Option<ChunkedGpuBuffer>,
     travel_buf: Option<ChunkedGpuBuffer>,
+    seam_buf: Option<ChunkedGpuBuffer>,
 }
 
 /// Persistent GPU pipelines and cached scene vertex/instance buffers stored in `egui_wgpu` resources.
@@ -653,6 +670,7 @@ impl ViewportGpuRenderer {
             1,
         );
         let travel_buf = upload_chunked(device, "layercraft_travel_lines", &scene.travel_lines, 2);
+        let seam_buf = upload_chunked(device, "layercraft_seam_markers", &scene.seam_verts, 3);
         self.uploaded = Some(UploadedBuffers {
             revision: scene.revision,
             bed_plate_buf,
@@ -662,6 +680,7 @@ impl ViewportGpuRenderer {
             ghost_buf,
             toolpath_buf,
             travel_buf,
+            seam_buf,
         });
     }
 }
@@ -882,8 +901,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         pass.set_bind_group(0, &renderer.cam_bind_group, &[]);
         pass.draw(0..3, 0..1);
 
-        // 2. Physical matte build plate
-        if let Some(buf) = &uploaded.bed_plate_buf {
+        // 2. Physical matte build plate (hidden when looking up from beneath the bed so the underside is unobstructed)
+        if bed_plate_visible_for_eye_z(self.eye_pos[2])
+            && let Some(buf) = &uploaded.bed_plate_buf
+        {
             draw_chunked_vertices(
                 pass_ref(&mut pass),
                 &renderer.lit_pipeline,
@@ -921,6 +942,18 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             && let Some(buf) = &uploaded.toolpath_buf
         {
             draw_chunked_instanced(pass_ref(&mut pass), renderer, buf, &self.toolpath_range);
+        }
+
+        if !self.seam_range.is_empty()
+            && let Some(buf) = &uploaded.seam_buf
+        {
+            draw_chunked_vertices(
+                pass_ref(&mut pass),
+                &renderer.lit_pipeline,
+                &renderer.cam_bind_group,
+                buf,
+                Some(&self.seam_range),
+            );
         }
 
         if !self.travel_range.is_empty()
@@ -1027,5 +1060,13 @@ mod tests {
         assert_eq!(chunk_range_overlap(0, 6, &(2..10)), Some((2, 4)));
         assert_eq!(chunk_range_overlap(6, 6, &(2..10)), Some((0, 4)));
         assert_eq!(chunk_range_overlap(12, 3, &(2..10)), None);
+    }
+
+    #[test]
+    fn bed_plate_hides_when_camera_is_underneath() {
+        assert!(bed_plate_visible_for_eye_z(50.0));
+        assert!(bed_plate_visible_for_eye_z(-0.04));
+        assert!(!bed_plate_visible_for_eye_z(-0.05));
+        assert!(!bed_plate_visible_for_eye_z(-45.0));
     }
 }

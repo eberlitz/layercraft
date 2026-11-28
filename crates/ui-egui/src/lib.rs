@@ -297,6 +297,7 @@ pub struct LayerCraftApp {
     pub(crate) show_ghost_mesh: bool,
     pub(crate) show_bed_grid: bool,
     pub(crate) show_travels: bool,
+    pub(crate) show_seams: bool,
     pub(crate) layer_move_step: usize,
     pub(crate) playback_playing: bool,
     pub(crate) playback_speed: f32,
@@ -495,6 +496,7 @@ impl LayerCraftApp {
             show_ghost_mesh: false,
             show_bed_grid: true,
             show_travels: false,
+            show_seams: true,
             layer_move_step: 0,
             playback_playing: false,
             playback_speed: 1.0,
@@ -3707,13 +3709,13 @@ impl LayerCraftApp {
                     }
                 }
 
-                let (draw_mesh, draw_ghost, toolpath_range, travel_range, nozzle_pos) =
+                let (draw_mesh, draw_ghost, toolpath_range, travel_range, seam_range, nozzle_pos) =
                     match self.view_mode {
-                        ViewMode::Home | ViewMode::Prepare => (true, false, 0..0, 0..0, None),
+                        ViewMode::Home | ViewMode::Prepare => (true, false, 0..0, 0..0, 0..0, None),
                         ViewMode::Preview => {
                             let n = self.scene.layer_ranges.len();
                             if n == 0 {
-                                (true, false, 0..0, 0..0, None)
+                                (true, false, 0..0, 0..0, 0..0, None)
                             } else {
                                 let top = self.max_layer.min(n - 1);
                                 let start_layer = if self.single_layer_only { top } else { 0 };
@@ -3769,6 +3771,40 @@ impl LayerCraftApp {
                                     0..0
                                 };
 
+                                let s_range = if self.show_seams
+                                    && !self.scene.seam_layer_ranges.is_empty()
+                                {
+                                    let s_start = self
+                                        .scene
+                                        .seam_layer_ranges
+                                        .get(start_layer)
+                                        .map(|r| r.start)
+                                        .unwrap_or(0);
+                                    let end_layer = if step_count > 0 && cur_step == 0 {
+                                        if self.single_layer_only || top == 0 {
+                                            None
+                                        } else {
+                                            Some(top - 1)
+                                        }
+                                    } else {
+                                        Some(top)
+                                    };
+                                    match end_layer {
+                                        Some(el) => {
+                                            let s_end = self
+                                                .scene
+                                                .seam_layer_ranges
+                                                .get(el)
+                                                .map(|r| r.end)
+                                                .unwrap_or(s_start);
+                                            s_start..s_end
+                                        }
+                                        None => 0..0,
+                                    }
+                                } else {
+                                    0..0
+                                };
+
                                 let show_nozzle = step_count > 0
                                     && (cur_step < step_count
                                         || self.playback_playing
@@ -3783,7 +3819,14 @@ impl LayerCraftApp {
                                     None
                                 };
 
-                                (false, self.show_ghost_mesh, v_start..v_end, t_range, n_pos)
+                                (
+                                    false,
+                                    self.show_ghost_mesh,
+                                    v_start..v_end,
+                                    t_range,
+                                    s_range,
+                                    n_pos,
+                                )
                             }
                         }
                     };
@@ -3805,6 +3848,7 @@ impl LayerCraftApp {
                         draw_ghost,
                         toolpath_range,
                         travel_range,
+                        seam_range,
                         nozzle_pos,
                     },
                 );
@@ -3881,6 +3925,9 @@ impl LayerCraftApp {
             if self.view_mode == ViewMode::Preview && !self.scene.layer_ranges.is_empty() {
                 if ui.input(|i| i.key_pressed(egui::Key::T)) {
                     self.show_travels = !self.show_travels;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::M)) {
+                    self.show_seams = !self.show_seams;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Space)) {
                     let max_steps = self.active_layer_step_count();

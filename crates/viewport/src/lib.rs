@@ -8,6 +8,7 @@ use std::ops::Range;
 use glam::{Mat4, Vec3, Vec4};
 use layercraft_config::PrintConfig;
 use layercraft_gcode::combing::CombingLayer;
+use layercraft_gcode::orient_path_for_seam;
 use layercraft_geom::{Aabb3, Point3, TriangleMesh};
 use layercraft_slice::{ExtrusionPath, ExtrusionRole, SlicedPlate, bead_area_mm2};
 use schemars::JsonSchema;
@@ -397,6 +398,11 @@ pub fn role_color(role: ExtrusionRole) -> [f32; 4] {
         ExtrusionRole::Brim => [0.40, 0.65, 0.96, 1.0],
     }
 }
+
+/// High-contrast marker color for standard outer-wall seams.
+pub const SEAM_MARKER_COLOR: [f32; 4] = [0.98, 0.99, 1.0, 1.0];
+/// High-contrast marker color for ramped scarf outer-wall seams.
+pub const SCARF_SEAM_MARKER_COLOR: [f32; 4] = [0.16, 0.96, 0.90, 1.0];
 
 fn lerp_color(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 4] {
     let u = t.clamp(0.0, 1.0);
@@ -997,6 +1003,8 @@ pub struct ToolpathInstances {
     pub travel_lines: Vec<LineVertex>,
     pub travel_layer_ranges: Vec<Range<u32>>,
     pub layer_steps: Vec<Vec<LayerMoveStep>>,
+    pub seam_verts: Vec<SceneVertex>,
+    pub seam_layer_ranges: Vec<Range<u32>>,
 }
 
 /// 3D extruded bead ribbon and travel-line geometry indexed by layer and intra-layer step.
@@ -1452,11 +1460,16 @@ pub fn build_toolpath_instances_with_config(
     let mut travel_lines = Vec::new();
     let mut travel_layer_ranges = Vec::with_capacity(total_layers);
     let mut layer_steps = Vec::with_capacity(total_layers);
+    let mut seam_verts = Vec::new();
+    let mut seam_layer_ranges = Vec::with_capacity(total_layers);
+    let mut prev_layer_seams: Vec<(f64, f64)> = Vec::new();
     let mut prev_xy: Option<(f64, f64)> = None;
 
     for (layer_idx, layer) in plate.layers.iter().enumerate() {
         let start = beads.len() as u32;
         let travel_start = travel_lines.len() as u32;
+        let seam_start = seam_verts.len() as u32;
+        let mut cur_layer_seams: Vec<(f64, f64)> = Vec::new();
         let mut steps = Vec::new();
         let z_top = layer.z_top_mm as f32;
         let layer_h = (layer.height_mm as f32).max(0.02);
@@ -1473,12 +1486,23 @@ pub fn build_toolpath_instances_with_config(
             None
         };
 
-        for path in &layer.paths {
-            let n = path.points.len();
+        for (path_idx, path) in layer.paths.iter().enumerate() {
+            let (ordered_pts, ordered_widths) = if let Some(cfg) = config {
+                let (cx, cy) = prev_xy.unwrap_or((0.0, 0.0));
+                orient_path_for_seam(path, layer.index, path_idx, cx, cy, &prev_layer_seams, cfg)
+            } else {
+                let ws = if path.has_variable_width() {
+                    path.point_widths_mm.clone()
+                } else {
+                    Vec::new()
+                };
+                (path.points.clone(), ws)
+            };
+            let n = ordered_pts.len();
             if n < 2 {
                 continue;
             }
-            let Some(&first_pt) = path.points.first() else {
+            let Some(&first_pt) = ordered_pts.first() else {
                 continue;
             };
             let (sx_f64, sy_f64) = first_pt.to_mm();
@@ -1580,9 +1604,17 @@ pub fn build_toolpath_instances_with_config(
             let mut segs: Vec<PathSeg> = Vec::with_capacity(seg_count);
             let mut best_len = 0.0_f32;
             let mut best_dir = (1.0_f32, 0.0_f32);
+            let has_var_w = !ordered_widths.is_empty() && ordered_widths.len() == n;
+            let v_width = |idx: usize| -> f64 {
+                if has_var_w {
+                    ordered_widths.get(idx).copied().unwrap_or(path.width_mm)
+                } else {
+                    path.width_mm
+                }
+            };
 
             for i in 0..seg_count {
-                let Some(&pa) = path.points.get(i) else {
+                let Some(&pa) = ordered_pts.get(i) else {
                     continue;
                 };
                 let next_idx = if path.closed {
@@ -1590,7 +1622,7 @@ pub fn build_toolpath_instances_with_config(
                 } else {
                     (i + 1).min(n - 1)
                 };
-                let Some(&pb) = path.points.get(next_idx) else {
+                let Some(&pb) = ordered_pts.get(next_idx) else {
                     continue;
                 };
                 let (ax, ay) = pa.to_mm();
@@ -1608,8 +1640,10 @@ pub fn build_toolpath_instances_with_config(
                     best_len = len;
                     best_dir = dir;
                 }
-                let hwa = 0.985 * (0.5 * path.vertex_width_mm(i)) as f32;
-                let hwb = 0.985 * (0.5 * path.vertex_width_mm(next_idx)) as f32;
+                let w0 = v_width(i);
+                let w1 = v_width(next_idx);
+                let hwa = 0.985 * (0.5 * w0) as f32;
+                let hwb = 0.985 * (0.5 * w1) as f32;
                 segs.push(PathSeg {
                     pa: (ax, ay),
                     pb: (bx, by),
@@ -1618,8 +1652,35 @@ pub fn build_toolpath_instances_with_config(
                     len,
                     hwa,
                     hwb,
-                    seg_width_mm: path.segment_width_mm(i) as f32,
+                    seg_width_mm: (0.5 * (w0 + w1)) as f32,
                 });
+            }
+
+            if path.closed && path.role == ExtrusionRole::OuterWall && !segs.is_empty() {
+                cur_layer_seams.push((sx_f64, sy_f64));
+                let loop_len: f64 = segs.iter().map(|s| f64::from(s.len)).sum();
+                let is_scarf = config.is_some_and(|cfg| {
+                    let sc = &cfg.process.scarf_seam;
+                    sc.enabled
+                        && layer.index > 0
+                        && ordered_widths.is_empty()
+                        && loop_len >= sc.min_length_mm
+                });
+                let w0 = ordered_widths.first().copied().unwrap_or(path.width_mm) as f32;
+                let r_xy = (0.72 * w0).clamp(0.26, 0.50);
+                let r_z = (0.62 * layer_h).clamp(0.08, 0.24);
+                let col = if is_scarf {
+                    SCARF_SEAM_MARKER_COLOR
+                } else {
+                    SEAM_MARKER_COLOR
+                };
+                push_seam_marker(
+                    &mut seam_verts,
+                    [sx_f64 as f32, sy_f64 as f32, z_center_base],
+                    r_xy,
+                    r_z,
+                    col,
+                );
             }
 
             if !segs.is_empty() {
@@ -1728,15 +1789,20 @@ pub fn build_toolpath_instances_with_config(
             let end_pt = if path.closed {
                 first_pt
             } else {
-                path.points.last().copied().unwrap_or(first_pt)
+                ordered_pts.last().copied().unwrap_or(first_pt)
             };
             prev_xy = Some(end_pt.to_mm());
         }
 
+        if !cur_layer_seams.is_empty() {
+            prev_layer_seams = cur_layer_seams;
+        }
         let end = beads.len() as u32;
         let travel_end = travel_lines.len() as u32;
+        let seam_end = seam_verts.len() as u32;
         layer_ranges.push(start..end);
         travel_layer_ranges.push(travel_start..travel_end);
+        seam_layer_ranges.push(seam_start..seam_end);
         layer_steps.push(steps);
     }
 
@@ -1746,6 +1812,8 @@ pub fn build_toolpath_instances_with_config(
         travel_lines,
         travel_layer_ranges,
         layer_steps,
+        seam_verts,
+        seam_layer_ranges,
     }
 }
 
@@ -1853,6 +1921,38 @@ pub fn build_nozzle_marker_mesh(tip_pos: [f32; 3], dark_mode: bool) -> Vec<Scene
     }
 
     out
+}
+
+fn push_seam_marker(
+    out: &mut Vec<SceneVertex>,
+    center: [f32; 3],
+    r_xy: f32,
+    r_z: f32,
+    color: [f32; 4],
+) {
+    let [cx, cy, cz] = center;
+    let top = [cx, cy, cz + r_z];
+    let bot = [cx, cy, cz - r_z];
+    let ring = [
+        [cx + r_xy, cy, cz],
+        [cx, cy + r_xy, cz],
+        [cx - r_xy, cy, cz],
+        [cx, cy - r_xy, cz],
+    ];
+    let face_normal = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| -> [f32; 3] {
+        let va = Vec3::from_array(a);
+        let vb = Vec3::from_array(b);
+        let vc = Vec3::from_array(c);
+        (vb - va).cross(vc - va).normalize_or_zero().to_array()
+    };
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        let (Some(&p0), Some(&p1)) = (ring.get(i), ring.get(j)) else {
+            continue;
+        };
+        push_tri(out, p0, p1, top, face_normal(p0, p1, top), color);
+        push_tri(out, p1, p0, bot, face_normal(p1, p0, bot), color);
+    }
 }
 
 fn push_tri(
@@ -1981,6 +2081,78 @@ mod tests {
                 v.normal
             );
         }
+    }
+
+    #[test]
+    fn toolpath_instances_emit_seam_markers_matching_config_and_scarf() {
+        use layercraft_config::SeamPosition;
+        use layercraft_geom::Point3;
+        use std::f64::consts::TAU;
+
+        let n_seg = 36usize;
+        let r = 10.0;
+        let h = 2.0;
+        let mut tris = Vec::with_capacity(n_seg * 4);
+        let cb = Point3::new(0.0, 0.0, 0.0);
+        let ct = Point3::new(0.0, 0.0, h);
+        for i in 0..n_seg {
+            let a0 = TAU * (i as f64) / (n_seg as f64);
+            let a1 = TAU * (((i + 1) % n_seg) as f64) / (n_seg as f64);
+            let b0 = Point3::new(r * a0.cos(), r * a0.sin(), 0.0);
+            let b1 = Point3::new(r * a1.cos(), r * a1.sin(), 0.0);
+            let t0 = Point3::new(r * a0.cos(), r * a0.sin(), h);
+            let t1 = Point3::new(r * a1.cos(), r * a1.sin(), h);
+            tris.push(layercraft_geom::Triangle::new(cb, b1, b0));
+            tris.push(layercraft_geom::Triangle::new(ct, t0, t1));
+            tris.push(layercraft_geom::Triangle::new(b0, b1, t1));
+            tris.push(layercraft_geom::Triangle::new(b0, t1, t0));
+        }
+        let mut cyl = layercraft_geom::TriangleMesh::new(tris).unwrap();
+        cyl.translate(125.0, 110.0, 0.0).unwrap();
+
+        let mut cfg_back = PrintConfig::default();
+        cfg_back.process.seam_position = SeamPosition::Back;
+        cfg_back.process.scarf_seam.enabled = true;
+        let plate = slice_single_mesh(&cyl, &cfg_back).unwrap();
+        let inst_scarf =
+            build_toolpath_instances_with_config(&plate, ColorMode::Feature, Some(&cfg_back));
+        assert_eq!(inst_scarf.seam_layer_ranges.len(), plate.layers.len());
+        // Layer 0 uses standard seam color; Layers 1+ use scarf seam color.
+        let r0 = inst_scarf.seam_layer_ranges[0].clone();
+        assert_eq!(r0.len(), 24);
+        assert_eq!(
+            inst_scarf.seam_verts[r0.start as usize].color,
+            SEAM_MARKER_COLOR
+        );
+        for range in inst_scarf.seam_layer_ranges.iter().skip(1) {
+            assert_eq!(range.len(), 24);
+            assert_eq!(
+                inst_scarf.seam_verts[range.start as usize].color,
+                SCARF_SEAM_MARKER_COLOR
+            );
+        }
+
+        let mut cfg_rand = PrintConfig::default();
+        cfg_rand.process.seam_position = SeamPosition::Random;
+        let inst_rand =
+            build_toolpath_instances_with_config(&plate, ColorMode::Feature, Some(&cfg_rand));
+        let mut unique_xys = std::collections::BTreeSet::new();
+        for range in &inst_rand.seam_layer_ranges {
+            let sum = inst_rand.seam_verts[range.start as usize..range.end as usize]
+                .iter()
+                .fold([0.0_f32; 2], |acc, v| {
+                    [acc[0] + v.pos[0], acc[1] + v.pos[1]]
+                });
+            let cnt = range.len() as f32;
+            unique_xys.insert((
+                (sum[0] / cnt * 100.0).round() as i32,
+                (sum[1] / cnt * 100.0).round() as i32,
+            ));
+        }
+        assert!(
+            unique_xys.len() > 2,
+            "expected random seams to vary across layers"
+        );
     }
 
     #[test]

@@ -1745,7 +1745,7 @@ const SETTINGS_CARDS: &[SettingsCardMeta] = &[
         tab: SidebarTab::Finish,
         id: "fin_scarf",
         title: "Scarf Seams",
-        keywords: "scarf seam enable length steps start height finish",
+        keywords: "scarf seam enable length steps start height flow finish",
         requires_tree_support: false,
         body: sec_finish_scarf,
     },
