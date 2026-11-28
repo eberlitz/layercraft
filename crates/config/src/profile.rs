@@ -4342,7 +4342,9 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
                 "hot_plate_temp_initial_layer": ["85"],
                 "chamber_temperature": ["35"],
                 "filament_max_volumetric_speed": ["18"],
-                "pressure_advance": ["0.047"]
+                "pressure_advance": ["0.047"],
+                "filament_retraction_length": ["0.8"],
+                "filament_wipe_distance": ["2.0"]
             }),
         ),
         doc_from_parts(
@@ -5162,6 +5164,7 @@ mod tests {
         assert!((pla.config.machine.bed_depth_mm - 220.0).abs() < 1e-9);
         assert!((pla.config.machine.bed_height_mm - 270.0).abs() < 1e-9);
         assert!((pla.config.process.layer_height_mm - 0.20).abs() < 1e-9);
+        assert!((pla.config.machine.retraction_length_mm - 0.7).abs() < 1e-9);
         assert!((pla.config.filament.max_volumetric_speed_mm3_s - 24.0).abs() < 1e-9);
         assert_eq!(pla.config.process.top_shell_thickness_mm, Some(0.8));
         assert_eq!(pla.config.process.bottom_shell_thickness_mm, Some(0.6));
@@ -5184,6 +5187,8 @@ mod tests {
         assert_eq!(petg.config.filament.first_layer_bed_temp_c, Some(85));
         assert_eq!(petg.config.filament.chamber_temp_c, Some(35));
         assert!((petg.config.filament.pressure_advance.unwrap() - 0.047).abs() < 1e-9);
+        assert!((petg.config.machine.retraction_length_mm - 0.8).abs() < 1e-9);
+        assert!((petg.config.machine.wipe_distance_mm - 2.0).abs() < 1e-9);
     }
 
     #[test]
