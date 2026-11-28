@@ -1246,6 +1246,49 @@ fn emit_single_layer_path(
         st.cur_layer_seams.push((sx, sy));
     }
 
+    let mut pts_mm = Vec::with_capacity(iter_pts.len() + 1);
+    pts_mm.push((sx, sy));
+    for pt in &iter_pts {
+        pts_mm.push(pt.to_mm());
+    }
+
+    let is_varying_w = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
+        let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
+        max_w - min_w > 1e-4
+    };
+
+    let total_loop_len: f64 = pts_mm
+        .windows(2)
+        .filter_map(|w| Some((w.first()?, w.get(1)?)))
+        .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
+        .sum();
+    let scarf = &config.process.scarf_seam;
+    let use_scarf = scarf.enabled
+        && layer.index > 0
+        && path.closed
+        && path.role == ExtrusionRole::OuterWall
+        && !is_varying_w
+        && total_loop_len >= scarf.min_length_mm;
+    let scarf_plan = if use_scarf {
+        let target_len = if scarf.entire_loop {
+            total_loop_len
+        } else {
+            scarf.length_mm.min(0.45 * total_loop_len)
+        };
+        if target_len >= 1.0 {
+            subdivide_loop_for_scarf(&pts_mm, target_len, scarf.steps as usize).map(|sub| {
+                let z_base = layer.z_top_mm - path.height_mm;
+                let z_start = z_base + scarf.start_height_ratio * path.height_mm;
+                (sub, target_len, z_start)
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let is_internal_infill = |r: ExtrusionRole| {
         matches!(
             r,
@@ -1262,7 +1305,7 @@ fn emit_single_layer_path(
     let mut travel_dist = (sx - *st.cur_x).hypot(sy - *st.cur_y);
     if !skip_infill_retract
         && *st.has_extruded
-        && travel_dist > config.machine.min_travel_for_retract_mm
+        && (travel_dist > config.machine.min_travel_for_retract_mm || scarf_plan.is_some())
         && st.retract_len > 0.0
         && !*st.retracted
     {
@@ -1352,15 +1395,23 @@ fn emit_single_layer_path(
         }
     }
 
-    if *st.z_hopped || (*st.cur_z - layer.z_top_mm).abs() > 1e-4 {
-        writeln!(st.out, "G0 Z{:.3} F{:.0}", layer.z_top_mm, st.zhop_f)
+    let landing_z = scarf_plan
+        .as_ref()
+        .map_or(layer.z_top_mm, |(_, _, z_start)| *z_start);
+    let mut scarf_started = false;
+    if *st.z_hopped || (*st.cur_z - landing_z).abs() > 1e-4 {
+        if scarf_plan.is_some() {
+            writeln!(st.out, ";SCARF_START").map_err(|_| GcodeError::FormatError)?;
+            scarf_started = true;
+        }
+        writeln!(st.out, "G0 Z{landing_z:.3} F{:.0}", st.zhop_f)
             .map_err(|_| GcodeError::FormatError)?;
         *st.total_time_s += estimate_trapezoid_move_time_s(
-            (*st.cur_z - layer.z_top_mm).abs(),
+            (*st.cur_z - landing_z).abs(),
             config.machine.z_hop_speed_mm_s,
             DEFAULT_Z_ACCEL_MM_S2,
         );
-        *st.cur_z = layer.z_top_mm;
+        *st.cur_z = landing_z;
         *st.z_hopped = false;
     }
 
@@ -1400,31 +1451,6 @@ fn emit_single_layer_path(
     let mut path_trail = Vec::with_capacity(iter_pts.len() + 2);
     path_trail.push((*st.cur_x, *st.cur_y));
 
-    let mut pts_mm = Vec::with_capacity(iter_pts.len() + 1);
-    pts_mm.push((*st.cur_x, *st.cur_y));
-    for pt in iter_pts {
-        pts_mm.push(pt.to_mm());
-    }
-
-    let is_varying_w = widths_mm.len() == pts_mm.len() && widths_mm.len() >= 2 && {
-        let min_w = widths_mm.iter().copied().fold(f64::INFINITY, f64::min);
-        let max_w = widths_mm.iter().copied().fold(0.0, f64::max);
-        max_w - min_w > 1e-4
-    };
-
-    let total_loop_len: f64 = pts_mm
-        .windows(2)
-        .filter_map(|w| Some((w.first()?, w.get(1)?)))
-        .map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1))
-        .sum();
-    let scarf = &config.process.scarf_seam;
-    let use_scarf = scarf.enabled
-        && layer.index > 0
-        && path.closed
-        && path.role == ExtrusionRole::OuterWall
-        && !is_varying_w
-        && total_loop_len >= scarf.min_length_mm;
-
     let role_accel = effective_role_accel_mm_s2(layer.index, path.role, config);
     let mut emitted_pts = Vec::with_capacity(pts_mm.len() + 4);
     emitted_pts.push((*st.cur_x, *st.cur_y));
@@ -1457,18 +1483,11 @@ fn emit_single_layer_path(
     };
 
     let mut scarf_done = false;
-    if use_scarf {
-        let target_len = if scarf.entire_loop {
-            total_loop_len
-        } else {
-            scarf.length_mm.min(0.45 * total_loop_len)
-        };
-        if target_len >= 1.0
-            && let Some(sub) = subdivide_loop_for_scarf(&pts_mm, target_len, scarf.steps as usize)
-        {
-            let z_base = layer.z_top_mm - path.height_mm;
-            let z_start = z_base + scarf.start_height_ratio * path.height_mm;
+    if let Some((sub, target_len, z_start)) = scarf_plan {
+        if !scarf_started {
             writeln!(emit_ctx.out, ";SCARF_START").map_err(|_| GcodeError::FormatError)?;
+        }
+        if (*st.cur_z - z_start).abs() > 1e-4 {
             writeln!(emit_ctx.out, "G0 Z{z_start:.3} F{:.0}", st.zhop_f)
                 .map_err(|_| GcodeError::FormatError)?;
             *emit_ctx.total_time_s += estimate_trapezoid_move_time_s(
@@ -1476,54 +1495,54 @@ fn emit_single_layer_path(
                 config.machine.z_hop_speed_mm_s,
                 DEFAULT_Z_ACCEL_MM_S2,
             );
-
-            // Phase A: ascending Z & flow ramp over [0..L].
-            let mut ramp_z = z_start;
-            for pair in sub.ramp_pts.windows(2) {
-                let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
-                    continue;
-                };
-                let seg_len = (x1 - x0).hypot(y1 - y0);
-                if seg_len <= 1e-6 {
-                    continue;
-                }
-                let t_end = (s1 / target_len).clamp(0.0, 1.0);
-                let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
-                let z1 = z_start + t_end * (layer.z_top_mm - z_start);
-                let frac_a = (scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio))
-                    * scarf.flow_ratio;
-                emit_ctx.emit_linear((x1, y1), seg_len, Some(z1), frac_a)?;
-                ramp_z = z1;
-            }
-            if (ramp_z - layer.z_top_mm).abs() > 1e-4 {
-                writeln!(emit_ctx.out, "G0 Z{:.3} F{:.0}", layer.z_top_mm, st.zhop_f)
-                    .map_err(|_| GcodeError::FormatError)?;
-            }
-            *st.cur_z = layer.z_top_mm;
-
-            // Phase B: constant-Z body over [L..P].
-            if sub.body_pts.len() >= 2 {
-                emit_ctx.emit_xy_sequence(&sub.body_pts, config)?;
-            }
-
-            // Phase C: complementary flow overlap at constant Z = layer.z_top_mm over [0..L].
-            for pair in sub.ramp_pts.windows(2) {
-                let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
-                    continue;
-                };
-                let seg_len = (x1 - x0).hypot(y1 - y0);
-                if seg_len <= 1e-6 {
-                    continue;
-                }
-                let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
-                let height_frac =
-                    scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
-                let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
-                emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
-            }
-            writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
-            scarf_done = true;
+            *st.cur_z = z_start;
         }
+
+        // Phase A: ascending Z & flow ramp over [0..L].
+        let mut ramp_z = z_start;
+        for pair in sub.ramp_pts.windows(2) {
+            let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let seg_len = (x1 - x0).hypot(y1 - y0);
+            if seg_len <= 1e-6 {
+                continue;
+            }
+            let t_end = (s1 / target_len).clamp(0.0, 1.0);
+            let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+            let z1 = z_start + t_end * (layer.z_top_mm - z_start);
+            let frac_a = (scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio))
+                * scarf.flow_ratio;
+            emit_ctx.emit_linear((x1, y1), seg_len, Some(z1), frac_a)?;
+            ramp_z = z1;
+        }
+        if (ramp_z - layer.z_top_mm).abs() > 1e-4 {
+            writeln!(emit_ctx.out, "G0 Z{:.3} F{:.0}", layer.z_top_mm, st.zhop_f)
+                .map_err(|_| GcodeError::FormatError)?;
+        }
+        *st.cur_z = layer.z_top_mm;
+
+        // Phase B: constant-Z body over [L..P].
+        if sub.body_pts.len() >= 2 {
+            emit_ctx.emit_xy_sequence(&sub.body_pts, config)?;
+        }
+
+        // Phase C: complementary flow overlap at constant Z = layer.z_top_mm over [0..L].
+        for pair in sub.ramp_pts.windows(2) {
+            let (Some(&(x0, y0, s0)), Some(&(x1, y1, s1))) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let seg_len = (x1 - x0).hypot(y1 - y0);
+            if seg_len <= 1e-6 {
+                continue;
+            }
+            let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
+            let height_frac = scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
+            let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
+            emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
+        }
+        writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
+        scarf_done = true;
     }
 
     if !scarf_done {
@@ -2292,6 +2311,39 @@ fn random_seam_index(points: &[Point2], layer_idx: usize, path_idx: usize) -> us
     n.saturating_sub(1)
 }
 
+fn shift_closed_index_by_fraction(points: &[Point2], start_idx: usize, frac: f64) -> usize {
+    let n = points.len();
+    if n < 4 {
+        return start_idx;
+    }
+    let mut cum_dists = Vec::with_capacity(n + 1);
+    cum_dists.push(0.0);
+    let mut total_perim = 0.0;
+    for step in 0..n {
+        let a_idx = (start_idx + step) % n;
+        let b_idx = (start_idx + step + 1) % n;
+        let (Some(&a), Some(&b)) = (points.get(a_idx), points.get(b_idx)) else {
+            return start_idx;
+        };
+        total_perim += a.distance_mm(b);
+        cum_dists.push(total_perim);
+    }
+    if total_perim <= 1e-6 {
+        return start_idx;
+    }
+    let target = frac.clamp(0.0, 1.0) * total_perim;
+    let mut best_step = 0usize;
+    let mut best_diff = f64::INFINITY;
+    for (step, &d) in cum_dists.iter().take(n).enumerate() {
+        let diff = (d - target).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best_step = step;
+        }
+    }
+    (start_idx + best_step) % n
+}
+
 fn orient_path_with_seam(
     path: &ExtrusionPath,
     layer_idx: usize,
@@ -2309,7 +2361,7 @@ fn orient_path_with_seam(
         return orient_path_nearest(path, cur_x, cur_y);
     }
 
-    let start_idx = match config.process.seam_position {
+    let base_idx = match config.process.seam_position {
         SeamPosition::Nearest => closest_vertex_index(&path.points, cur_x, cur_y),
         SeamPosition::Back => closest_vertex_index(
             &path.points,
@@ -2318,6 +2370,14 @@ fn orient_path_with_seam(
         ),
         SeamPosition::Aligned => aligned_seam_index(&path.points, prev_layer_seams, config),
         SeamPosition::Random => random_seam_index(&path.points, layer_idx, path_idx),
+    };
+    let start_idx = if config.process.scarf_seam.enabled
+        && path.role == ExtrusionRole::InnerWall
+        && path.points.len() >= 4
+    {
+        shift_closed_index_by_fraction(&path.points, base_idx, 0.5)
+    } else {
+        base_idx
     };
     let pts = rotate_closed_slice(&path.points, start_idx);
     let ws = if path.has_variable_width() {
@@ -3986,6 +4046,110 @@ mod tests {
         assert!(
             rel_vol_diff < 0.02,
             "scarf volume diff {rel_vol_diff:.4} too large"
+        );
+    }
+
+    #[test]
+    fn scarf_seam_staggers_inner_wall_retracts_and_lands_directly_at_z_start() {
+        let cyl = make_cylinder(10.0, 4.0, 48);
+        let mut cfg = PrintConfig::default();
+        cfg.machine.retraction_length_mm = 0.7;
+        cfg.machine.z_hop_mm = 0.4;
+        cfg.machine.relative_extrusion = true;
+        cfg.process.scarf_seam.enabled = true;
+        cfg.process.arc_fitting = true;
+
+        let plate = slice_single_mesh(&cyl, &cfg).unwrap();
+        let out = emit_gcode(&plate, &cfg).unwrap();
+        let (rep, _) = evaluate_gcode(&out.gcode, 1.75, 250.0, 250.0).unwrap();
+        assert!(rep.safety.is_clean(), "{:?}", rep.safety);
+        assert_eq!(rep.safety.z_regressions, 0);
+        assert!(rep.scarf_ramp_moves_count > 10);
+
+        let lines: Vec<&str> = out.gcode.lines().collect();
+        let l5_start = lines
+            .iter()
+            .position(|l| l.trim() == ";Z:1.200")
+            .expect("layer 5 Z:1.200 marker missing");
+        let l5_end = lines[l5_start + 1..]
+            .iter()
+            .position(|l| l.trim() == ";LAYER_CHANGE")
+            .map_or(lines.len(), |off| l5_start + 1 + off);
+        let l5 = &lines[l5_start..l5_end];
+
+        let inner_idx = l5
+            .iter()
+            .position(|l| l.trim() == ";TYPE:Inner wall")
+            .expect("Inner wall missing on layer 5");
+        let outer_idx = l5
+            .iter()
+            .position(|l| l.trim() == ";TYPE:Outer wall")
+            .expect("Outer wall missing on layer 5");
+        let scarf_idx = l5
+            .iter()
+            .position(|l| l.trim() == ";SCARF_START")
+            .expect("SCARF_START missing on layer 5");
+        assert!(inner_idx < outer_idx && outer_idx < scarf_idx);
+
+        let parse_xy = |line: &str| -> Option<(f64, f64)> {
+            let mut x = None;
+            let mut y = None;
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix('X') {
+                    x = v.parse::<f64>().ok();
+                } else if let Some(v) = tok.strip_prefix('Y') {
+                    y = v.parse::<f64>().ok();
+                }
+            }
+            Some((x?, y?))
+        };
+
+        let inner_travel_xy = l5[inner_idx..outer_idx]
+            .iter()
+            .filter(|l| l.starts_with("G0 "))
+            .find_map(|l| parse_xy(l))
+            .expect("Inner wall travel XY missing");
+        let outer_travel_xy = l5[outer_idx..scarf_idx]
+            .iter()
+            .filter(|l| l.starts_with("G0 "))
+            .find_map(|l| parse_xy(l))
+            .expect("Outer wall travel XY missing");
+        let seam_sep =
+            (outer_travel_xy.0 - inner_travel_xy.0).hypot(outer_travel_xy.1 - inner_travel_xy.1);
+        assert!(
+            seam_sep >= 10.0,
+            "expected staggered inner/outer seams >= 10 mm apart, got {seam_sep:.3} mm"
+        );
+
+        let pre_scarf = &l5[outer_idx..scarf_idx];
+        assert!(
+            pre_scarf.iter().any(|l| l.contains(" E-")),
+            "expected retraction before outer scarf travel: {pre_scarf:?}"
+        );
+        assert!(
+            !pre_scarf.iter().any(|l| l.trim().starts_with("G0 Z1.200")),
+            "unexpected intermediate G0 Z1.200 before SCARF_START: {pre_scarf:?}"
+        );
+        assert!(
+            !pre_scarf.iter().any(|l| l.trim() == "G1 E0.70000 F2100"),
+            "unexpected unretract before SCARF_START: {pre_scarf:?}"
+        );
+
+        let post_scarf = &l5[scarf_idx + 1..];
+        assert!(
+            post_scarf[0].starts_with("G0 Z1.010 "),
+            "expected direct G0 Z1.010 after SCARF_START, got {:?}",
+            post_scarf[0]
+        );
+        assert!(
+            post_scarf[1].starts_with("G1 E0.70000 "),
+            "expected unretract at z_start after G0 Z1.010, got {:?}",
+            post_scarf[1]
+        );
+        assert!(
+            post_scarf[2].contains("Z1."),
+            "expected ascending scarf ramp move right after unretract, got {:?}",
+            post_scarf[2]
         );
     }
 

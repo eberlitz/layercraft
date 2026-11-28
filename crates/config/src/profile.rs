@@ -2736,6 +2736,12 @@ fn apply_process_settings_pass1(
         cfg.process.scarf_seam.entire_loop = parse_bool_val(k, v)?;
         ctx.mark_applied(k);
     }
+    if let Some((k, v)) = ctx.get_primary(s, &["seam_slope_flow_ratio", "scarf_seam_flow_ratio"])
+        && !is_nil_value(v)
+    {
+        cfg.process.scarf_seam.flow_ratio = parse_density_fraction(k, v)?;
+        ctx.mark_applied(k);
+    }
     ctx.mark_recognized_if_present(s, &["scarf_angle_threshold", "seam_slope_conditional"]);
 
     // Arc fitting settings
@@ -3567,6 +3573,11 @@ fn populate_process_profile_settings(
     );
     insert_str(settings, "seam_slope_steps", p.scarf_seam.steps.to_string());
     insert_bool_flag(settings, "seam_slope_entire_loop", p.scarf_seam.entire_loop);
+    insert_str(
+        settings,
+        "seam_slope_flow_ratio",
+        fmt_profile_pct(p.scarf_seam.flow_ratio),
+    );
     insert_bool_flag(settings, "enable_arc_fitting", p.arc_fitting);
     insert_str(
         settings,
@@ -5426,6 +5437,10 @@ mod tests {
         assert_eq!(
             res.config.process.scarf_seam.enabled,
             cfg.process.scarf_seam.enabled
+        );
+        assert!(
+            (res.config.process.scarf_seam.flow_ratio - cfg.process.scarf_seam.flow_ratio).abs()
+                < 1e-9
         );
         assert_eq!(
             res.config.process.adaptive_layer_height,

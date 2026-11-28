@@ -782,9 +782,9 @@ impl Default for IroningConfig {
     fn default() -> Self {
         Self {
             mode: IroningType::Off,
-            flow_ratio: 0.10,
-            line_spacing_mm: 0.10,
-            inset_mm: 0.21,
+            flow_ratio: 0.15,
+            line_spacing_mm: 0.15,
+            inset_mm: 0.25,
             speed_mm_s: 30.0,
             angle_offset_deg: 45.0,
         }
@@ -808,11 +808,11 @@ impl Default for ScarfSeamConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            length_mm: 15.0,
+            length_mm: 20.0,
             min_length_mm: 5.0,
-            steps: 10,
-            start_height_ratio: 0.10,
-            flow_ratio: 1.0,
+            steps: 20,
+            start_height_ratio: 0.05,
+            flow_ratio: 0.90,
             entire_loop: false,
         }
     }

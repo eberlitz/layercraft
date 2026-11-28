@@ -2489,6 +2489,12 @@ fn sec_finish_scarf(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette
             proc_cfg.scarf_seam.start_height_ratio = (start_pct / 100.0).clamp(0.02, 0.50);
         }
     });
+    let mut flow_pct = proc_cfg.scarf_seam.flow_ratio * 100.0;
+    setting_row(ui, p, "Scarf flow", |ui| {
+        if unit_drag(ui, &mut flow_pct, 50.0..=150.0, 1.0, "%").changed() {
+            proc_cfg.scarf_seam.flow_ratio = (flow_pct / 100.0).clamp(0.5, 1.5);
+        }
+    });
 }
 
 fn sec_finish_arc(app: &mut LayerCraftApp, ui: &mut egui::Ui, p: &ThemePalette) {

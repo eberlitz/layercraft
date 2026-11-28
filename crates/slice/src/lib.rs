@@ -1761,7 +1761,14 @@ fn slice_raw_layers_internal(
                 if !iron_regions.is_empty() {
                     let iron_buckets = partition_regions(&iron_regions, base_p, &active_iron)?;
                     let iron_angle = solid_angle + iron.angle_offset_deg.to_radians();
-                    let scaled_flow = (iron.flow_ratio * iron.line_spacing_mm / solid_w).max(0.005);
+                    let capsule_area =
+                        (solid_w - h).max(0.0) * h + std::f64::consts::FRAC_PI_4 * h * h;
+                    let target_area = iron.flow_ratio * iron.line_spacing_mm * h;
+                    let scaled_flow = if capsule_area > 1e-9 {
+                        (target_area / capsule_area).max(0.005)
+                    } else {
+                        (iron.flow_ratio * iron.line_spacing_mm / solid_w).max(0.005)
+                    };
                     for (sub_iron, b_params) in iron_buckets {
                         let iron_here = match b_params.ironing_mode {
                             IroningType::Off => false,
@@ -5344,7 +5351,7 @@ mod tests {
             .find(|p| p.role == ExtrusionRole::Ironing)
             .unwrap()
             .flow_ratio;
-        assert!(sample_flow > 0.005 && sample_flow < 0.05);
+        assert!(sample_flow > 0.005 && sample_flow < 0.10);
     }
 
     fn make_tapered_wedge_mesh(
