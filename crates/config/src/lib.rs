@@ -782,10 +782,10 @@ impl Default for IroningConfig {
     fn default() -> Self {
         Self {
             mode: IroningType::Off,
-            flow_ratio: 0.18,
+            flow_ratio: 0.24,
             line_spacing_mm: 0.15,
-            inset_mm: 0.25,
-            speed_mm_s: 30.0,
+            inset_mm: 0.35,
+            speed_mm_s: 55.0,
             angle_offset_deg: 45.0,
         }
     }
