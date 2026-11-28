@@ -1152,6 +1152,7 @@ fn emit_object_end(
 
 const RETRACT_BEFORE_WIPE_RATIO: f64 = 0.70;
 const MAX_WIPE_SPEED_MM_S: f64 = 80.0;
+const SCARF_PHASE_C_MIN_FLOW_FRAC: f64 = 0.12;
 
 fn is_internal_infill(role: ExtrusionRole) -> bool {
     matches!(
@@ -1762,7 +1763,11 @@ fn emit_single_layer_path(
             }
             let t_mid = (0.5 * (s0 + s1) / target_len).clamp(0.0, 1.0);
             let height_frac = scarf.start_height_ratio + t_mid * (1.0 - scarf.start_height_ratio);
-            let frac_c = ((1.0 - height_frac) * scarf.flow_ratio).max(0.0);
+            let comp_frac = 1.0 - height_frac;
+            if comp_frac < SCARF_PHASE_C_MIN_FLOW_FRAC {
+                break;
+            }
+            let frac_c = (comp_frac * scarf.flow_ratio).max(0.0);
             emit_ctx.emit_linear((x1, y1), seg_len, None, frac_c)?;
         }
         writeln!(emit_ctx.out, ";SCARF_END").map_err(|_| GcodeError::FormatError)?;
@@ -2200,40 +2205,44 @@ fn collect_wipe_segments(trail: &[(f64, f64)], max_dist_mm: f64) -> (Vec<(f64, f
     (segs, total_wiped)
 }
 
-fn compute_inward_wipe_tuck(
+type WipePlan = (Vec<(f64, f64, f64)>, f64);
+
+fn build_inward_outer_wall_wipe(
     start_xy: (f64, f64),
-    segs: &[(f64, f64, f64)],
+    trail: &[(f64, f64)],
+    wipe_dist: f64,
     outer_wall_width_mm: f64,
     wipe_regions: &[ExPolygon],
-) -> Option<(f64, f64, f64)> {
-    let last_idx = segs.len().checked_sub(1)?;
-    let &(end_x, end_y, _) = segs.get(last_idx)?;
-    let prev_xy = if last_idx > 0 {
-        let &(px, py, _) = segs.get(last_idx - 1)?;
-        (px, py)
-    } else {
-        start_xy
-    };
-    let dx = end_x - prev_xy.0;
-    let dy = end_y - prev_xy.1;
-    let len = dx.hypot(dy);
-    if len <= 1e-6 {
-        return None;
-    }
-    let (tx, ty) = (dx / len, dy / len);
+) -> Option<WipePlan> {
     let w = outer_wall_width_mm.max(0.2);
     let tuck_dist = (0.9 * w).clamp(0.25, 0.6);
     let probe_dist = (2.0 * w).clamp(0.6, 1.2);
+    let (raw_segs, _) = collect_wipe_segments(trail, wipe_dist.max(0.5));
+    let (rx0, ry0) = raw_segs
+        .iter()
+        .find_map(|&(x, y, _)| ((x - start_xy.0).hypot(y - start_xy.1) > 1e-6).then_some((x, y)))?;
+    let dx0 = rx0 - start_xy.0;
+    let dy0 = ry0 - start_xy.1;
+    let len0 = dx0.hypot(dy0);
+    if len0 <= 1e-6 {
+        return None;
+    }
+    let (tx0, ty0) = (dx0 / len0, dy0 / len0);
 
     let normal_is_interior = |nx: f64, ny: f64| -> bool {
-        let Ok(p_mid) = Point2::from_mm(end_x + 0.5 * tuck_dist * nx, end_y + 0.5 * tuck_dist * ny)
+        let Ok(p_mid) = Point2::from_mm(
+            start_xy.0 + 0.5 * tuck_dist * nx,
+            start_xy.1 + 0.5 * tuck_dist * ny,
+        ) else {
+            return false;
+        };
+        let Ok(p_tuck) = Point2::from_mm(start_xy.0 + tuck_dist * nx, start_xy.1 + tuck_dist * ny)
         else {
             return false;
         };
-        let Ok(p_tuck) = Point2::from_mm(end_x + tuck_dist * nx, end_y + tuck_dist * ny) else {
-            return false;
-        };
-        let Ok(p_probe) = Point2::from_mm(end_x + probe_dist * nx, end_y + probe_dist * ny) else {
+        let Ok(p_probe) =
+            Point2::from_mm(start_xy.0 + probe_dist * nx, start_xy.1 + probe_dist * ny)
+        else {
             return false;
         };
         wipe_regions.iter().any(|ex| {
@@ -2241,16 +2250,70 @@ fn compute_inward_wipe_tuck(
         })
     };
 
-    let n_left = (-ty, tx);
-    let n_right = (ty, -tx);
-    let left_ok = normal_is_interior(n_left.0, n_left.1);
-    let right_ok = normal_is_interior(n_right.0, n_right.1);
-    if left_ok ^ right_ok {
-        let (nx, ny) = if left_ok { n_left } else { n_right };
-        Some((end_x + nx * tuck_dist, end_y + ny * tuck_dist, tuck_dist))
-    } else {
-        None
+    let n_left0 = (-ty0, tx0);
+    let n_right0 = (ty0, -tx0);
+    let left_ok = normal_is_interior(n_left0.0, n_left0.1);
+    let right_ok = normal_is_interior(n_right0.0, n_right0.1);
+    if left_ok == right_ok {
+        return None;
     }
+    let use_left = left_ok;
+    let (nx0, ny0) = if use_left { n_left0 } else { n_right0 };
+    let q0 = (start_xy.0 + nx0 * tuck_dist, start_xy.1 + ny0 * tuck_dist);
+
+    let mut out_segs = Vec::with_capacity(raw_segs.len() + 1);
+    out_segs.push((q0.0, q0.1, tuck_dist));
+    let mut total_wiped = tuck_dist;
+    let mut rem_budget = (wipe_dist - tuck_dist).max(0.0);
+    let mut prev_raw = start_xy;
+    let mut prev_q = q0;
+
+    for &(rx, ry, _) in &raw_segs {
+        if rem_budget <= 1e-6 {
+            break;
+        }
+        let sdx = rx - prev_raw.0;
+        let sdy = ry - prev_raw.1;
+        let slen = sdx.hypot(sdy);
+        if slen <= 1e-6 {
+            prev_raw = (rx, ry);
+            continue;
+        }
+        let (stx, sty) = (sdx / slen, sdy / slen);
+        let (snx, sny) = if use_left { (-sty, stx) } else { (sty, -stx) };
+        let mut qx = rx + snx * tuck_dist;
+        let mut qy = ry + sny * tuck_dist;
+        let mut q_len = (qx - prev_q.0).hypot(qy - prev_q.1);
+        if q_len <= 1e-6 {
+            prev_raw = (rx, ry);
+            continue;
+        }
+        if q_len > rem_budget {
+            let frac = rem_budget / q_len;
+            qx = prev_q.0 + (qx - prev_q.0) * frac;
+            qy = prev_q.1 + (qy - prev_q.1) * frac;
+            q_len = rem_budget;
+        }
+        let Ok(p_mid) = Point2::from_mm(0.5 * (prev_q.0 + qx), 0.5 * (prev_q.1 + qy)) else {
+            break;
+        };
+        let Ok(p_end) = Point2::from_mm(qx, qy) else {
+            break;
+        };
+        if !wipe_regions
+            .iter()
+            .any(|ex| ex.contains_point(p_mid) && ex.contains_point(p_end))
+        {
+            break;
+        }
+        out_segs.push((qx, qy, q_len));
+        total_wiped += q_len;
+        rem_budget -= q_len;
+        prev_q = (qx, qy);
+        prev_raw = (rx, ry);
+    }
+
+    Some((out_segs, total_wiped))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2275,23 +2338,14 @@ fn perform_retract(
             Some(ExtrusionRole::OuterWall | ExtrusionRole::OverhangWall)
         ) && !wipe_regions.is_empty()
         {
-            let w = config.process.outer_wall_width_mm.max(0.2);
-            let tuck_dist = (0.9 * w).clamp(0.25, 0.6);
-            let trail_budget = if wipe_dist > tuck_dist + 0.4 {
-                wipe_dist - tuck_dist
-            } else {
-                wipe_dist
-            };
-            let (mut segs, mut wiped) = collect_wipe_segments(trail, trail_budget);
-            if let Some(tuck_seg) =
-                compute_inward_wipe_tuck((*cur_x, *cur_y), &segs, w, wipe_regions)
-            {
-                wiped += tuck_seg.2;
-                segs.push(tuck_seg);
-                (segs, wiped)
-            } else {
-                collect_wipe_segments(trail, wipe_dist)
-            }
+            build_inward_outer_wall_wipe(
+                (*cur_x, *cur_y),
+                trail,
+                wipe_dist,
+                config.process.outer_wall_width_mm,
+                wipe_regions,
+            )
+            .unwrap_or_else(|| collect_wipe_segments(trail, wipe_dist))
         } else {
             collect_wipe_segments(trail, wipe_dist)
         };
@@ -5484,6 +5538,7 @@ mod tests {
         let mut cur_z = 0.0;
         let mut retracted = false;
         let mut awaiting_scarf_retract = false;
+        let mut last_extrude_e_per_mm: Option<f64> = None;
         let mut layer_change_scarf_transitions = 0usize;
 
         let mut idx = 0usize;
@@ -5492,13 +5547,19 @@ mod tests {
             if l == ";SCARF_END" {
                 awaiting_scarf_retract = true;
                 let scarf_end_r = (cur_x - cx).hypot(cur_y - cy);
+                let tail_rate =
+                    last_extrude_e_per_mm.expect("expected Phase C extrusion before SCARF_END");
+                assert!(
+                    tail_rate >= 0.002,
+                    "ultra-starved Phase C tail right before SCARF_END at line {idx}: E/mm={tail_rate:.5}"
+                );
                 // Inspect whether this scarf end leads directly into a ;LAYER_CHANGE.
                 let mut look = idx + 1;
                 let mut saw_wipe_start = false;
                 let mut saw_wipe_end = false;
                 let mut saw_pre_retract = false;
                 let mut saw_type_before_layer = false;
-                let mut wipe_end_xy = (cur_x, cur_y);
+                let mut wipe_xy_radii = Vec::new();
                 let mut wx_track = cur_x;
                 let mut wy_track = cur_y;
                 while look < lines.len() {
@@ -5514,7 +5575,6 @@ mod tests {
                         saw_wipe_start = true;
                     } else if nl == ";WIPE_END" {
                         saw_wipe_end = true;
-                        wipe_end_xy = (wx_track, wy_track);
                     } else if saw_wipe_start && !saw_wipe_end && nl.starts_with("G1 ") {
                         let nx = parse_val(nl, 'X');
                         let ny = parse_val(nl, 'Y');
@@ -5522,11 +5582,14 @@ mod tests {
                         if nx.is_none() && ny.is_none() && ne.is_some_and(|e| e < 0.0) {
                             saw_pre_retract = true;
                         }
-                        if let Some(x) = nx {
-                            wx_track = x;
-                        }
-                        if let Some(y) = ny {
-                            wy_track = y;
+                        if nx.is_some() || ny.is_some() {
+                            if let Some(x) = nx {
+                                wx_track = x;
+                            }
+                            if let Some(y) = ny {
+                                wy_track = y;
+                            }
+                            wipe_xy_radii.push((wx_track - cx).hypot(wy_track - cy));
                         }
                     }
                     look += 1;
@@ -5543,11 +5606,16 @@ mod tests {
                         saw_pre_retract,
                         "expected in-place pre-retract inside wipe block at line {idx}"
                     );
-                    let wipe_end_r = (wipe_end_xy.0 - cx).hypot(wipe_end_xy.1 - cy);
                     assert!(
-                        wipe_end_r < scarf_end_r - 0.25,
-                        "expected inward wipe tuck radius < {scarf_end_r:.3} - 0.25, got {wipe_end_r:.3}"
+                        !wipe_xy_radii.is_empty(),
+                        "expected XY wipe moves inside wipe block at line {idx}"
                     );
+                    for (step_i, &wr) in wipe_xy_radii.iter().enumerate() {
+                        assert!(
+                            wr < scarf_end_r - 0.25,
+                            "expected every wipe XY move (step {step_i}) strictly inward < {scarf_end_r:.3} - 0.25, got {wr:.3} (all: {wipe_xy_radii:?})"
+                        );
+                    }
 
                     // Verify next layer performs one single combined Z-lift to layer_z + z_hop_mm.
                     let mut next_z_decl = None;
@@ -5604,6 +5672,14 @@ mod tests {
                         awaiting_scarf_retract = false;
                     } else if e > 1e-6 && nx.is_none() && ny.is_none() {
                         retracted = false;
+                    } else if e > 1e-6 && (nx.is_some() || ny.is_some()) {
+                        awaiting_scarf_retract = false;
+                        let tx = nx.unwrap_or(cur_x);
+                        let ty = ny.unwrap_or(cur_y);
+                        let seg_len = (tx - cur_x).hypot(ty - cur_y);
+                        if seg_len > 1e-6 {
+                            last_extrude_e_per_mm = Some(e / seg_len);
+                        }
                     }
                 }
                 if let Some(x) = nx {

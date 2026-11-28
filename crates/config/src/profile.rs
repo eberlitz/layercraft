@@ -4336,7 +4336,7 @@ fn builtin_preset_documents() -> Vec<ProfileDocument> {
             true,
             vec!["LayerCraft Generic PETG".to_owned()],
             json!({
-                "nozzle_temperature": ["250"],
+                "nozzle_temperature": ["245"],
                 "nozzle_temperature_initial_layer": ["250"],
                 "hot_plate_temp": ["85"],
                 "hot_plate_temp_initial_layer": ["85"],
@@ -5181,7 +5181,7 @@ mod tests {
         assert!(petg.warnings.is_empty(), "{:?}", petg.warnings);
         assert!(petg.unmapped_keys.is_empty(), "{:?}", petg.unmapped_keys);
         assert!((petg.config.filament.max_volumetric_speed_mm3_s - 18.0).abs() < 1e-9);
-        assert_eq!(petg.config.filament.nozzle_temp_c, 250);
+        assert_eq!(petg.config.filament.nozzle_temp_c, 245);
         assert_eq!(petg.config.filament.bed_temp_c, 85);
         assert_eq!(petg.config.filament.first_layer_nozzle_temp_c, Some(250));
         assert_eq!(petg.config.filament.first_layer_bed_temp_c, Some(85));
