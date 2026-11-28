@@ -3539,7 +3539,34 @@ pub(crate) fn build_perimeters_classic(
                     gap_speed,
                 )?;
                 if !gap_paths.is_empty() {
-                    infill_area = difference(&infill_area, &gap_regions)?;
+                    if !infill_area.is_empty() {
+                        let (narrow_infill, mut kept) = if wide_infill.is_empty() {
+                            (infill_area, Vec::new())
+                        } else {
+                            let wide_padded = offset(&wide_infill, mm_to_nm(0.005)?, join)?;
+                            let narrow = difference(&infill_area, &wide_padded)?;
+                            (narrow, wide_infill)
+                        };
+                        for comp in narrow_infill {
+                            let claimed_by_gap_fill = gap_paths.iter().any(|gp| {
+                                gp.points.iter().any(|&pt| comp.contains_point(pt))
+                                    || gp.points.windows(2).any(|w| {
+                                        if let (Some(&a), Some(&b)) = (w.first(), w.get(1)) {
+                                            let (ax, ay) = a.to_mm();
+                                            let (bx, by) = b.to_mm();
+                                            Point2::from_mm(0.5 * (ax + bx), 0.5 * (ay + by))
+                                                .is_ok_and(|mid| comp.contains_point(mid))
+                                        } else {
+                                            false
+                                        }
+                                    })
+                            });
+                            if !claimed_by_gap_fill {
+                                kept.push(comp);
+                            }
+                        }
+                        infill_area = union_if_multi(kept)?;
+                    }
                     paths.extend(gap_paths);
                 }
             }
@@ -7069,6 +7096,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn classic_gap_fill_does_not_overlap_infill_in_tapered_wedge() {
+        let wedge = make_tapered_wedge_mesh(36.0, 4.0, 0.25, 8.0);
+        let mut cfg = PrintConfig::default();
+        cfg.process.wall_generator = WallGenerator::Classic;
+        cfg.process.wall_loops = 2;
+        cfg.process.outer_wall_width_mm = 0.45;
+        cfg.process.inner_wall_width_mm = 0.45;
+        cfg.process.solid_infill_width_mm = 0.42;
+        cfg.process.gap_fill_enabled = true;
+
+        let plate = slice_single_mesh(&wedge, &cfg).unwrap();
+        assert_eq!(plate.layers.len(), 40);
+
+        let check_layer = |layer: &SlicedLayer, role: ExtrusionRole| {
+            let infill_paths: Vec<_> = layer.paths.iter().filter(|p| p.role == role).collect();
+            let gap_paths: Vec<_> = layer
+                .paths
+                .iter()
+                .filter(|p| p.role == ExtrusionRole::GapFill)
+                .collect();
+            assert!(
+                !infill_paths.is_empty(),
+                "expected {role:?} paths on layer {}",
+                layer.index
+            );
+            assert!(
+                !gap_paths.is_empty(),
+                "expected GapFill paths on layer {}",
+                layer.index
+            );
+            let infill_max_x = infill_paths
+                .iter()
+                .flat_map(|p| p.points.iter())
+                .map(|pt| pt.to_mm().0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let gap_min_x = gap_paths
+                .iter()
+                .flat_map(|p| p.points.iter())
+                .map(|pt| pt.to_mm().0)
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                infill_max_x <= gap_min_x + 0.15,
+                "layer {} {:?} max_x ({infill_max_x:.3}) overlapped GapFill min_x ({gap_min_x:.3})",
+                layer.index,
+                role
+            );
+
+            for gp in &gap_paths {
+                let mut check_pts: Vec<(f64, f64)> = gp.points.iter().map(|p| p.to_mm()).collect();
+                for w in gp.points.windows(2) {
+                    if let (Some(&a), Some(&b)) = (w.first(), w.get(1)) {
+                        let (ax, ay) = a.to_mm();
+                        let (bx, by) = b.to_mm();
+                        check_pts.push((0.5 * (ax + bx), 0.5 * (ay + by)));
+                    }
+                }
+                for ip in &infill_paths {
+                    for w in ip.points.windows(2) {
+                        if let (Some(&a), Some(&b)) = (w.first(), w.get(1)) {
+                            let (ax, ay) = a.to_mm();
+                            let (bx, by) = b.to_mm();
+                            let min_x = ax.min(bx) + 0.05;
+                            let max_x = ax.max(bx) - 0.05;
+                            let min_y = ay.min(by) + 0.05;
+                            let max_y = ay.max(by) - 0.05;
+                            if max_x <= min_x || max_y <= min_y {
+                                continue;
+                            }
+                            for &(gx, gy) in &check_pts {
+                                assert!(
+                                    !(gx >= min_x && gx <= max_x && gy >= min_y && gy <= max_y),
+                                    "layer {} GapFill point ({gx:.3},{gy:.3}) overlapped {:?} segment bbox [{min_x:.3}..{max_x:.3}]x[{min_y:.3}..{max_y:.3}]",
+                                    layer.index,
+                                    role
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        check_layer(&plate.layers[0], ExtrusionRole::BottomSurface);
+        let sparse_mid = plate.layers[5..35]
+            .iter()
+            .find(|l| {
+                l.paths
+                    .iter()
+                    .any(|p| p.role == ExtrusionRole::SparseInfill)
+            })
+            .expect("expected mid SparseInfill layer");
+        check_layer(sparse_mid, ExtrusionRole::SparseInfill);
+        check_layer(&plate.layers[39], ExtrusionRole::TopSurface);
     }
 
     #[test]
